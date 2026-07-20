@@ -200,6 +200,11 @@ impl BoundedOutput {
 /// Why a child invocation cannot be treated as operationally complete.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IncompleteReason {
+    HandshakeTimeout,
+    HandshakeRejected,
+    ManifestMissing,
+    ProtocolViolation,
+    RequestOrderViolation,
     Timeout,
     StdoutLimitExceeded,
     StderrLimitExceeded,
@@ -228,6 +233,20 @@ pub struct ProcessOutcome {
     pub duration: Duration,
     /// Time spent terminating and draining after the attributable run phase.
     pub cleanup_duration: Duration,
+}
+
+/// Transport result for a manifest-first provider invocation.
+pub(crate) struct ManifestFirstOutcome {
+    pub(crate) process: ProcessOutcome,
+    pub(crate) handshake_accepted: bool,
+    pub(crate) request_bytes_written: usize,
+}
+
+/// Incremental disposition of one provider JSONL line after request delivery.
+pub(crate) enum StreamLineDecision {
+    Continue,
+    Complete,
+    Reject,
 }
 
 /// Failures that prevent even an incomplete process record from being trusted.
@@ -336,9 +355,13 @@ pub fn run_bounded(
             made_progress = drain_output(Stream::Stderr, &mut pipes.stderr, &mut capture, &limits)
                 || made_progress;
         }
-        if capture.failure.is_some() {
-            terminate_and_reap(&mut child, &mut exit_status)?;
-            drain_after_termination(&mut pipes, &mut capture, &limits);
+        if stop_failed(
+            &mut child,
+            &mut pipes,
+            &mut capture,
+            &limits,
+            &mut exit_status,
+        )? {
             break;
         }
 
@@ -362,6 +385,350 @@ pub fn run_bounded(
         exit_status = child.try_wait().map_err(ProcessError::Wait)?;
     }
 
+    Ok(finalize_outcome(
+        started,
+        limits,
+        &mut child,
+        exit_status,
+        capture,
+    ))
+}
+
+/// Run a provider without writing request bytes until its first complete
+/// stdout line has been accepted as the manifest.
+///
+/// The validator is invoked exactly once and before any request byte is
+/// written. A rejected manifest, pre-request payload output, early EOF, or
+/// handshake timeout becomes a bounded incomplete outcome.
+pub(crate) fn run_bounded_manifest_first(
+    spec: &ProcessSpec,
+    limits: ProcessLimits,
+    handshake_timeout: Duration,
+    validate_manifest: impl FnOnce(&[u8]) -> bool,
+    mut validate_stream_line: impl FnMut(&[u8]) -> StreamLineDecision,
+) -> Result<ManifestFirstOutcome, ProcessError> {
+    let limits = validate_manifest_first_spec(spec, limits, handshake_timeout)?;
+    let started = Instant::now();
+    let deadlines = PhaseDeadlines {
+        total: started.checked_add(limits.timeout).unwrap_or(started),
+        handshake: started.checked_add(handshake_timeout).unwrap_or(started),
+    };
+    let (mut child, mut pipes) = spawn_piped_child(spec)?;
+    let mut capture = CaptureState::new(&limits);
+    let mut validator = Some(validate_manifest);
+    let mut handshake_accepted = false;
+    let mut stream_complete = false;
+    let mut stream_offset = 0;
+    let mut request_bytes_written = 0;
+    let mut exit_status = None;
+
+    // LLM contract: MANIFEST_PENDING -> REQUEST_WRITING -> STREAMING -> COMPLETE | INCOMPLETE; request bytes are forbidden in MANIFEST_PENDING.
+    while !capture.is_finished(exit_status.as_ref()) {
+        let mut made_progress = false;
+        enforce_phase_deadline(&mut capture, handshake_accepted, deadlines);
+        if stop_failed(
+            &mut child,
+            &mut pipes,
+            &mut capture,
+            &limits,
+            &mut exit_status,
+        )? {
+            break;
+        }
+        let request_phase = handshake_accepted;
+        let stdout_before = capture.stdout.observed_bytes;
+        if capture.failure.is_none() {
+            made_progress = if request_phase {
+                drain_output(Stream::Stdout, &mut pipes.stdout, &mut capture, &limits)
+            } else {
+                drain_output_until_idle(&mut pipes.stdout, &mut capture, &limits)
+            } || made_progress;
+        }
+        if request_phase && !capture.stdin_done && capture.stdout.observed_bytes > stdout_before {
+            capture.failure = Some(IncompleteReason::RequestOrderViolation);
+        } else if !request_phase && capture.failure.is_none() {
+            if let Some(line_end) = validate_available_manifest(&mut capture, &mut validator) {
+                handshake_accepted = true;
+                stream_offset = line_end;
+            }
+        }
+        if !request_phase && handshake_accepted && Instant::now() >= deadlines.handshake {
+            capture.failure = Some(IncompleteReason::HandshakeTimeout);
+        }
+        if capture.failure.is_none() && handshake_accepted && pipes.stdin.is_some() {
+            made_progress = write_stdin(
+                &mut pipes.stdin,
+                &spec.stdin,
+                &mut request_bytes_written,
+                &mut capture,
+            ) || made_progress;
+        }
+        if capture.failure.is_none() && capture.stdin_done {
+            validate_stream_progress(
+                &mut capture,
+                &mut stream_offset,
+                &mut stream_complete,
+                &mut validate_stream_line,
+            );
+        }
+        if capture.failure.is_none() {
+            made_progress = drain_output(Stream::Stderr, &mut pipes.stderr, &mut capture, &limits)
+                || made_progress;
+        }
+
+        if stop_failed(
+            &mut child,
+            &mut pipes,
+            &mut capture,
+            &limits,
+            &mut exit_status,
+        )? {
+            break;
+        }
+
+        if finish_phase_iteration(
+            &mut child,
+            &mut pipes,
+            &mut capture,
+            &limits,
+            &mut exit_status,
+            IterationPhase {
+                deadlines,
+                handshake_accepted,
+                made_progress,
+            },
+        )? {
+            break;
+        }
+    }
+
+    if exit_status.is_none() {
+        exit_status = child.try_wait().map_err(ProcessError::Wait)?;
+    }
+    let process = finalize_outcome(started, limits, &mut child, exit_status, capture);
+    Ok(ManifestFirstOutcome {
+        process,
+        handshake_accepted,
+        request_bytes_written,
+    })
+}
+
+#[derive(Clone, Copy)]
+struct PhaseDeadlines {
+    total: Instant,
+    handshake: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct IterationPhase {
+    deadlines: PhaseDeadlines,
+    handshake_accepted: bool,
+    made_progress: bool,
+}
+
+fn enforce_phase_deadline(
+    capture: &mut CaptureState,
+    handshake_accepted: bool,
+    deadlines: PhaseDeadlines,
+) {
+    let now = Instant::now();
+    if !handshake_accepted && now >= deadlines.handshake {
+        capture.failure = Some(IncompleteReason::HandshakeTimeout);
+    } else if now >= deadlines.total {
+        capture.failure = Some(IncompleteReason::Timeout);
+    }
+}
+
+fn finish_phase_iteration(
+    child: &mut ChildCleanupGuard,
+    pipes: &mut PipeHandles,
+    capture: &mut CaptureState,
+    limits: &ProcessLimits,
+    exit_status: &mut Option<ExitStatus>,
+    phase: IterationPhase,
+) -> Result<bool, ProcessError> {
+    *exit_status = child.try_wait().map_err(ProcessError::Wait)?;
+    let now = Instant::now();
+    if now >= phase.deadlines.total {
+        capture.failure = Some(IncompleteReason::Timeout);
+    } else if !phase.handshake_accepted
+        && (capture.stdout_done || exit_status.is_some())
+        && !capture.stdout.bytes.contains(&b'\n')
+    {
+        capture.failure = Some(IncompleteReason::ManifestMissing);
+    }
+    if stop_failed(child, pipes, capture, limits, exit_status)?
+        || capture.is_finished(exit_status.as_ref())
+    {
+        return Ok(true);
+    }
+    if !phase.made_progress {
+        let phase_deadline = if phase.handshake_accepted {
+            phase.deadlines.total
+        } else {
+            phase.deadlines.handshake
+        };
+        std::thread::sleep(
+            phase_deadline
+                .saturating_duration_since(now)
+                .min(POLL_INTERVAL),
+        );
+    }
+    Ok(false)
+}
+
+fn stop_failed(
+    child: &mut ChildCleanupGuard,
+    pipes: &mut PipeHandles,
+    capture: &mut CaptureState,
+    limits: &ProcessLimits,
+    exit_status: &mut Option<ExitStatus>,
+) -> Result<bool, ProcessError> {
+    if capture.failure.is_none() {
+        return Ok(false);
+    }
+    terminate_and_reap(child, exit_status)?;
+    drain_after_termination(pipes, capture, limits);
+    Ok(true)
+}
+
+fn validate_available_manifest<F>(
+    capture: &mut CaptureState,
+    validator: &mut Option<F>,
+) -> Option<usize>
+where
+    F: FnOnce(&[u8]) -> bool,
+{
+    let newline = capture
+        .stdout
+        .bytes
+        .iter()
+        .position(|byte| *byte == b'\n')?;
+    let line_end = newline.saturating_add(1);
+    if capture.stdout.observed_bytes != u64::try_from(line_end).unwrap_or(u64::MAX) {
+        capture.failure = Some(IncompleteReason::RequestOrderViolation);
+        return None;
+    }
+    let accepted = validator.take().expect("manifest validator is called once")(
+        &capture.stdout.bytes[..line_end],
+    );
+    if accepted {
+        Some(line_end)
+    } else {
+        capture.failure = Some(IncompleteReason::HandshakeRejected);
+        None
+    }
+}
+
+fn drain_output_until_idle<R: Read>(
+    reader: &mut Option<R>,
+    capture: &mut CaptureState,
+    limits: &ProcessLimits,
+) -> bool {
+    let mut made_progress = false;
+    while capture.failure.is_none() && drain_output(Stream::Stdout, reader, capture, limits) {
+        made_progress = true;
+    }
+    made_progress
+}
+
+fn validate_stream_progress(
+    capture: &mut CaptureState,
+    stream_offset: &mut usize,
+    stream_complete: &mut bool,
+    validate_line: &mut impl FnMut(&[u8]) -> StreamLineDecision,
+) {
+    if *stream_complete && capture.stdout.bytes.len() > *stream_offset {
+        capture.failure = Some(IncompleteReason::ProtocolViolation);
+        return;
+    }
+    while let Some(newline) = capture.stdout.bytes[*stream_offset..]
+        .iter()
+        .position(|byte| *byte == b'\n')
+    {
+        let line_end = (*stream_offset).saturating_add(newline).saturating_add(1);
+        match validate_line(&capture.stdout.bytes[*stream_offset..line_end]) {
+            StreamLineDecision::Continue => *stream_offset = line_end,
+            StreamLineDecision::Complete => {
+                *stream_offset = line_end;
+                *stream_complete = true;
+            }
+            StreamLineDecision::Reject => {
+                capture.failure = Some(IncompleteReason::ProtocolViolation);
+                return;
+            }
+        }
+        if *stream_complete && capture.stdout.bytes.len() > *stream_offset {
+            capture.failure = Some(IncompleteReason::ProtocolViolation);
+            return;
+        }
+    }
+    if capture.stdout_done && *stream_offset < capture.stdout.bytes.len() {
+        match validate_line(&capture.stdout.bytes[*stream_offset..]) {
+            StreamLineDecision::Complete => {
+                *stream_offset = capture.stdout.bytes.len();
+                *stream_complete = true;
+            }
+            StreamLineDecision::Continue | StreamLineDecision::Reject => {
+                capture.failure = Some(IncompleteReason::ProtocolViolation);
+                return;
+            }
+        }
+    }
+    if capture.stdout_done && !*stream_complete {
+        capture.failure = Some(IncompleteReason::ProtocolViolation);
+    }
+}
+
+fn validate_manifest_first_spec(
+    spec: &ProcessSpec,
+    limits: ProcessLimits,
+    handshake_timeout: Duration,
+) -> Result<ProcessLimits, ProcessError> {
+    if cfg!(not(unix)) {
+        return Err(ProcessError::UnsupportedPlatform);
+    }
+    spec.validate()?;
+    if spec.stdin.is_empty() {
+        return Err(ProcessError::InvalidSpec(
+            "manifest-first request must not be empty",
+        ));
+    }
+    let limits = limits.validate()?;
+    if handshake_timeout.is_zero() || handshake_timeout > limits.timeout {
+        return Err(ProcessError::InvalidLimits(
+            "handshake timeout must be positive and within total timeout",
+        ));
+    }
+    Ok(limits)
+}
+
+fn spawn_piped_child(spec: &ProcessSpec) -> Result<(ChildCleanupGuard, PipeHandles), ProcessError> {
+    let mut child = ChildCleanupGuard::new(spawn_child(spec)?);
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or(ProcessError::MissingPipe { stream: "stdin" })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(ProcessError::MissingPipe { stream: "stdout" })?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or(ProcessError::MissingPipe { stream: "stderr" })?;
+    let pipes = PipeHandles::new(stdin, stdout, stderr);
+    pipes.configure_nonblocking()?;
+    Ok((child, pipes))
+}
+
+fn finalize_outcome(
+    started: Instant,
+    limits: ProcessLimits,
+    child: &mut ChildCleanupGuard,
+    exit_status: Option<ExitStatus>,
+    capture: CaptureState,
+) -> ProcessOutcome {
     let native_exit_code = exit_status.as_ref().and_then(ExitStatus::code);
     let exit_code = native_exit_code.and_then(|code| u8::try_from(code).ok());
     let state = match capture.failure {
@@ -378,14 +745,14 @@ pub fn run_bounded(
     let wall_duration = started.elapsed();
     let duration = wall_duration.min(limits.timeout);
     child.disarm();
-    Ok(ProcessOutcome {
+    ProcessOutcome {
         state,
         exit_code,
         stdout: capture.stdout,
         stderr: capture.stderr,
         duration,
         cleanup_duration: wall_duration.saturating_sub(duration),
-    })
+    }
 }
 
 /// Ensures every post-spawn error path terminates the process group and reaps
@@ -741,9 +1108,11 @@ fn reject_nul(value: &OsStr, field: &'static str) -> Result<(), ProcessError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        IncompleteReason, ProcessError, ProcessLimits, ProcessSpec, ProcessState, run_bounded,
+        IO_CHUNK_BYTES, IncompleteReason, ProcessError, ProcessLimits, ProcessSpec, ProcessState,
+        StreamLineDecision, run_bounded, run_bounded_manifest_first,
     };
     use std::time::Duration;
+    use tempfile::tempdir;
 
     fn limits(stdout: usize, stderr: usize) -> ProcessLimits {
         ProcessLimits {
@@ -755,6 +1124,40 @@ mod tests {
 
     fn shell(script: &str) -> ProcessSpec {
         ProcessSpec::new("/bin/sh").args(["-c", script])
+    }
+
+    #[test]
+    fn manifest_boundary_never_hides_pre_request_payload() {
+        for line_bytes in [IO_CHUNK_BYTES - 1, IO_CHUNK_BYTES, IO_CHUNK_BYTES + 1] {
+            let directory = tempdir().unwrap();
+            let marker = directory.path().join("request-received");
+            let manifest = "m".repeat(line_bytes - 1);
+            let spec = ProcessSpec::new("/bin/sh")
+                .args([
+                    "-c",
+                    "printf '%s\\nTAIL\\n' \"$1\"; if IFS= read -r request; then : > \"$2\"; fi",
+                    "sh",
+                    &manifest,
+                    marker.to_str().unwrap(),
+                ])
+                .stdin(b"request\n".to_vec());
+            let result = run_bounded_manifest_first(
+                &spec,
+                limits(32 * 1024, 4 * 1024),
+                Duration::from_secs(1),
+                |_| true,
+                |_| StreamLineDecision::Continue,
+            )
+            .unwrap();
+
+            assert_eq!(result.request_bytes_written, 0, "line bytes {line_bytes}");
+            assert_eq!(
+                result.process.state,
+                ProcessState::Incomplete(IncompleteReason::RequestOrderViolation),
+                "line bytes {line_bytes}"
+            );
+            assert!(!marker.exists(), "line bytes {line_bytes}");
+        }
     }
 
     #[cfg(unix)]
