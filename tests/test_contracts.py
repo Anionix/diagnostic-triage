@@ -437,9 +437,7 @@ class ContractTest(unittest.TestCase):
                 "session_report_fixture",
             },
         )
-        self.contracts.validator("protocol.schema.json").validate(
-            handshake["manifest"]
-        )
+        self.contracts.validator("protocol.schema.json").validate(handshake["manifest"])
         capabilities = set(handshake["manifest"]["adapter"]["capabilities"])
         required = set(handshake["required_capabilities"])
         self.assertFalse(required <= capabilities)
@@ -524,9 +522,7 @@ class ContractTest(unittest.TestCase):
                 ],
                 "applicability": "SAFE",
                 "tool_native": True,
-                "patch_evidence_id": failed_verification["evidence"][0][
-                    "evidence_id"
-                ],
+                "patch_evidence_id": failed_verification["evidence"][0]["evidence_id"],
             }
         ]
         finding = failed_verification["findings"][0]
@@ -552,9 +548,7 @@ class ContractTest(unittest.TestCase):
                 validate_report(candidate, self.contracts)
 
     def test_request_rejects_noncanonical_paths(self) -> None:
-        request = load_session(
-            FIXTURE_DIR / "valid-empty-session.jsonl"
-        )[1]
+        request = load_session(FIXTURE_DIR / "valid-empty-session.jsonl")[1]
         validator = self.contracts.validator("protocol.schema.json")
         invalid_paths = (
             "/absolute",
@@ -640,6 +634,76 @@ class ContractTest(unittest.TestCase):
             validate_report(report, self.contracts)
         decision["waiver"]["fingerprint"] = report["findings"][0]["fingerprint"]
         validate_report(report, self.contracts)
+
+    def test_waiver_rfc3339_offset_boundaries(self) -> None:
+        report = load_json(FIXTURE_DIR / "valid-report.json")
+        decision = report["decisions"][0]
+        decision["action"] = "WAIVE"
+        decision["waiver"] = {
+            "fingerprint": report["findings"][0]["fingerprint"],
+            "waived_action": "BLOCK",
+            "reason": "temporary waiver",
+            "owner": "maintainers",
+            "expires_at": "2026-08-20T00:00:00+23:59",
+        }
+        for valid_expiry in (
+            "2026-08-20T00:00:00Z",
+            "2026-08-20t00:00:00z",
+            "0000-01-01T00:00:00+23:59",
+            "9998-12-31T23:59:59-23:59",
+            "2000-02-29T00:00:00Z",
+            "2400-02-29T00:00:00Z",
+            "2026-08-20T00:00:00.123456789Z",
+            "2026-08-20T00:00:00+23:59",
+            "2026-08-20T00:00:00-23:59",
+        ):
+            candidate = copy.deepcopy(report)
+            candidate["decisions"][0]["waiver"]["expires_at"] = valid_expiry
+            with self.subTest(valid_expiry=valid_expiry):
+                validate_report(candidate, self.contracts)
+
+        validator = self.contracts.validator("model.schema.json")
+        for invalid_offset in ("+24:00", "-24:00", "+23:60", "-23:60"):
+            candidate = copy.deepcopy(report)
+            candidate["decisions"][0]["waiver"]["expires_at"] = (
+                f"2026-08-20T00:00:00{invalid_offset}"
+            )
+            with self.subTest(offset=invalid_offset):
+                self.assertTrue(list(validator.iter_errors(candidate)))
+        for impossible_date in (
+            "2023-02-29T00:00:00Z",
+            "1900-02-29T00:00:00Z",
+            "2100-02-29T00:00:00Z",
+            "2024-04-31T00:00:00Z",
+        ):
+            candidate = copy.deepcopy(report)
+            candidate["decisions"][0]["waiver"]["expires_at"] = impossible_date
+            with self.subTest(impossible_date=impossible_date):
+                self.assertTrue(list(validator.iter_errors(candidate)))
+
+        annotation_only_validator = cast(
+            Validator,
+            Draft202012Validator(
+                self.contracts.schemas["model.schema.json"],
+                registry=self.contracts.registry,
+            ),
+        )
+        for malformed_expiry in (
+            "not-a-date+23:59",
+            "9999-01-01T00:00:00Z",
+            "2023-02-29T00:00:00Z",
+            "1900-02-29T00:00:00Z",
+            "2100-02-29T00:00:00Z",
+            "2024-04-31T00:00:00Z",
+            "2026-08-20T00:00:60Z",
+            "2026-08-20T00:00:00.1234567890Z",
+            "2026-08-20T00:00:00Z\n",
+            "2026-08-20T00:00:00Z\u2028",
+        ):
+            candidate = copy.deepcopy(report)
+            candidate["decisions"][0]["waiver"]["expires_at"] = malformed_expiry
+            with self.subTest(malformed_expiry=malformed_expiry):
+                self.assertTrue(list(annotation_only_validator.iter_errors(candidate)))
 
     def test_taxonomy_document_matches_schema(self) -> None:
         taxonomy = self.contracts.schemas["taxonomy.schema.json"]

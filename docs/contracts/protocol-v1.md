@@ -49,6 +49,20 @@ sequence and count agreement, unique IDs, references, byte/digest consistency,
 location ordering, waiver binding, and verified-execution status. Passing the
 schema alone is therefore necessary but not a valid Diagnostic Triage session.
 
+### Timestamp profile
+
+Waiver timestamps use a deterministic RFC 3339 subset: calendar-valid years
+0000 through 9998, seconds 00 through 59, optional fractional seconds of one
+through nine digits, and either Z/z or a numeric offset whose hour is 00
+through 23 and minute is 00 through 59. Year 9999, leap seconds, and precision
+finer than one nanosecond are unsupported in v1 so every accepted value maps
+losslessly to the Engine timestamp used for expiry comparisons.
+
+The schema pattern enforces both the lexical profile and Gregorian month,
+day, and leap-year bounds without lookaround extensions. The Draft 2020-12
+date-time format remains a semantic annotation and optional second assertion;
+correctness does not depend on a validator enabling format assertions.
+
 ## Limits and paths
 
 The request always carries limits. v1 hard maxima are 600,000 ms total runtime,
