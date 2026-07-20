@@ -238,6 +238,24 @@ fn waive_expiry_must_be_strictly_after_evaluation_by_parsed_instant() {
             );
         }
     }
+
+    for (evaluated_at, expires_at) in [
+        (
+            "0000-01-01T00:00:00.000000000Z",
+            "0000-01-01T00:00:00.000000001Z",
+        ),
+        (
+            "9998-12-31T23:59:58.999999999Z",
+            "9998-12-31T23:59:59.000000000Z",
+        ),
+    ] {
+        let mut candidate = report.clone();
+        candidate["decisions"][0]["evaluated_at"] = json!(evaluated_at);
+        candidate["decisions"][0]["waiver"]["expires_at"] = json!(expires_at);
+        validate_report_json(&serde_json::to_vec(&candidate).unwrap()).unwrap_or_else(|error| {
+            panic!("rejected v1 boundary interval {evaluated_at}..{expires_at}: {error}")
+        });
+    }
 }
 
 #[test]

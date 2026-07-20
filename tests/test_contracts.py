@@ -1502,6 +1502,22 @@ class ContractTest(unittest.TestCase):
             with self.subTest(rejected_expiry=expiry), self.assertRaises(ContractError):
                 validate_report(candidate, self.contracts)
 
+        for evaluated_at, expires_at in (
+            (
+                "0000-01-01T00:00:00.000000000Z",
+                "0000-01-01T00:00:00.000000001Z",
+            ),
+            (
+                "9998-12-31T23:59:58.999999999Z",
+                "9998-12-31T23:59:59.000000000Z",
+            ),
+        ):
+            candidate = copy.deepcopy(report)
+            candidate["decisions"][0]["evaluated_at"] = evaluated_at
+            candidate["decisions"][0]["waiver"]["expires_at"] = expires_at
+            with self.subTest(evaluated_at=evaluated_at, expires_at=expires_at):
+                validate_report(candidate, self.contracts)
+
     def test_waiver_is_bound_to_a_fingerprint(self) -> None:
         report = load_json(FIXTURE_DIR / "valid-report.json")
         decision = copy.deepcopy(report["decisions"][0])
