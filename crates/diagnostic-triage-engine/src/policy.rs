@@ -269,10 +269,14 @@ impl PolicySnapshot {
                     .cmp(&right.action)
                     .then_with(|| right.rule_id.cmp(&left.rule_id))
             });
+        let default_rule_id = default_rule_id(finding, baseline);
         let (action, matched_rule_id) = selected_rule
-            .filter(|rule| rule.action >= baseline)
+            .filter(|rule| {
+                rule.action > baseline
+                    || (rule.action == baseline && rule.rule_id.as_str() < default_rule_id)
+            })
             .map_or_else(
-                || (baseline, default_rule_id(finding, baseline).to_owned()),
+                || (baseline, default_rule_id.to_owned()),
                 |rule| (rule.action, rule.rule_id.clone()),
             );
 
