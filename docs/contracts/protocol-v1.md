@@ -75,6 +75,30 @@ object ID does not strengthen its provenance. Consumers that require producer
 or artifact authenticity must separately verify the release manifest, artifact
 digest, and signature once those release artifacts exist.
 
+### Deterministic `SessionReport` assembly
+
+`SessionReport` assembly is a pure function of its explicit inputs. Before
+cloning or sorting any top-level collection, and before Decision materialization,
+the Engine checks that every top-level collection it will emit contains at most
+10,000 items; an over-limit collection is rejected at that boundary. The
+Engine also streams its explicit input through a bounded JSON writer before
+Decision materialization and checks the final encoded report after contract
+validation; both enforce the 64 MiB v1 report limit without allocating an
+aggregate JSON buffer. The Engine performs no filesystem or process I/O and
+reads no clock or randomness source. `session_id` and `engine.source_revision`
+are caller-owned inputs and are validated, not regenerated. `contract_sha256`,
+`policy_digest`, and `verdict` are Engine-derived values and are not
+caller-selected.
+
+The canonical top-level order is ascending by canonical wire value of the
+object ID for `observations`, `evidence`, `fix_candidates`, and `executions`;
+ascending by `(fingerprint, finding_id)` for `findings`; and ascending by
+`(finding_id, decision_id)` for `decisions`. Every nested array of identifier
+or fingerprint references is sorted ascending by its canonical wire value.
+For a nonempty `findings` collection, the caller supplies one validated
+evaluation timestamp and every materialized Decision carries that timestamp;
+with no Findings, no Decisions or evaluation timestamp is emitted.
+
 Starting with the first alpha release, the whole published v1 boundary becomes
 additive-only: schemas, protocol identifiers and events, taxonomy values, and
 cross-object validation rules may gain only optional surface. Changing an

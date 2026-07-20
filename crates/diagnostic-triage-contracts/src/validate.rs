@@ -25,7 +25,8 @@ const MAX_TRANSCRIPT_BYTES: usize = 32 * 1024 * 1024;
 // Manifest, request, 10,000 payload events, and completion.
 const MAX_TRANSCRIPT_LINES: usize = 10_003;
 // Reports aggregate providers but remain bounded at the JSON wire boundary.
-const MAX_REPORT_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum encoded size of one v1 `SessionReport` JSON document.
+pub const MAX_REPORT_BYTES: usize = 64 * 1024 * 1024;
 
 /// A fully decoded and semantically valid v1 Provider/Observer transcript.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -299,28 +300,34 @@ fn validate_contract_identity(report: &SessionReport) -> Result<(), ContractErro
     Ok(())
 }
 
-fn validate_report_verdict(report: &SessionReport) -> Result<(), ContractError> {
-    let expected = if report
-        .executions
+/// Derive the session verdict from execution outcomes and policy decisions.
+///
+/// The precedence is exactly `INCOMPLETE > UNSUPPORTED > POLICY_FAIL > PASS`.
+/// This helper is pure: it only reads the supplied slices.
+#[must_use]
+pub fn derive_session_verdict(executions: &[Execution], decisions: &[Decision]) -> Verdict {
+    if executions
         .iter()
         .any(|execution| execution.required && execution.status == ExecutionStatus::Incomplete)
     {
         Verdict::Incomplete
-    } else if report
-        .executions
+    } else if executions
         .iter()
         .any(|execution| execution.required && execution.status == ExecutionStatus::Unsupported)
     {
         Verdict::Unsupported
-    } else if report
-        .decisions
+    } else if decisions
         .iter()
         .any(|decision| decision.action == DecisionAction::Block)
     {
         Verdict::PolicyFail
     } else {
         Verdict::Pass
-    };
+    }
+}
+
+fn validate_report_verdict(report: &SessionReport) -> Result<(), ContractError> {
+    let expected = derive_session_verdict(&report.executions, &report.decisions);
     if report.verdict != expected {
         return Err(model_error(
             "report verdict differs from required executions and decisions",
@@ -1026,7 +1033,9 @@ fn model_error(message: impl Into<String>) -> ContractError {
 mod tests {
     use serde_json::json;
 
-    use super::{preflight_report_input, preflight_session_input};
+    use crate::model::{ExecutionStatus, SessionReport, Verdict};
+
+    use super::{derive_session_verdict, preflight_report_input, preflight_session_input};
 
     #[test]
     fn preflight_rejects_bytes_and_lines_before_json_materialization() {
@@ -1073,5 +1082,49 @@ mod tests {
         });
         let transcript = format!("{{}}\n{request}\n{final_manifest}");
         assert!(preflight_session_input(transcript.as_bytes(), 4096, 10).is_err());
+    }
+
+    #[test]
+    fn derives_session_verdict_with_exact_precedence() {
+        let report: SessionReport =
+            serde_json::from_str(include_str!("../../../tests/fixtures/v1/valid-report.json"))
+                .expect("valid report fixture");
+        let mut executions = report.executions;
+        let block_decisions = report.decisions;
+        let mut decisions = block_decisions.clone();
+
+        executions[0].status = ExecutionStatus::Complete;
+        decisions.clear();
+        assert_eq!(
+            derive_session_verdict(&executions, &decisions),
+            Verdict::Pass
+        );
+
+        decisions = block_decisions;
+        assert_eq!(
+            derive_session_verdict(&executions, &decisions),
+            Verdict::PolicyFail
+        );
+
+        executions[0].required = false;
+        executions[0].status = ExecutionStatus::Incomplete;
+        assert_eq!(
+            derive_session_verdict(&executions, &decisions),
+            Verdict::PolicyFail
+        );
+
+        executions[0].required = true;
+        executions[0].status = ExecutionStatus::Unsupported;
+        assert_eq!(
+            derive_session_verdict(&executions, &decisions),
+            Verdict::Unsupported
+        );
+
+        executions.push(executions[0].clone());
+        executions[0].status = ExecutionStatus::Incomplete;
+        assert_eq!(
+            derive_session_verdict(&executions, &decisions),
+            Verdict::Incomplete
+        );
     }
 }
