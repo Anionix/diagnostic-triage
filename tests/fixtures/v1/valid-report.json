@@ -44,6 +44,7 @@
       },
       "symbol": "x",
       "state": "REPORTED",
+      "pre_report_state": "CLASSIFIED",
       "evidence_ids": ["019f7e95-0000-7000-8000-000000000102"]
     }
   ],

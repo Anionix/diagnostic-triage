@@ -76,6 +76,9 @@
             "VERIFIED", "REPORTED"
           ]
         },
+        "pre_report_state": {
+          "enum": ["CLASSIFIED", "FIX_PROPOSED", "VERIFIED"]
+        },
         "evidence_ids": {
           "type": "array",
           "uniqueItems": true,
@@ -94,17 +97,74 @@
       "allOf": [
         {
           "if": {
-            "properties": { "state": { "enum": ["FIX_PROPOSED", "VERIFIED"] } },
-            "required": ["state"]
+            "anyOf": [
+              {
+                "properties": { "state": { "enum": ["FIX_PROPOSED", "VERIFIED"] } },
+                "required": ["state"]
+              },
+              {
+                "properties": {
+                  "state": { "const": "REPORTED" },
+                  "pre_report_state": { "enum": ["FIX_PROPOSED", "VERIFIED"] }
+                },
+                "required": ["state", "pre_report_state"]
+              }
+            ]
           },
           "then": { "required": ["fix_candidate_id"] }
         },
         {
           "if": {
-            "properties": { "state": { "const": "VERIFIED" } },
-            "required": ["state"]
+            "anyOf": [
+              {
+                "properties": { "state": { "const": "VERIFIED" } },
+                "required": ["state"]
+              },
+              {
+                "properties": {
+                  "state": { "const": "REPORTED" },
+                  "pre_report_state": { "const": "VERIFIED" }
+                },
+                "required": ["state", "pre_report_state"]
+              }
+            ]
           },
           "then": { "required": ["verification_execution_ids"] }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "REPORTED" } },
+            "required": ["state"]
+          },
+          "then": { "required": ["pre_report_state"] },
+          "else": { "not": { "required": ["pre_report_state"] } }
+        },
+        {
+          "if": {
+            "anyOf": [
+              {
+                "properties": {
+                  "state": { "enum": ["DISCOVERED", "NORMALIZED", "CLASSIFIED"] }
+                },
+                "required": ["state"]
+              },
+              {
+                "properties": {
+                  "state": { "const": "REPORTED" },
+                  "pre_report_state": { "const": "CLASSIFIED" }
+                },
+                "required": ["state", "pre_report_state"]
+              }
+            ]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                { "required": ["fix_candidate_id"] },
+                { "required": ["verification_execution_ids"] }
+              ]
+            }
+          }
         }
       ]
     },
