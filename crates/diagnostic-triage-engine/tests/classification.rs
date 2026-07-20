@@ -48,6 +48,7 @@ fn rule(id: &str, selector: RuleIdSelector, taxonomy: Taxonomy) -> Classificatio
     ClassificationRule {
         id: id.into(),
         tool_name: "ty".into(),
+        tool_version: None,
         native_rule_id: selector,
         language: None,
         origin: None,
@@ -81,6 +82,198 @@ fn most_specific_rule_wins_independent_of_catalog_order() {
 }
 
 #[test]
+fn exact_tool_version_beats_generic_independent_of_catalog_order() {
+    let mut generic = rule(
+        "ty.generic",
+        RuleIdSelector::Any,
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    generic.native_rule_id = RuleIdSelector::Exact("invalid-argument-type".into());
+    let mut exact = rule(
+        "ty.versioned",
+        RuleIdSelector::Exact("invalid-argument-type".into()),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
+    );
+    exact.tool_version = Some("0.0.1".into());
+    let input = observation(Some("invalid-argument-type"));
+
+    let forward = classify_observation(&input, &[generic.clone(), exact.clone()]).unwrap();
+    let reverse = classify_observation(&input, &[exact, generic]).unwrap();
+
+    assert_eq!(forward, reverse);
+    assert_eq!(forward.rule_id, "ty.versioned");
+    assert_eq!(
+        forward.taxonomy.micro_category,
+        MicroCategory::IncompatibleType
+    );
+}
+
+#[test]
+fn exact_tool_versions_select_their_own_taxonomy_without_ambiguity() {
+    let mut first = rule(
+        "ty.v1",
+        RuleIdSelector::Exact("invalid-argument-type".into()),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
+    );
+    first.tool_version = Some("0.0.1".into());
+    let mut second = rule(
+        "ty.v2",
+        RuleIdSelector::Exact("invalid-argument-type".into()),
+        taxonomy(Category::Correctness, MicroCategory::WrongResult),
+    );
+    second.tool_version = Some("0.0.2".into());
+    let rules = [first, second];
+
+    let first_match =
+        classify_observation(&observation(Some("invalid-argument-type")), &rules).unwrap();
+    let mut second_input = observation(Some("invalid-argument-type"));
+    second_input.tool.version = "0.0.2".into();
+    let second_match = classify_observation(&second_input, &rules).unwrap();
+
+    assert_eq!(first_match.rule_id, "ty.v1");
+    assert_eq!(
+        first_match.taxonomy.micro_category,
+        MicroCategory::IncompatibleType
+    );
+    assert_eq!(second_match.rule_id, "ty.v2");
+    assert_eq!(
+        second_match.taxonomy.micro_category,
+        MicroCategory::WrongResult
+    );
+}
+
+#[test]
+fn wrong_exact_tool_version_does_not_match() {
+    let mut versioned = rule(
+        "ty.versioned",
+        RuleIdSelector::Any,
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
+    );
+    versioned.tool_version = Some("0.0.2".into());
+
+    let mut input = observation(None);
+    input.tool.version = "0.0.1".into();
+
+    assert!(matches!(
+        classify_observation(&input, &[versioned]),
+        Err(EngineError::Unclassified { .. })
+    ));
+}
+
+#[test]
+fn generic_version_rule_remains_a_fallback_for_other_versions() {
+    let generic = rule(
+        "ty.generic",
+        RuleIdSelector::Exact("invalid-argument-type".into()),
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    let mut versioned = rule(
+        "ty.versioned",
+        RuleIdSelector::Exact("invalid-argument-type".into()),
+        taxonomy(Category::Correctness, MicroCategory::WrongResult),
+    );
+    versioned.tool_version = Some("0.0.2".into());
+    let input = observation(Some("invalid-argument-type"));
+
+    let selected = classify_observation(&input, &[versioned, generic]).unwrap();
+
+    assert_eq!(selected.rule_id, "ty.generic");
+}
+
+#[test]
+fn tool_version_selector_uses_unicode_character_boundaries() {
+    let boundary = "\u{e9}".repeat(64);
+    let mut input = observation(None);
+    input.tool.version.clone_from(&boundary);
+    let mut accepted = rule(
+        "version-boundary",
+        RuleIdSelector::Any,
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    accepted.tool_version = Some(boundary);
+
+    assert_eq!(
+        classify_observation(&input, &[accepted]).unwrap().rule_id,
+        "version-boundary"
+    );
+
+    let mut rejected = rule(
+        "version-overflow",
+        RuleIdSelector::Any,
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    rejected.tool_version = Some("\u{e9}".repeat(65));
+    assert!(matches!(
+        classify_observation(&observation(None), &[rejected]),
+        Err(EngineError::Input(
+            EngineInputError::InvalidClassificationToolVersion { .. }
+        ))
+    ));
+}
+
+#[test]
+fn orthogonal_single_constraints_with_conflicting_taxonomy_are_ambiguous() {
+    let mut version_only = rule(
+        "ty.version-only",
+        RuleIdSelector::Any,
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    version_only.tool_version = Some("0.0.1".into());
+    let rule_only = rule(
+        "ty.rule-only",
+        RuleIdSelector::Exact("invalid-argument-type".into()),
+        taxonomy(Category::Correctness, MicroCategory::WrongResult),
+    );
+
+    assert!(matches!(
+        classify_observation(
+            &observation(Some("invalid-argument-type")),
+            &[version_only, rule_only]
+        ),
+        Err(EngineError::AmbiguousClassification { .. })
+    ));
+}
+
+#[test]
+fn identically_constrained_rules_are_ambiguous_even_with_the_same_taxonomy() {
+    let first = rule(
+        "same-a",
+        RuleIdSelector::Exact("x".into()),
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    let second = rule(
+        "same-b",
+        RuleIdSelector::Exact("x".into()),
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+
+    assert!(matches!(
+        classify_observation(&observation(Some("x")), &[first, second]),
+        Err(EngineError::AmbiguousClassification { rule_ids, .. })
+            if rule_ids == vec!["same-a", "same-b"]
+    ));
+}
+
+#[test]
+fn tool_versions_are_opaque_and_case_sensitive() {
+    let generic = rule(
+        "generic",
+        RuleIdSelector::Any,
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    let mut exact = rule(
+        "exact",
+        RuleIdSelector::Any,
+        taxonomy(Category::Correctness, MicroCategory::WrongResult),
+    );
+    exact.tool_version = Some("V1.0.0+BUILD".into());
+
+    let selected = classify_observation(&observation(None), &[exact, generic]).unwrap();
+
+    assert_eq!(selected.rule_id, "generic");
+}
+
+#[test]
 fn absent_selector_does_not_match_present_rule_id() {
     let absent = rule(
         "ty.no-rule",
@@ -108,7 +301,28 @@ fn equal_specificity_with_different_taxonomy_is_rejected() {
 
     assert!(matches!(
         classify_observation(&observation(Some("x")), &[second, first]),
-        Err(EngineError::AmbiguousClassification { rule_ids, .. }) if rule_ids == "a,b"
+        Err(EngineError::AmbiguousClassification { rule_ids, .. })
+            if rule_ids == vec!["a", "b"]
+    ));
+}
+
+#[test]
+fn ambiguous_rule_ids_remain_structured_when_ids_contain_commas() {
+    let first = rule(
+        "a,one",
+        RuleIdSelector::Exact("x".into()),
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    let second = rule(
+        "b,two",
+        RuleIdSelector::Exact("x".into()),
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+
+    assert!(matches!(
+        classify_observation(&observation(Some("x")), &[second, first]),
+        Err(EngineError::AmbiguousClassification { rule_ids, .. })
+            if rule_ids == vec!["a,one", "b,two"]
     ));
 }
 
@@ -134,7 +348,7 @@ fn ambiguous_classification_error_is_bounded() {
             rule_ids,
             omitted_rule_count: 2,
             ..
-        }) if rule_ids.split(',').count() == 8
+        }) if rule_ids.len() == 8
     ));
 }
 
@@ -217,6 +431,45 @@ fn malformed_catalog_identity_returns_typed_errors() {
         Err(EngineError::Input(
             EngineInputError::NonCanonicalClassificationNativeRuleId { .. }
         ))
+    ));
+
+    let mut empty_tool_version = rule(
+        "empty-version",
+        RuleIdSelector::Any,
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    empty_tool_version.tool_version = Some(String::new());
+    assert!(matches!(
+        classify_observation(&observation(None), &[empty_tool_version]),
+        Err(EngineError::Input(
+            EngineInputError::InvalidClassificationToolVersion { rule_id }
+        )) if rule_id == "empty-version"
+    ));
+
+    let mut oversized_tool_version = rule(
+        "oversized-version",
+        RuleIdSelector::Any,
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    oversized_tool_version.tool_version = Some("x".repeat(65));
+    assert!(matches!(
+        classify_observation(&observation(None), &[oversized_tool_version]),
+        Err(EngineError::Input(
+            EngineInputError::InvalidClassificationToolVersion { rule_id }
+        )) if rule_id == "oversized-version"
+    ));
+
+    let mut noncanonical_tool_version = rule(
+        "noncanonical-version",
+        RuleIdSelector::Any,
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    noncanonical_tool_version.tool_version = Some(" 0.0.1 ".into());
+    assert!(matches!(
+        classify_observation(&observation(None), &[noncanonical_tool_version]),
+        Err(EngineError::Input(
+            EngineInputError::NonCanonicalClassificationToolVersion { rule_id }
+        )) if rule_id == "noncanonical-version"
     ));
 }
 

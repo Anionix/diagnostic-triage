@@ -85,6 +85,7 @@ fn structured_catalog_rule_is_retained_outside_finding_contract() {
     let rule = ClassificationRule {
         id: "ty.invalid-argument".into(),
         tool_name: "ty".into(),
+        tool_version: None,
         native_rule_id: RuleIdSelector::Exact("invalid-argument-type".into()),
         language: None,
         origin: None,
@@ -93,6 +94,36 @@ fn structured_catalog_rule_is_retained_outside_finding_contract() {
     let classified = build_finding(&observation(), &[rule]).unwrap();
 
     assert_eq!(classified.classification_rule_id, "ty.invalid-argument");
+    assert_eq!(classified.finding.classification, taxonomy());
+}
+
+#[test]
+fn build_finding_uses_version_specific_rule() {
+    let generic = ClassificationRule {
+        id: "ty.generic".into(),
+        tool_name: "ty".into(),
+        tool_version: None,
+        native_rule_id: RuleIdSelector::Exact("invalid-argument-type".into()),
+        language: None,
+        origin: None,
+        taxonomy: Taxonomy {
+            category: Category::Type,
+            micro_category: MicroCategory::Unknown,
+        },
+    };
+    let versioned = ClassificationRule {
+        id: "ty.0.0.1".into(),
+        tool_name: "ty".into(),
+        tool_version: Some("0.0.1".into()),
+        native_rule_id: RuleIdSelector::Exact("invalid-argument-type".into()),
+        language: None,
+        origin: None,
+        taxonomy: taxonomy(),
+    };
+
+    let classified = build_finding(&observation(), &[generic, versioned]).unwrap();
+
+    assert_eq!(classified.classification_rule_id, "ty.0.0.1");
     assert_eq!(classified.finding.classification, taxonomy());
 }
 

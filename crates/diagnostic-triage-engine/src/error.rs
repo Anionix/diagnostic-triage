@@ -19,6 +19,10 @@ pub enum EngineInputError {
     InvalidClassificationToolName { rule_id: String },
     #[error("classification rule {rule_id} has a noncanonical tool name")]
     NonCanonicalClassificationToolName { rule_id: String },
+    #[error("classification rule {rule_id} has an invalid tool version")]
+    InvalidClassificationToolVersion { rule_id: String },
+    #[error("classification rule {rule_id} has a noncanonical tool version")]
+    NonCanonicalClassificationToolVersion { rule_id: String },
     #[error("classification rule {rule_id} has an invalid native rule ID")]
     InvalidClassificationNativeRuleId { rule_id: String },
     #[error("classification rule {rule_id} has a noncanonical native rule ID")]
@@ -54,11 +58,11 @@ pub enum EngineError {
     #[error("no taxonomy rule matched observation {observation_id}")]
     Unclassified { observation_id: String },
     #[error(
-        "taxonomy rules are ambiguous for observation {observation_id}: {rule_ids} (+{omitted_rule_count} more)"
+        "taxonomy rules are ambiguous for observation {observation_id}: {rule_ids:?} (+{omitted_rule_count} more)"
     )]
     AmbiguousClassification {
         observation_id: String,
-        rule_ids: String,
+        rule_ids: Vec<String>,
         omitted_rule_count: usize,
     },
     #[error("findings with fingerprint {fingerprint} have conflicting {field}")]
