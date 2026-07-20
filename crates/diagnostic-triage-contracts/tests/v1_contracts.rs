@@ -141,6 +141,124 @@ fn typed_reports_round_trip_without_emitting_optional_nulls() {
 }
 
 #[test]
+fn decision_evaluated_at_is_required_and_strictly_rfc3339() {
+    let valid = report_fixture();
+    validate_report_json(&serde_json::to_vec(&valid).expect("report remains JSON serializable"))
+        .expect("decision with a strict evaluated_at is valid");
+
+    let mut missing = valid.clone();
+    missing["decisions"][0]
+        .as_object_mut()
+        .expect("decision is an object")
+        .remove("evaluated_at");
+    assert!(
+        rejects_report(&missing),
+        "accepted a Decision without evaluated_at"
+    );
+
+    for invalid_timestamp in [
+        "not-a-date",
+        "2026-07-21T00:00:00+24:00",
+        "2026-02-29T00:00:00Z",
+        "2026-07-21T00:00:00.1234567890Z",
+    ] {
+        let mut invalid = valid.clone();
+        invalid["decisions"][0]["evaluated_at"] = json!(invalid_timestamp);
+        assert!(
+            rejects_report(&invalid),
+            "accepted invalid Decision evaluated_at {invalid_timestamp:?}"
+        );
+    }
+}
+
+#[test]
+fn report_rejects_decisions_with_mixed_evaluation_instants() {
+    let mut report = report_fixture();
+    let second_finding_id = "019f7e95-0000-7000-8000-000000000107";
+    let second_decision_id = "019f7e95-0000-7000-8000-000000000108";
+
+    let mut second_finding = report["findings"][0].clone();
+    second_finding["finding_id"] = json!(second_finding_id);
+    second_finding["fingerprint"] = json!(format!("dtfp1:{}", "d".repeat(64)));
+    second_finding["message"] = json!("A second finding evaluated in the same report");
+    report["findings"]
+        .as_array_mut()
+        .expect("findings is an array")
+        .push(second_finding);
+
+    let mut second_decision = report["decisions"][0].clone();
+    second_decision["decision_id"] = json!(second_decision_id);
+    second_decision["finding_id"] = json!(second_finding_id);
+    second_decision["evaluated_at"] = json!("2026-07-21T01:00:00+01:00");
+    report["decisions"]
+        .as_array_mut()
+        .expect("decisions is an array")
+        .push(second_decision);
+
+    validate_report_json(&serde_json::to_vec(&report).unwrap())
+        .expect("equivalent offset spellings represent one evaluation instant");
+
+    report["decisions"][1]["evaluated_at"] = json!("2026-07-21T00:00:01Z");
+    assert!(
+        rejects_report(&report),
+        "accepted Decisions with mixed policy evaluation instants"
+    );
+}
+
+#[test]
+fn waive_expiry_must_be_strictly_after_evaluation_by_parsed_instant() {
+    let mut report = report_fixture();
+    report["decisions"][0]["action"] = json!("WAIVE");
+    report["decisions"][0]["evaluated_at"] = json!("2026-07-21T00:00:00Z");
+    report["decisions"][0]["waiver"] = json!({
+        "fingerprint": report["findings"][0]["fingerprint"].clone(),
+        "waived_action": "BLOCK",
+        "reason": "accepted until the upstream fix lands",
+        "owner": "maintainers",
+        "expires_at": "2026-08-20T00:00:00Z"
+    });
+
+    for (expiry, accepted) in [
+        ("2026-07-21T00:00:00Z", false),
+        ("2026-07-20T23:59:59.999999999Z", false),
+        ("2026-07-21T01:00:00+01:00", false),
+        ("2026-07-21T00:30:00+01:00", false),
+        ("2026-07-20T23:30:00-01:00", true),
+        ("2026-07-21T00:00:00.000000001Z", true),
+    ] {
+        let mut candidate = report.clone();
+        candidate["decisions"][0]["waiver"]["expires_at"] = json!(expiry);
+        if accepted {
+            validate_report_json(&serde_json::to_vec(&candidate).unwrap())
+                .unwrap_or_else(|error| panic!("rejected valid expiry {expiry}: {error}"));
+        } else {
+            assert!(
+                rejects_report(&candidate),
+                "accepted expiry {expiry} that is not after evaluation"
+            );
+        }
+    }
+
+    for (evaluated_at, expires_at) in [
+        (
+            "0000-01-01T00:00:00.000000000Z",
+            "0000-01-01T00:00:00.000000001Z",
+        ),
+        (
+            "9998-12-31T23:59:58.999999999Z",
+            "9998-12-31T23:59:59.000000000Z",
+        ),
+    ] {
+        let mut candidate = report.clone();
+        candidate["decisions"][0]["evaluated_at"] = json!(evaluated_at);
+        candidate["decisions"][0]["waiver"]["expires_at"] = json!(expires_at);
+        validate_report_json(&serde_json::to_vec(&candidate).unwrap()).unwrap_or_else(|error| {
+            panic!("rejected v1 boundary interval {evaluated_at}..{expires_at}: {error}")
+        });
+    }
+}
+
+#[test]
 fn direct_report_deserialization_rejects_duplicate_keys() {
     let text = String::from_utf8(fixture("valid-report.json")).expect("report fixture is UTF-8");
     let duplicate = text.replacen(

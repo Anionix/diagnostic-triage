@@ -55,6 +55,7 @@
       "decision_id": "019f7e95-0000-7000-8000-000000000106",
       "finding_id": "019f7e95-0000-7000-8000-000000000105",
       "action": "BLOCK",
+      "evaluated_at": "2026-07-21T00:00:00Z",
       "policy_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
       "matched_rule_id": "default.error.type"
     }
