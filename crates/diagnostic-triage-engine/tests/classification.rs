@@ -274,6 +274,78 @@ fn tool_versions_are_opaque_and_case_sensitive() {
 }
 
 #[test]
+fn absent_native_rule_selector_refines_any_for_missing_rule_id() {
+    let fallback = rule(
+        "fallback",
+        RuleIdSelector::Any,
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    let absent = rule(
+        "absent",
+        RuleIdSelector::Absent,
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
+    );
+
+    let selected = classify_observation(&observation(None), &[absent, fallback]).unwrap();
+
+    assert_eq!(selected.rule_id, "absent");
+}
+
+#[test]
+fn unequal_constraint_counts_do_not_break_incomparable_ambiguity() {
+    let mut three_constraints = rule(
+        "three",
+        RuleIdSelector::Exact("x".into()),
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    three_constraints.tool_version = Some("0.0.1".into());
+    three_constraints.language = Some(Language::from_str("python").unwrap());
+    let mut origin_only = rule(
+        "origin",
+        RuleIdSelector::Any,
+        taxonomy(Category::Correctness, MicroCategory::WrongResult),
+    );
+    origin_only.origin = Some(Origin::Normal);
+
+    assert!(matches!(
+        classify_observation(
+            &observation(Some("x")),
+            &[three_constraints, origin_only]
+        ),
+        Err(EngineError::AmbiguousClassification { rule_ids, .. })
+            if rule_ids == vec!["origin", "three"]
+    ));
+}
+
+#[test]
+fn later_combined_refinement_dominates_both_diamond_parents() {
+    let mut version_only = rule(
+        "version",
+        RuleIdSelector::Any,
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    version_only.tool_version = Some("0.0.1".into());
+    let mut language_only = rule(
+        "language",
+        RuleIdSelector::Any,
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    language_only.language = Some(Language::from_str("python").unwrap());
+    let mut combined = rule(
+        "combined",
+        RuleIdSelector::Any,
+        taxonomy(Category::Correctness, MicroCategory::WrongResult),
+    );
+    combined.tool_version = Some("0.0.1".into());
+    combined.language = Some(Language::from_str("python").unwrap());
+
+    let selected =
+        classify_observation(&observation(None), &[version_only, language_only, combined]).unwrap();
+
+    assert_eq!(selected.rule_id, "combined");
+}
+
+#[test]
 fn absent_selector_does_not_match_present_rule_id() {
     let absent = rule(
         "ty.no-rule",
@@ -349,6 +421,62 @@ fn ambiguous_classification_error_is_bounded() {
             omitted_rule_count: 2,
             ..
         }) if rule_ids.len() == 8
+    ));
+}
+
+#[test]
+fn maximum_supported_catalog_selects_a_unique_refinement_at_the_end() {
+    let fallback_taxonomy = taxonomy(Category::Type, MicroCategory::Unknown);
+    let mut rules = (0..MAX_CLASSIFICATION_RULES - 1)
+        .map(|index| {
+            rule(
+                &format!("fallback-{index:04}"),
+                RuleIdSelector::Any,
+                fallback_taxonomy.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    rules.push(rule(
+        "unique-refinement",
+        RuleIdSelector::Exact("x".to_owned()),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
+    ));
+
+    let selected = classify_observation(&observation(Some("x")), &rules).unwrap();
+
+    assert_eq!(rules.len(), MAX_CLASSIFICATION_RULES);
+    assert_eq!(selected.rule_id, "unique-refinement");
+    assert_eq!(
+        selected.taxonomy.micro_category,
+        MicroCategory::IncompatibleType
+    );
+}
+
+#[test]
+fn maximum_supported_ambiguity_is_bounded_and_deterministic() {
+    let shared_taxonomy = taxonomy(Category::Type, MicroCategory::Unknown);
+    let rules = (0..MAX_CLASSIFICATION_RULES)
+        .rev()
+        .map(|index| {
+            rule(
+                &format!("ambiguous-{index:04}"),
+                RuleIdSelector::Exact("x".to_owned()),
+                shared_taxonomy.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let expected_rule_ids = (0..8)
+        .map(|index| format!("ambiguous-{index:04}"))
+        .collect::<Vec<_>>();
+
+    assert!(matches!(
+        classify_observation(&observation(Some("x")), &rules),
+        Err(EngineError::AmbiguousClassification {
+            rule_ids,
+            omitted_rule_count,
+            ..
+        }) if rule_ids == expected_rule_ids
+            && omitted_rule_count == MAX_CLASSIFICATION_RULES - 8
     ));
 }
 

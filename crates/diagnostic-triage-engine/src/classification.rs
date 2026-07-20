@@ -14,6 +14,7 @@ use crate::{EngineError, EngineInputError, normalize::collapse_whitespace};
 /// Maximum number of taxonomy mappings accepted by the v1 classifier.
 pub const MAX_CLASSIFICATION_RULES: usize = 4096;
 const MAX_AMBIGUOUS_RULE_IDS: usize = 8;
+const CONSTRAINT_MASK_COUNT: usize = 1 << 4;
 
 /// Match behavior for an optional native rule identifier.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,28 +119,33 @@ impl ClassificationRule {
                 .is_none_or(|origin| origin == &observation.origin)
     }
 
-    fn is_more_specific_than(&self, other: &Self) -> bool {
-        let own = [
-            self.tool_version.is_some(),
-            self.native_rule_id.is_constrained(),
-            self.language.is_some(),
-            self.origin.is_some(),
-        ];
-        let candidate = [
-            other.tool_version.is_some(),
-            other.native_rule_id.is_constrained(),
-            other.language.is_some(),
-            other.origin.is_some(),
-        ];
-
-        own.iter()
-            .zip(candidate)
-            .all(|(own, candidate)| !candidate || *own)
-            && own
-                .iter()
-                .zip(candidate)
-                .any(|(own, candidate)| *own && !candidate)
+    fn constraint_mask(&self) -> u8 {
+        u8::from(self.tool_version.is_some())
+            | (u8::from(self.native_rule_id.is_constrained()) << 1)
+            | (u8::from(self.language.is_some()) << 2)
+            | (u8::from(self.origin.is_some()) << 3)
     }
+}
+
+fn maximal_constraint_masks(populated: u16) -> u16 {
+    // Co-matching rules agree on every constrained value, so strict bit-set
+    // inclusion is exactly the v1 refinement relation over four dimensions.
+    let mut maximal = 0_u16;
+    for candidate in 0..CONSTRAINT_MASK_COUNT {
+        let candidate_bit = 1_u16 << candidate;
+        if populated & candidate_bit == 0 {
+            continue;
+        }
+        let dominated = (0..CONSTRAINT_MASK_COUNT).any(|other| {
+            other != candidate
+                && populated & (1_u16 << other) != 0
+                && (other & candidate) == candidate
+        });
+        if !dominated {
+            maximal |= candidate_bit;
+        }
+    }
+    maximal
 }
 
 /// The selected taxonomy and its auditable catalog rule.
@@ -153,7 +159,7 @@ pub struct ClassificationMatch {
 ///
 /// # Errors
 ///
-/// Returns an error for invalid observations or catalog rules, no match, or an
+/// Returns an error for invalid observations or catalog rules, no match, or
 /// multiple incomparable or identically constrained maximal matches.
 pub fn classify_observation(
     observation: &Observation,
@@ -191,40 +197,63 @@ pub fn classify_observation(
         }
     }
 
-    let matches = rules
-        .iter()
-        .filter(|rule| rule.matches(observation))
-        .collect::<Vec<_>>();
-    if matches.is_empty() {
+    let mut matching_by_mask: [Vec<&ClassificationRule>; CONSTRAINT_MASK_COUNT] =
+        std::array::from_fn(|_| Vec::new());
+    let mut populated_masks = 0_u16;
+    for rule in rules.iter().filter(|rule| rule.matches(observation)) {
+        let mask = usize::from(rule.constraint_mask());
+        populated_masks |= 1_u16 << mask;
+        matching_by_mask[mask].push(rule);
+    }
+    if populated_masks == 0 {
         return Err(EngineError::Unclassified {
             observation_id: observation.observation_id.to_string(),
         });
     }
-    let mut maximal = matches
-        .iter()
-        .copied()
-        .filter(|candidate| {
-            !matches
-                .iter()
-                .any(|other| other.is_more_specific_than(candidate))
-        })
-        .collect::<Vec<_>>();
-    maximal.sort_by(|left, right| left.id.cmp(&right.id));
 
-    if maximal.len() > 1 {
-        let reported_rule_count = maximal.len().min(MAX_AMBIGUOUS_RULE_IDS);
+    let maximal_masks = maximal_constraint_masks(populated_masks);
+    let maximal_rule_count = matching_by_mask
+        .iter()
+        .enumerate()
+        .filter(|(mask, _)| maximal_masks & (1_u16 << mask) != 0)
+        .map(|(_, rules)| rules.len())
+        .sum::<usize>();
+    if maximal_rule_count > 1 {
+        let mut reported_rule_ids = BTreeSet::new();
+        for rule in matching_by_mask
+            .iter()
+            .enumerate()
+            .filter(|(mask, _)| maximal_masks & (1_u16 << mask) != 0)
+            .flat_map(|(_, rules)| rules)
+        {
+            if reported_rule_ids.len() < MAX_AMBIGUOUS_RULE_IDS {
+                reported_rule_ids.insert(rule.id.as_str());
+                continue;
+            }
+            let should_replace = reported_rule_ids
+                .last()
+                .is_some_and(|largest| rule.id.as_str() < *largest);
+            if should_replace {
+                reported_rule_ids.pop_last();
+                reported_rule_ids.insert(rule.id.as_str());
+            }
+        }
         return Err(EngineError::AmbiguousClassification {
             observation_id: observation.observation_id.to_string(),
-            rule_ids: maximal
-                .iter()
-                .take(reported_rule_count)
-                .map(|rule| rule.id.clone())
-                .collect(),
-            omitted_rule_count: maximal.len() - reported_rule_count,
+            rule_ids: reported_rule_ids.into_iter().map(str::to_owned).collect(),
+            omitted_rule_count: maximal_rule_count - maximal_rule_count.min(MAX_AMBIGUOUS_RULE_IDS),
         });
     }
 
-    let selected = maximal[0];
+    let selected = matching_by_mask
+        .iter()
+        .enumerate()
+        .filter(|(mask, _)| maximal_masks & (1_u16 << mask) != 0)
+        .flat_map(|(_, rules)| rules)
+        .next()
+        .ok_or_else(|| EngineError::Unclassified {
+            observation_id: observation.observation_id.to_string(),
+        })?;
     Ok(ClassificationMatch {
         rule_id: selected.id.clone(),
         taxonomy: selected.taxonomy.clone(),
