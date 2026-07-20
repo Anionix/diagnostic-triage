@@ -5,7 +5,7 @@
     "version": "0.1.0",
     "source_revision": "84563c93ee06e3a834a03ff53f21b62b6ab0cc89"
   },
-  "contract_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "contract_sha256": "7b8652989f914ceb44a174fb015b3f990e23670e977cc5f77e997a15cfa7f3d3",
   "policy_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   "verdict": "UNSUPPORTED",
   "observations": [],

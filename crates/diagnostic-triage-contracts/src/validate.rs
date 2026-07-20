@@ -2,8 +2,10 @@
 
 use std::collections::{HashMap, HashSet};
 
+use sha2::{Digest, Sha256};
+
 use crate::{
-    ContractError, Fingerprint, ObjectId, Sha256Digest,
+    ContractError, Fingerprint, ObjectId, Sha256Digest, SourceRevision,
     jsonl::{decode_json_object, decode_jsonl, decode_line},
     model::{
         AdapterKind, Decision, Evidence, EvidenceSource, Execution, ExecutionStatus, Finding,
@@ -253,11 +255,44 @@ fn preflight_report_input(input: &[u8], max_bytes: usize) -> Result<(), Contract
 /// violated.
 pub fn validate_report(report: &SessionReport) -> Result<(), ContractError> {
     report.validate()?;
+    validate_contract_identity(report)?;
     let index = ReportIndex::new(report)?;
     validate_report_references(report, &index)?;
     validate_report_decisions(report, &index)?;
     for candidate in index.fixes.values() {
         validate_fix_references(candidate, &index.observations, &index.evidence)?;
+    }
+    Ok(())
+}
+
+/// Validate a report and bind it to a consumer's immutable source pin.
+///
+/// # Errors
+///
+/// Returns [`ContractError::Model`] when the report is invalid or its Engine
+/// revision differs from `expected_source_revision`.
+pub fn validate_report_for_revision(
+    report: &SessionReport,
+    expected_source_revision: &SourceRevision,
+) -> Result<(), ContractError> {
+    validate_report(report)?;
+    if &report.engine.source_revision != expected_source_revision {
+        return Err(model_error(
+            "engine source revision differs from consumer pin",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_contract_identity(report: &SessionReport) -> Result<(), ContractError> {
+    let expected = format!(
+        "{:x}",
+        Sha256::digest(report.engine.source_revision.as_str().as_bytes())
+    );
+    if report.contract_sha256.as_str() != expected {
+        return Err(model_error(
+            "contract digest differs from engine source revision",
+        ));
     }
     Ok(())
 }

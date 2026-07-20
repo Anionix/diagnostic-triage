@@ -13,7 +13,7 @@ fix safety.
 The project is establishing its versioned contracts. The stable v1 interfaces
 will be the `diagnostic-triage` command, `diagnostic-triage.toml`, JSON/JSONL
 schemas, and exit codes. Rust workspace crates are internal and will not be
-published during v1 development.
+published during v1 development. No alpha contract has been published yet.
 
 The canonical architecture and terminology are recorded in [CONTEXT.md](CONTEXT.md)
 and [ADR 0001](docs/adr/0001-standalone-canonical-engine.md).

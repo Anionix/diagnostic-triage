@@ -39,15 +39,40 @@ and session outcome itself; a transcript containing such a Request is invalid.
 The manifest-only outcome is fixed by `handshake-unsupported.json` and its
 referenced `valid-unsupported-report.json` golden fixture.
 
-Schema v1 is additive only. Changing an existing field's meaning, accepted
-value set, ordering rule, error rule, or default requires protocol v2.
+### Contract version compatibility
 
-### Pre-v1 release compatibility note
+No alpha contract has been published. Before the first alpha release, v1
+identifiers are provisional: contract corrections may add, remove, or require
+fields and may change validation semantics. Pre-alpha consumers must pin the
+immutable, full commit object ID from the canonical
+`Anionix/diagnostic-triage` Git repository. A produced
+`SessionReport.engine.source_revision` must equal that pin. The corresponding
+`SessionReport.contract_sha256` is the lowercase SHA-256 of the revision's
+lowercase ASCII object ID with no prefix, newline, or other terminator. Contract
+validation checks this pair; consumers additionally compare `source_revision`
+with their external source pin through `validate_report_for_revision` or an
+equivalent runtime boundary. The pin itself supplies the expected bytes, so no
+separate digest publication is required before release manifests exist. Golden
+fixtures carry a fixed example identity and are contract examples, not release
+reports. A different source revision or contract digest is a different
+pre-alpha contract.
 
-Before the first alpha release, consumers pin the exact contract SHA-256 digest
-that they validate against. Strict validators pinned to an earlier v1 digest
-may reject additive fields; pre-alpha v1 therefore does not claim old-reader
-compatibility.
+This comparison binds a report's claimed contract identity; it is not an
+attestation that an untrusted producer ran that revision, and hashing a Git
+object ID does not strengthen its provenance. Consumers that require producer
+or artifact authenticity must separately verify the release manifest, artifact
+digest, and signature once those release artifacts exist.
+
+Starting with the first alpha release, the whole published v1 boundary becomes
+additive-only: schemas, protocol identifiers and events, taxonomy values, and
+cross-object validation rules may gain only optional surface. Changing an
+existing field's meaning, accepted value set, ordering rule, error rule,
+required status, or default then requires protocol v2. Validators remain pinned
+to an exact contract digest. Any additive v1 change creates a new digest and
+requires an explicit consumer pin refresh; an older pinned validator may reject
+members or events absent from its contract. Additive-only constrains evolution
+between published v1 digests and is not an unknown-field fallback rule. Only
+negotiated unknown optional capabilities are ignored.
 
 JSON Schema validates each envelope's shape. Transcript and report validators
 add cross-object semantics that Draft 2020-12 cannot express portably: adapter

@@ -39,6 +39,7 @@ outside v1.
 - First-party adapters pay process startup cost in exchange for fault isolation
   and one real protocol seam.
 - Rust implementation details may change without a public crate migration.
-- A breaking contract change requires a new schema/protocol major version.
+- After the first alpha, a breaking contract change requires a new
+  schema/protocol major version.
 - The prototype in `Anionix/data-format-lab` is provenance, not a compatibility
   commitment; this repository's first published contracts define v1.
