@@ -42,6 +42,13 @@ referenced `valid-unsupported-report.json` golden fixture.
 Schema v1 is additive only. Changing an existing field's meaning, accepted
 value set, ordering rule, error rule, or default requires protocol v2.
 
+### Pre-v1 release compatibility note
+
+Before the first alpha release, consumers pin the exact contract SHA-256 digest
+that they validate against. Strict validators pinned to an earlier v1 digest
+may reject additive fields; pre-alpha v1 therefore does not claim old-reader
+compatibility.
+
 JSON Schema validates each envelope's shape. Transcript and report validators
 add cross-object semantics that Draft 2020-12 cannot express portably: adapter
 role and operation, negotiated event capabilities, manifest attribution,
@@ -88,6 +95,44 @@ and a `..` segment are invalid. An Evidence path is validated by the same rule.
 No partial session is promoted to PASS. Providers emit Observations, not
 Findings, fingerprints, Decisions, or final policy Verdicts.
 
+## Verification and evidence attribution
+
+A `FixCandidate.observation_ids` list defines the candidate's observation
+scope. Every Finding with a `fix_candidate_id` must have all of its observations
+covered by that scope. A Finding that cites verification
+(`verification_execution_ids`) must also cite a `fix_candidate_id`. Each source Observation
+and its Finding must use the same complete tool identity, including `rule_id`.
+A candidate must not span different `tool.name`/`tool.version` identities, but
+it may cover observations from multiple `rule_id` values for that one tool
+version.
+
 Execution records name both the adapter and invoked tool. Queue, setup, run,
 normalize, cache, retry, runner, and toolchain identity are explicit; unavailable
 measurements use the contract's `UNAVAILABLE` value instead of inferred data.
+Runtime-synthesized Provider executions may include `verification`, a
+structural receipt containing the `fix_candidate_id`, `patch_sha256`,
+`base_snapshot_sha256`, `base_snapshot_evidence_id`, nonempty unique
+`target_fingerprints`, and `result_evidence_id` for the verification result.
+`base_snapshot_evidence_id` must identify dedicated `ARTIFACT` evidence with
+media type `application/vnd.diagnostic-triage.snapshot+json` whose `sha256`
+matches `base_snapshot_sha256`. Verification PATCH evidence must be complete,
+not truncated, and inline. Snapshot Evidence must also use inline `content` so
+its digest is recomputed during contract validation; a `relative_path` PATCH or
+snapshot is not proof.
+Snapshot and result evidence IDs must be distinct. Snapshot evidence must never
+be truncated: `truncated` is `false` and `observed_bytes` equals
+`retained_bytes`. A verification result Evidence
+must set its optional `execution_id` to the owning verification execution; a
+`COMPLETE` verification execution's result evidence must likewise never be
+truncated and must be inline. Evidence omits `execution_id` unless it is owned
+by an execution.
+Any execution-owned Evidence must resolve to an Execution in the same complete
+`SessionReport`. In a protocol transcript it must resolve to an Execution event
+in that transcript, which remains subject to the normal final `completion`
+requirement. These are structural links and
+digest bindings in the SessionReport, not cryptographic attestations; they do
+not by themselves prove patch provenance, execution integrity, or result
+correctness. Request IDs are intentionally excluded because SessionReport has
+no validated request collection. Observer and Engine executions cannot carry
+it. The field is omitted when absent, never serialized as `null`; the Request
+envelope does not carry a fix candidate, including for `VERIFY --patch`.

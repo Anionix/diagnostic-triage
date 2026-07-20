@@ -1,0 +1,157 @@
+{
+  "schema_version": "diagnostic-triage.session-report/v1",
+  "session_id": "019f7e95-0000-7000-8000-000000000101",
+  "engine": {
+    "version": "0.1.0",
+    "source_revision": "84563c93ee06e3a834a03ff53f21b62b6ab0cc89"
+  },
+  "contract_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "policy_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "verdict": "POLICY_FAIL",
+  "observations": [
+    {
+      "schema_version": "diagnostic-triage.observation/v1",
+      "observation_id": "019f7e95-0000-7000-8000-000000000103",
+      "tool": { "name": "ruff", "version": "0.12.4", "rule_id": "F821" },
+      "language": "python",
+      "severity": "ERROR",
+      "origin": "NORMAL",
+      "message": "Undefined name `x`",
+      "location": {
+        "path": "src/example.py",
+        "start": { "line": 7, "column": 12 },
+        "end": { "line": 7, "column": 13 }
+      },
+      "symbol": "x",
+      "evidence_ids": ["019f7e95-0000-7000-8000-000000000102"]
+    }
+  ],
+  "findings": [
+    {
+      "schema_version": "diagnostic-triage.finding/v1",
+      "finding_id": "019f7e95-0000-7000-8000-000000000105",
+      "fingerprint": "dtfp1:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "observation_ids": ["019f7e95-0000-7000-8000-000000000103"],
+      "tool": { "name": "ruff", "version": "0.12.4", "rule_id": "F821" },
+      "language": "python",
+      "severity": "ERROR",
+      "classification": { "category": "type", "micro_category": "unresolved-symbol" },
+      "message": "Undefined name `x`",
+      "location": {
+        "path": "src/example.py",
+        "start": { "line": 7, "column": 12 },
+        "end": { "line": 7, "column": 13 }
+      },
+      "symbol": "x",
+      "state": "VERIFIED",
+      "evidence_ids": ["019f7e95-0000-7000-8000-000000000102"],
+      "fix_candidate_id": "019f7e95-0000-7000-8000-000000000108",
+      "verification_execution_ids": ["019f7e95-0000-7000-8000-000000000104"]
+    }
+  ],
+  "decisions": [
+    {
+      "schema_version": "diagnostic-triage.decision/v1",
+      "decision_id": "019f7e95-0000-7000-8000-000000000106",
+      "finding_id": "019f7e95-0000-7000-8000-000000000105",
+      "action": "BLOCK",
+      "policy_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "matched_rule_id": "default.error.type"
+    }
+  ],
+  "evidence": [
+    {
+      "schema_version": "diagnostic-triage.evidence/v1",
+      "evidence_id": "019f7e95-0000-7000-8000-000000000102",
+      "source": "DIAGNOSTIC",
+      "media_type": "text/plain",
+      "retained_bytes": 4,
+      "observed_bytes": 4,
+      "limit_bytes": 1048576,
+      "truncated": false,
+      "sha256": "a70c83c40d7e2ef96c8ed8d033cf2cc0909a37b415020c316380ccb1d40520d8",
+      "content": "F821"
+    },
+    {
+      "schema_version": "diagnostic-triage.evidence/v1",
+      "evidence_id": "019f7e95-0000-7000-8000-000000000107",
+      "source": "PATCH",
+      "media_type": "text/x-diff",
+      "retained_bytes": 42,
+      "observed_bytes": 42,
+      "limit_bytes": 1048576,
+      "truncated": false,
+      "sha256": "f7efec72998d2a5dfccffb6c8677c1f5219236675eac2657908456a3579166c0",
+      "content": "--- a/src/example.py\n+++ b/src/example.py\n"
+    },
+    {
+      "schema_version": "diagnostic-triage.evidence/v1",
+      "evidence_id": "019f7e95-0000-7000-8000-000000000110",
+      "execution_id": "019f7e95-0000-7000-8000-000000000104",
+      "source": "STDOUT",
+      "media_type": "text/plain",
+      "retained_bytes": 0,
+      "observed_bytes": 0,
+      "limit_bytes": 1048576,
+      "truncated": false,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "content": ""
+    },
+    {
+      "schema_version": "diagnostic-triage.evidence/v1",
+      "evidence_id": "019f7e95-0000-7000-8000-000000000109",
+      "source": "ARTIFACT",
+      "media_type": "application/vnd.diagnostic-triage.snapshot+json",
+      "retained_bytes": 82,
+      "observed_bytes": 82,
+      "limit_bytes": 1048576,
+      "truncated": false,
+      "sha256": "3b6a36b9dbd72d7d1ea5c498dbadaa424c19c25fe8bf6852fc13e7e214df8ffa",
+      "content": "{\"tree_sha256\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}"
+    }
+  ],
+  "fix_candidates": [
+    {
+      "schema_version": "diagnostic-triage.fix-candidate/v1",
+      "fix_candidate_id": "019f7e95-0000-7000-8000-000000000108",
+      "observation_ids": ["019f7e95-0000-7000-8000-000000000103"],
+      "applicability": "SAFE",
+      "tool_native": true,
+      "patch_evidence_id": "019f7e95-0000-7000-8000-000000000107"
+    }
+  ],
+  "executions": [
+    {
+      "schema_version": "diagnostic-triage.execution/v1",
+      "execution_id": "019f7e95-0000-7000-8000-000000000104",
+      "adapter_id": "ruff",
+      "adapter_kind": "PROVIDER",
+      "tool": { "name": "ruff", "version": "0.12.4" },
+      "toolchain_fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "required": true,
+      "status": "COMPLETE",
+      "exit_code": 1,
+      "phases_ms": {
+        "queue": "NOT_APPLICABLE",
+        "setup": 0,
+        "run": 180,
+        "normalize": 4,
+        "total": 184
+      },
+      "performance": { "status": "WITHIN_BUDGET", "budget_ms": 60000 },
+      "cache": { "status": "NOT_APPLICABLE" },
+      "retry": { "status": "RECORDED", "attempt": 1, "same_revision": true },
+      "runner": { "status": "UNAVAILABLE" },
+      "verification": {
+        "fix_candidate_id": "019f7e95-0000-7000-8000-000000000108",
+        "patch_sha256": "f7efec72998d2a5dfccffb6c8677c1f5219236675eac2657908456a3579166c0",
+        "base_snapshot_sha256": "3b6a36b9dbd72d7d1ea5c498dbadaa424c19c25fe8bf6852fc13e7e214df8ffa",
+        "base_snapshot_evidence_id": "019f7e95-0000-7000-8000-000000000109",
+        "target_fingerprints": [
+          "dtfp1:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        ],
+        "result_evidence_id": "019f7e95-0000-7000-8000-000000000110"
+      }
+    }
+  ]
+}

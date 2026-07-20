@@ -9,6 +9,8 @@ use diagnostic_triage_contracts::{
 };
 use serde_json::{Value, json};
 
+// LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
+
 const VALID_SESSIONS: &[&str] = &[
     "valid-empty-session.jsonl",
     "valid-observer-session.jsonl",
@@ -36,7 +38,11 @@ const INVALID_SESSIONS: &[&str] = &[
     "invalid-truncated-session.jsonl",
     "invalid-unnegotiated-event.jsonl",
 ];
-const VALID_REPORTS: &[&str] = &["valid-report.json", "valid-unsupported-report.json"];
+const VALID_REPORTS: &[&str] = &[
+    "valid-report.json",
+    "valid-unsupported-report.json",
+    "valid-verified-report.json",
+];
 
 fn fixture_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -52,11 +58,29 @@ fn report_fixture() -> Value {
     serde_json::from_slice(&fixture("valid-report.json")).expect("report fixture is JSON")
 }
 
+fn verified_report_fixture() -> Value {
+    serde_json::from_slice(&fixture("valid-verified-report.json"))
+        .expect("verified report fixture is JSON")
+}
+
+fn observation_id(report: &Value) -> Value {
+    report["observations"][0]["observation_id"].clone()
+}
+
 fn rejects_report(value: &Value) -> bool {
     validate_report_json(
         &serde_json::to_vec(value).expect("mutated report remains JSON serializable"),
     )
     .is_err()
+}
+
+fn evidence_mut<'a>(report: &'a mut Value, evidence_id: &str) -> &'a mut Value {
+    report["evidence"]
+        .as_array_mut()
+        .expect("evidence is an array")
+        .iter_mut()
+        .find(|evidence| evidence["evidence_id"] == evidence_id)
+        .expect("fixture contains the referenced evidence")
 }
 
 #[test]
@@ -277,4 +301,619 @@ fn waiver_must_be_complete_and_bound_to_its_finding() {
         &serde_json::to_vec(&report).expect("mutated report remains JSON serializable"),
     )
     .expect("complete waiver bound to its finding is valid");
+}
+
+#[test]
+fn verified_finding_requires_exact_execution_attribution() {
+    let valid = verified_report_fixture();
+    validate_report_json(
+        &serde_json::to_vec(&valid).expect("verified report remains JSON serializable"),
+    )
+    .expect("candidate-bound verification execution is valid");
+
+    let mut missing = valid.clone();
+    missing["executions"][0]
+        .as_object_mut()
+        .expect("execution is an object")
+        .remove("verification");
+    assert!(
+        rejects_report(&missing),
+        "accepted a stale execution without verification attribution"
+    );
+
+    let mut dangling = valid.clone();
+    dangling["executions"][0]["verification"]["fix_candidate_id"] =
+        json!("019f7e95-0000-7000-8000-000000000999");
+    assert!(
+        rejects_report(&dangling),
+        "accepted verification attribution to an unknown candidate"
+    );
+
+    let mut mismatched = valid.clone();
+    let mut alternate = mismatched["fix_candidates"][0].clone();
+    alternate["fix_candidate_id"] = json!("019f7e95-0000-7000-8000-000000000109");
+    mismatched["fix_candidates"]
+        .as_array_mut()
+        .expect("fix_candidates is an array")
+        .push(alternate);
+    mismatched["executions"][0]["verification"]["fix_candidate_id"] =
+        json!("019f7e95-0000-7000-8000-000000000109");
+    assert!(
+        rejects_report(&mismatched),
+        "accepted verification attribution for a different candidate"
+    );
+
+    for adapter_kind in ["ENGINE", "OBSERVER"] {
+        let mut invalid = valid.clone();
+        invalid["executions"][0]["adapter_kind"] = json!(adapter_kind);
+        assert!(
+            rejects_report(&invalid),
+            "accepted a {adapter_kind} execution as verification proof"
+        );
+    }
+
+    for applicability in ["MANUAL", "UNSAFE"] {
+        let mut invalid = valid.clone();
+        invalid["fix_candidates"][0]["applicability"] = json!(applicability);
+        assert!(
+            rejects_report(&invalid),
+            "accepted a {applicability} candidate as VERIFIED"
+        );
+    }
+}
+
+#[test]
+fn verification_attribution_requires_patch_targets_result_and_tool_identity() {
+    let valid = verified_report_fixture();
+    validate_report_json(
+        &serde_json::to_vec(&valid).expect("verified report remains JSON serializable"),
+    )
+    .expect("complete verification attribution is valid");
+
+    let patch_id = valid["fix_candidates"][0]["patch_evidence_id"]
+        .as_str()
+        .expect("fix candidate patch evidence id is a string")
+        .to_owned();
+    let mut truncated_patch = valid.clone();
+    let patch = evidence_mut(&mut truncated_patch, &patch_id);
+    let retained_bytes = patch["retained_bytes"]
+        .as_u64()
+        .expect("patch retained bytes is an integer");
+    patch["observed_bytes"] = json!(retained_bytes + 1);
+    patch["truncated"] = json!(true);
+    assert!(
+        rejects_report(&truncated_patch),
+        "accepted verification using truncated PATCH evidence"
+    );
+
+    let mut patch_relative_path = valid.clone();
+    let patch = evidence_mut(&mut patch_relative_path, &patch_id);
+    patch
+        .as_object_mut()
+        .expect("patch evidence is an object")
+        .remove("content");
+    patch["relative_path"] = json!("patches/fix.diff");
+    assert!(
+        rejects_report(&patch_relative_path),
+        "accepted verification using a relative_path PATCH evidence"
+    );
+
+    let mut wrong_patch_digest = valid.clone();
+    wrong_patch_digest["executions"][0]["verification"]["patch_sha256"] = json!("f".repeat(64));
+    assert!(
+        rejects_report(&wrong_patch_digest),
+        "accepted verification with a digest unrelated to PATCH evidence"
+    );
+
+    let mut wrong_target_set = valid.clone();
+    wrong_target_set["executions"][0]["verification"]["target_fingerprints"] =
+        json!([format!("dtfp1:{}", "f".repeat(64))]);
+    assert!(
+        rejects_report(&wrong_target_set),
+        "accepted verification for a target fingerprint outside the verified finding set"
+    );
+
+    let mut wrong_result_evidence = valid.clone();
+    wrong_result_evidence["executions"][0]["verification"]["result_evidence_id"] =
+        json!("019f7e95-0000-7000-8000-000000000999");
+    assert!(
+        rejects_report(&wrong_result_evidence),
+        "accepted verification pointing at unknown result evidence"
+    );
+
+    let mut unrelated_diagnostic = valid.clone();
+    unrelated_diagnostic["executions"][0]["verification"]["result_evidence_id"] =
+        unrelated_diagnostic["evidence"][0]["evidence_id"].clone();
+    assert!(
+        rejects_report(&unrelated_diagnostic),
+        "accepted verification pointing at an unrelated DIAGNOSTIC evidence"
+    );
+
+    for (label, execution_id) in [
+        ("missing", None),
+        ("wrong", Some(json!("019f7e95-0000-7000-8000-000000000999"))),
+    ] {
+        let mut invalid = valid.clone();
+        let result_evidence_id = invalid["executions"][0]["verification"]["result_evidence_id"]
+            .as_str()
+            .expect("result evidence id is a string")
+            .to_owned();
+        let result = evidence_mut(&mut invalid, &result_evidence_id);
+        match execution_id {
+            Some(execution_id) => result["execution_id"] = execution_id,
+            None => {
+                result
+                    .as_object_mut()
+                    .expect("result evidence is an object")
+                    .remove("execution_id");
+            }
+        }
+        assert!(
+            rejects_report(&invalid),
+            "accepted result evidence with {label} execution attribution"
+        );
+    }
+
+    let mut wrong_result_source = valid.clone();
+    wrong_result_source["evidence"][2]["source"] = json!("PATCH");
+    assert!(
+        rejects_report(&wrong_result_source),
+        "accepted verification whose result evidence has the wrong source"
+    );
+
+    for (field, value) in [("name", json!("black")), ("version", json!("0.12.3"))] {
+        let mut wrong_tool = valid.clone();
+        wrong_tool["executions"][0]["tool"][field] = value;
+        assert!(
+            rejects_report(&wrong_tool),
+            "accepted verification with mismatched execution tool {field}"
+        );
+    }
+}
+
+#[test]
+fn fix_proposed_finding_must_stay_within_candidate_observation_scope() {
+    let mut report = verified_report_fixture();
+    let out_of_scope_id = "019f7e95-0000-7000-8000-000000000111";
+    let mut out_of_scope = report["observations"][0].clone();
+    out_of_scope["observation_id"] = json!(out_of_scope_id);
+    out_of_scope["message"] = json!("another diagnostic");
+    report["observations"]
+        .as_array_mut()
+        .expect("observations is an array")
+        .push(out_of_scope);
+    report["findings"][0]["state"] = json!("FIX_PROPOSED");
+    report["findings"][0]["observation_ids"] = json!([out_of_scope_id]);
+    report["findings"][0]
+        .as_object_mut()
+        .expect("finding is an object")
+        .remove("verification_execution_ids");
+    report["executions"][0]
+        .as_object_mut()
+        .expect("execution is an object")
+        .remove("verification");
+
+    assert!(
+        rejects_report(&report),
+        "accepted FIX_PROPOSED finding outside its candidate observation scope"
+    );
+}
+
+#[test]
+fn fix_candidate_rejects_observations_from_multiple_tool_identities() {
+    let mut report = verified_report_fixture();
+    let second_observation_id = "019f7e95-0000-7000-8000-000000000111";
+    let mut second_observation = report["observations"][0].clone();
+    second_observation["observation_id"] = json!(second_observation_id);
+    second_observation["tool"]["name"] = json!("mypy");
+    second_observation["tool"]["version"] = json!("1.0.0");
+    report["observations"]
+        .as_array_mut()
+        .expect("observations is an array")
+        .push(second_observation);
+    report["fix_candidates"][0]["observation_ids"] =
+        json!([observation_id(&report), second_observation_id]);
+
+    assert!(
+        rejects_report(&report),
+        "accepted a fix candidate sourced from multiple tool identities"
+    );
+}
+
+#[test]
+fn fix_candidate_may_cover_multiple_rules_from_one_tool_version() {
+    let mut report = verified_report_fixture();
+    let second_observation_id = "019f7e95-0000-7000-8000-000000000111";
+    let mut second_observation = report["observations"][0].clone();
+    second_observation["observation_id"] = json!(second_observation_id);
+    second_observation["tool"]["rule_id"] = json!("E501");
+    second_observation["message"] = json!("line too long");
+    report["observations"]
+        .as_array_mut()
+        .expect("observations is an array")
+        .push(second_observation);
+    report["fix_candidates"][0]["observation_ids"] =
+        json!([observation_id(&report), second_observation_id]);
+
+    validate_report_json(&serde_json::to_vec(&report).unwrap())
+        .expect("one tool version may propose a candidate spanning multiple rules");
+}
+
+#[test]
+fn finding_tool_must_match_every_source_observation_tool() {
+    let mut report = report_fixture();
+    let second_observation_id = "019f7e95-0000-7000-8000-000000000111";
+    let mut second_observation = report["observations"][0].clone();
+    second_observation["observation_id"] = json!(second_observation_id);
+    second_observation["tool"]["name"] = json!("mypy");
+    second_observation["tool"]["version"] = json!("1.0.0");
+    report["observations"]
+        .as_array_mut()
+        .expect("observations is an array")
+        .push(second_observation);
+    report["findings"][0]["observation_ids"] =
+        json!([observation_id(&report), second_observation_id]);
+
+    assert!(
+        rejects_report(&report),
+        "accepted a finding whose tool differs from a source observation"
+    );
+}
+
+#[test]
+fn duplicate_finding_fingerprints_are_rejected() {
+    let mut report = report_fixture();
+    let mut duplicate = report["findings"][0].clone();
+    duplicate["finding_id"] = json!("019f7e95-0000-7000-8000-000000000107");
+    report["findings"]
+        .as_array_mut()
+        .expect("findings is an array")
+        .push(duplicate);
+
+    assert!(
+        rejects_report(&report),
+        "accepted duplicate finding fingerprints"
+    );
+}
+
+#[test]
+fn safe_fix_candidate_rejects_an_unrelated_observation_set() {
+    let mut report = verified_report_fixture();
+    let unrelated_observation_id = "019f7e95-0000-7000-8000-000000000111";
+    let mut unrelated_observation = report["observations"][0].clone();
+    unrelated_observation["observation_id"] = json!(unrelated_observation_id);
+    unrelated_observation["message"] = json!("unrelated diagnostic");
+    report["observations"]
+        .as_array_mut()
+        .expect("observations is an array")
+        .push(unrelated_observation);
+    report["fix_candidates"][0]["observation_ids"] = json!([unrelated_observation_id]);
+
+    assert!(
+        rejects_report(&report),
+        "accepted a SAFE fix candidate containing an unrelated observation"
+    );
+}
+
+#[test]
+fn verification_requires_an_attributed_base_snapshot_evidence() {
+    let valid = verified_report_fixture();
+    validate_report_json(
+        &serde_json::to_vec(&valid).expect("verified report remains JSON serializable"),
+    )
+    .expect("base snapshot evidence attribution is valid");
+
+    let mut unknown = valid.clone();
+    unknown["executions"][0]["verification"]["base_snapshot_evidence_id"] =
+        json!("019f7e95-0000-7000-8000-000000000999");
+    assert!(
+        rejects_report(&unknown),
+        "accepted verification pointing at unknown base snapshot evidence"
+    );
+
+    let base_snapshot_id = valid["executions"][0]["verification"]["base_snapshot_evidence_id"]
+        .as_str()
+        .expect("base snapshot evidence id is a string")
+        .to_owned();
+
+    let mut wrong_source = valid.clone();
+    evidence_mut(&mut wrong_source, &base_snapshot_id)["source"] = json!("PATCH");
+    assert!(
+        rejects_report(&wrong_source),
+        "accepted base snapshot evidence with the wrong source"
+    );
+
+    let mut wrong_media_type = valid.clone();
+    evidence_mut(&mut wrong_media_type, &base_snapshot_id)["media_type"] =
+        json!("application/octet-stream");
+    assert!(
+        rejects_report(&wrong_media_type),
+        "accepted base snapshot evidence with the wrong media type"
+    );
+
+    let mut wrong_digest = valid.clone();
+    wrong_digest["executions"][0]["verification"]["base_snapshot_sha256"] = json!("a".repeat(64));
+    assert!(
+        rejects_report(&wrong_digest),
+        "accepted base snapshot evidence with a mismatched digest"
+    );
+
+    let mut relative_path = valid;
+    let snapshot = evidence_mut(&mut relative_path, &base_snapshot_id);
+    snapshot
+        .as_object_mut()
+        .expect("base snapshot evidence is an object")
+        .remove("content");
+    snapshot["relative_path"] = json!("snapshots/base.json");
+    assert!(
+        rejects_report(&relative_path),
+        "accepted verification using a relative_path base snapshot"
+    );
+}
+
+#[test]
+fn verified_finding_rejects_truncated_base_snapshot_and_complete_result() {
+    let valid = verified_report_fixture();
+    let base_snapshot_id = valid["executions"][0]["verification"]["base_snapshot_evidence_id"]
+        .as_str()
+        .expect("base snapshot evidence id is a string")
+        .to_owned();
+    let result_id = valid["executions"][0]["verification"]["result_evidence_id"]
+        .as_str()
+        .expect("result evidence id is a string")
+        .to_owned();
+
+    for (label, evidence_id) in [
+        ("base snapshot", base_snapshot_id.as_str()),
+        ("result", result_id.as_str()),
+    ] {
+        let mut invalid = valid.clone();
+        let evidence = evidence_mut(&mut invalid, evidence_id);
+        let retained_bytes = evidence["retained_bytes"]
+            .as_u64()
+            .expect("retained bytes is an integer");
+        evidence["observed_bytes"] = json!(retained_bytes + 1);
+        evidence["truncated"] = json!(true);
+        assert!(
+            rejects_report(&invalid),
+            "accepted VERIFIED finding with truncated {label} evidence"
+        );
+    }
+
+    let mut result_relative_path = valid;
+    let result = evidence_mut(&mut result_relative_path, &result_id);
+    result
+        .as_object_mut()
+        .expect("result evidence is an object")
+        .remove("content");
+    result["relative_path"] = json!("receipts/result.txt");
+    assert!(
+        rejects_report(&result_relative_path),
+        "accepted COMPLETE verification with a relative_path result evidence"
+    );
+}
+
+#[test]
+fn verification_rejects_reusing_snapshot_as_result_and_snapshot_media_as_result() {
+    let valid = verified_report_fixture();
+    let execution_id = valid["executions"][0]["execution_id"].clone();
+    let base_snapshot_id = valid["executions"][0]["verification"]["base_snapshot_evidence_id"]
+        .as_str()
+        .expect("base snapshot evidence id is a string")
+        .to_owned();
+    let result_id = valid["executions"][0]["verification"]["result_evidence_id"]
+        .as_str()
+        .expect("result evidence id is a string")
+        .to_owned();
+
+    let mut same_evidence = valid.clone();
+    same_evidence["executions"][0]["verification"]["result_evidence_id"] = json!(&base_snapshot_id);
+    evidence_mut(&mut same_evidence, &base_snapshot_id)["execution_id"] = execution_id;
+    assert!(
+        rejects_report(&same_evidence),
+        "accepted the same evidence as both base snapshot and verification result"
+    );
+
+    let mut snapshot_result = valid;
+    evidence_mut(&mut snapshot_result, &result_id)["media_type"] =
+        json!("application/vnd.diagnostic-triage.snapshot+json");
+    assert!(
+        rejects_report(&snapshot_result),
+        "accepted snapshot media type for verification result evidence"
+    );
+}
+
+#[test]
+fn jsonl_evidence_execution_id_must_reference_an_execution_in_the_transcript() {
+    let valid = String::from_utf8(fixture("valid-session.jsonl")).expect("fixture is UTF-8");
+    let invalid = valid.replacen(
+        "\"source\":\"DIAGNOSTIC\"",
+        "\"execution_id\":\"019f7e95-0000-7000-8000-000000000999\",\"source\":\"DIAGNOSTIC\"",
+        1,
+    );
+    assert_ne!(invalid, valid, "test must inject an execution reference");
+    assert!(
+        validate_session_jsonl(invalid.as_bytes()).is_err(),
+        "accepted evidence attributed to an execution absent from the transcript"
+    );
+}
+
+#[test]
+fn jsonl_provider_execution_event_is_rejected_by_provider_role() {
+    let input = String::from_utf8(fixture("valid-observer-session.jsonl"))
+        .expect("observer fixture is UTF-8");
+    let mut events = input
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("fixture line is JSON"))
+        .collect::<Vec<_>>();
+    events[0]["adapter"]["kind"] = json!("PROVIDER");
+    events[0]["adapter"]["capabilities"] = json!(["diagnostic.check/v1"]);
+    events[1]["operation"] = json!("CHECK");
+    events[1]["required_capabilities"] = json!(["diagnostic.check/v1"]);
+    events[2]["execution"]["adapter_kind"] = json!("PROVIDER");
+    events[2]["execution"]["exit_code"] = json!(0);
+    events[2]["execution"]["verification"] = json!({
+        "fix_candidate_id": "019f7e95-0000-7000-8000-000000000108",
+        "patch_sha256": "f7efec72998d2a5dfccffb6c8677c1f5219236675eac2657908456a3579166c0",
+        "base_snapshot_sha256": "3b6a36b9dbd72d7d1ea5c498dbadaa424c19c25fe8bf6852fc13e7e214df8ffa",
+        "base_snapshot_evidence_id": "019f7e95-0000-7000-8000-000000000109",
+        "target_fingerprints": [
+            "dtfp1:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        ],
+        "result_evidence_id": "019f7e95-0000-7000-8000-000000000110"
+    });
+
+    let session = events
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert!(
+        validate_session_jsonl(session.as_bytes()).is_err(),
+        "accepted a Provider execution event emitted by a Provider role"
+    );
+}
+
+#[test]
+fn jsonl_observer_execution_verification_is_rejected_by_model() {
+    let input = String::from_utf8(fixture("valid-observer-session.jsonl"))
+        .expect("observer fixture is UTF-8");
+    let mut events = input
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("fixture line is JSON"))
+        .collect::<Vec<_>>();
+    events[2]["execution"]["verification"] = json!({
+        "fix_candidate_id": "019f7e95-0000-7000-8000-000000000108",
+        "patch_sha256": "f7efec72998d2a5dfccffb6c8677c1f5219236675eac2657908456a3579166c0",
+        "base_snapshot_sha256": "3b6a36b9dbd72d7d1ea5c498dbadaa424c19c25fe8bf6852fc13e7e214df8ffa",
+        "base_snapshot_evidence_id": "019f7e95-0000-7000-8000-000000000109",
+        "target_fingerprints": [
+            "dtfp1:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+        ],
+        "result_evidence_id": "019f7e95-0000-7000-8000-000000000110"
+    });
+
+    let session = events
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    assert!(
+        validate_session_jsonl(session.as_bytes()).is_err(),
+        "accepted Observer execution verification attribution in JSONL"
+    );
+}
+
+#[test]
+fn observer_jsonl_may_attribute_evidence_to_its_execution() {
+    let input = String::from_utf8(fixture("valid-observer-session.jsonl"))
+        .expect("observer fixture is UTF-8");
+    let mut events = input
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("fixture line is JSON"))
+        .collect::<Vec<_>>();
+    let request_id = events[1]["request_id"].clone();
+    let execution_id = events[2]["execution"]["execution_id"].clone();
+    events[2]["sequence"] = json!(1);
+    events[3]["sequence"] = json!(2);
+    events[3]["counts"]["evidence"] = json!(1);
+    events.insert(
+        2,
+        json!({
+            "protocol_version": "diagnostic-triage.protocol/v1",
+            "kind": "evidence",
+            "request_id": request_id,
+            "sequence": 0,
+            "evidence": {
+                "schema_version": "diagnostic-triage.evidence/v1",
+                "evidence_id": "019f7e95-0000-7000-8000-000000000203",
+                "execution_id": execution_id,
+                "source": "ARTIFACT",
+                "media_type": "application/json",
+                "retained_bytes": 0,
+                "observed_bytes": 0,
+                "limit_bytes": 1_048_576,
+                "truncated": false,
+                "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+                "content": ""
+            }
+        }),
+    );
+    let session = events
+        .iter()
+        .map(|event| serde_json::to_string(event).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+
+    validate_session_jsonl(session.as_bytes())
+        .expect("observer evidence may reference an execution in the same transcript");
+}
+
+#[test]
+fn failed_verification_receipts_remain_reportable_and_share_the_base_snapshot() {
+    for (status, verdict) in [("INCOMPLETE", "INCOMPLETE"), ("UNSUPPORTED", "UNSUPPORTED")] {
+        let mut report = verified_report_fixture();
+        report["verdict"] = json!(verdict);
+        report["findings"][0]["state"] = json!("FIX_PROPOSED");
+        report["executions"][0]["status"] = json!(status);
+        report["executions"][0]["exit_code"] = Value::Null;
+        report["executions"][0]["message"] = json!(format!(
+            "verification execution is {}",
+            status.to_lowercase()
+        ));
+        let result_id = report["executions"][0]["verification"]["result_evidence_id"]
+            .as_str()
+            .expect("result evidence id is a string")
+            .to_owned();
+        let result = evidence_mut(&mut report, &result_id);
+        result
+            .as_object_mut()
+            .expect("result evidence is an object")
+            .remove("content");
+        result["relative_path"] = json!(format!("receipts/{}.txt", status.to_lowercase()));
+        let retained_bytes = result["retained_bytes"]
+            .as_u64()
+            .expect("retained bytes is an integer");
+        result["observed_bytes"] = json!(retained_bytes + 1);
+        result["truncated"] = json!(true);
+        validate_report_json(&serde_json::to_vec(&report).unwrap())
+            .unwrap_or_else(|error| panic!("rejected non-inline {status} receipt: {error}"));
+    }
+
+    let mut unsafe_receipt = verified_report_fixture();
+    unsafe_receipt["findings"][0]["state"] = json!("FIX_PROPOSED");
+    unsafe_receipt["fix_candidates"][0]["applicability"] = json!("UNSAFE");
+    assert!(
+        rejects_report(&unsafe_receipt),
+        "accepted an UNSAFE candidate as a verification subject"
+    );
+
+    let mut report = verified_report_fixture();
+    let mut second = report["executions"][0].clone();
+    second["execution_id"] = json!("019f7e95-0000-8000-8000-000000000112");
+    second["adapter_id"] = json!("ruff-secondary");
+    let mut second_result = report["evidence"][2].clone();
+    second_result["evidence_id"] = json!("019f7e95-0000-8000-8000-000000000113");
+    second_result["execution_id"] = second["execution_id"].clone();
+    second["verification"]["result_evidence_id"] = second_result["evidence_id"].clone();
+    report["findings"][0]["verification_execution_ids"]
+        .as_array_mut()
+        .unwrap()
+        .push(second["execution_id"].clone());
+    report["executions"].as_array_mut().unwrap().push(second);
+    report["evidence"]
+        .as_array_mut()
+        .unwrap()
+        .push(second_result);
+    validate_report_json(&serde_json::to_vec(&report).unwrap())
+        .expect("same-candidate receipts may share a base snapshot");
+
+    report["executions"][1]["verification"]["base_snapshot_sha256"] = json!("a".repeat(64));
+    assert!(
+        rejects_report(&report),
+        "accepted same-candidate receipts with different base snapshots"
+    );
 }

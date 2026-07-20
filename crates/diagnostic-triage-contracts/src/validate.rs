@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    ContractError, ObjectId,
+    ContractError, Fingerprint, ObjectId, Sha256Digest,
     jsonl::{decode_json_object, decode_jsonl, decode_line},
     model::{
         AdapterKind, Decision, Evidence, EvidenceSource, Execution, ExecutionStatus, Finding,
@@ -46,6 +46,18 @@ struct ReportIndex<'a> {
 impl<'a> ReportIndex<'a> {
     fn new(report: &'a SessionReport) -> Result<Self, ContractError> {
         let mut all_ids = HashSet::new();
+        let findings = index_unique(
+            &report.findings,
+            |value| &value.finding_id,
+            "finding",
+            &mut all_ids,
+        )?;
+        let mut fingerprints = HashSet::new();
+        for finding in findings.values() {
+            if !fingerprints.insert(&finding.fingerprint) {
+                return Err(model_error("duplicate finding fingerprint in report"));
+            }
+        }
         Ok(Self {
             observations: index_unique(
                 &report.observations,
@@ -53,12 +65,7 @@ impl<'a> ReportIndex<'a> {
                 "observation",
                 &mut all_ids,
             )?,
-            findings: index_unique(
-                &report.findings,
-                |value| &value.finding_id,
-                "finding",
-                &mut all_ids,
-            )?,
+            findings,
             decisions: index_unique(
                 &report.decisions,
                 |value| &value.decision_id,
@@ -259,6 +266,16 @@ fn validate_report_references(
     report: &SessionReport,
     index: &ReportIndex<'_>,
 ) -> Result<(), ContractError> {
+    for evidence in &report.evidence {
+        if evidence
+            .execution_id
+            .as_ref()
+            .is_some_and(|identifier| !index.executions.contains_key(identifier))
+        {
+            return Err(model_error("evidence references unknown execution"));
+        }
+    }
+    validate_execution_verifications(report, index)?;
     for observation in &report.observations {
         require_all(
             &observation.evidence_ids,
@@ -266,6 +283,153 @@ fn validate_report_references(
             "observation references unknown evidence",
         )?;
     }
+    let finding_fingerprints_by_execution = validate_finding_references(report, index)?;
+    validate_target_fingerprints(report, &finding_fingerprints_by_execution)
+}
+
+fn validate_execution_verifications(
+    report: &SessionReport,
+    index: &ReportIndex<'_>,
+) -> Result<(), ContractError> {
+    let mut base_snapshots_by_candidate: HashMap<ObjectId, Sha256Digest> = HashMap::new();
+    for execution in &report.executions {
+        let Some(verification) = execution.verification.as_ref() else {
+            continue;
+        };
+        let Some(candidate) = index.fixes.get(&verification.fix_candidate_id) else {
+            return Err(model_error(
+                "execution verification references unknown fix candidate",
+            ));
+        };
+        if candidate.applicability != crate::model::Applicability::Safe {
+            return Err(model_error(
+                "execution verification requires a SAFE fix candidate",
+            ));
+        }
+        validate_verification_evidence(execution, verification, candidate, index)?;
+        if let Some(previous) = base_snapshots_by_candidate.get(&verification.fix_candidate_id) {
+            if previous != &verification.base_snapshot_sha256 {
+                return Err(model_error(
+                    "execution verification base snapshot differs for fix candidate",
+                ));
+            }
+        }
+        base_snapshots_by_candidate.insert(
+            verification.fix_candidate_id.clone(),
+            verification.base_snapshot_sha256.clone(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_verification_evidence(
+    execution: &Execution,
+    verification: &crate::model::VerificationAttribution,
+    candidate: &FixCandidate,
+    index: &ReportIndex<'_>,
+) -> Result<(), ContractError> {
+    let Some(patch) = index.evidence.get(&candidate.patch_evidence_id) else {
+        return Err(model_error(
+            "execution verification references unknown patch evidence",
+        ));
+    };
+    if patch.source != EvidenceSource::Patch {
+        return Err(model_error(
+            "execution verification patch evidence is not a patch",
+        ));
+    }
+    if patch.truncated {
+        return Err(model_error(
+            "execution verification patch evidence is truncated",
+        ));
+    }
+    if patch.content.is_none() {
+        return Err(model_error(
+            "execution verification patch evidence must be inline",
+        ));
+    }
+    if verification.patch_sha256 != patch.sha256 {
+        return Err(model_error(
+            "execution verification patch digest differs from patch evidence",
+        ));
+    }
+    let Some(base_snapshot) = index.evidence.get(&verification.base_snapshot_evidence_id) else {
+        return Err(model_error(
+            "execution verification references unknown base snapshot evidence",
+        ));
+    };
+    if base_snapshot.source != EvidenceSource::Artifact {
+        return Err(model_error(
+            "execution verification base snapshot evidence is not an artifact",
+        ));
+    }
+    if base_snapshot.content.is_none() {
+        return Err(model_error(
+            "execution verification base snapshot evidence must be inline",
+        ));
+    }
+    if base_snapshot.truncated {
+        return Err(model_error(
+            "execution verification base snapshot evidence is truncated",
+        ));
+    }
+    if base_snapshot.media_type != "application/vnd.diagnostic-triage.snapshot+json" {
+        return Err(model_error(
+            "execution verification base snapshot evidence has an invalid media type",
+        ));
+    }
+    if verification.base_snapshot_sha256 != base_snapshot.sha256 {
+        return Err(model_error(
+            "execution verification base snapshot digest differs from snapshot evidence",
+        ));
+    }
+    if verification.base_snapshot_evidence_id == verification.result_evidence_id {
+        return Err(model_error(
+            "execution verification snapshot and result evidence must differ",
+        ));
+    }
+    let Some(result) = index.evidence.get(&verification.result_evidence_id) else {
+        return Err(model_error(
+            "execution verification references unknown result evidence",
+        ));
+    };
+    if !matches!(
+        result.source,
+        EvidenceSource::Stdout | EvidenceSource::Diagnostic | EvidenceSource::Artifact
+    ) {
+        return Err(model_error(
+            "execution verification result evidence has an invalid source",
+        ));
+    }
+    if result.media_type == "application/vnd.diagnostic-triage.snapshot+json" {
+        return Err(model_error(
+            "execution verification result evidence cannot be a base snapshot",
+        ));
+    }
+    if execution.status == ExecutionStatus::Complete && result.truncated {
+        return Err(model_error(
+            "complete verification execution has truncated result evidence",
+        ));
+    }
+    if execution.status == ExecutionStatus::Complete && result.content.is_none() {
+        return Err(model_error(
+            "complete verification result evidence must be inline",
+        ));
+    }
+    if result.execution_id.as_ref() != Some(&execution.execution_id) {
+        return Err(model_error(
+            "execution verification result evidence belongs to a different execution",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_finding_references(
+    report: &SessionReport,
+    index: &ReportIndex<'_>,
+) -> Result<HashMap<ObjectId, HashSet<Fingerprint>>, ContractError> {
+    let mut finding_fingerprints_by_execution: HashMap<ObjectId, HashSet<Fingerprint>> =
+        HashMap::new();
     for finding in &report.findings {
         require_all(
             &finding.observation_ids,
@@ -277,12 +441,31 @@ fn validate_report_references(
             &index.evidence,
             "finding references unknown evidence",
         )?;
-        if finding
-            .fix_candidate_id
-            .as_ref()
-            .is_some_and(|identifier| !index.fixes.contains_key(identifier))
-        {
-            return Err(model_error("finding references unknown fix candidate"));
+        for identifier in &finding.observation_ids {
+            let observation = index
+                .observations
+                .get(identifier)
+                .expect("finding observation references were checked");
+            if observation.tool != finding.tool {
+                return Err(model_error(
+                    "finding tool differs from source observation tool",
+                ));
+            }
+        }
+        if let Some(identifier) = &finding.fix_candidate_id {
+            let Some(candidate) = index.fixes.get(identifier) else {
+                return Err(model_error("finding references unknown fix candidate"));
+            };
+            let candidate_observations = candidate.observation_ids.iter().collect::<HashSet<_>>();
+            if finding
+                .observation_ids
+                .iter()
+                .any(|observation_id| !candidate_observations.contains(observation_id))
+            {
+                return Err(model_error(
+                    "finding observations are outside the fix candidate scope",
+                ));
+            }
         }
         if let Some(identifiers) = &finding.verification_execution_ids {
             require_all(
@@ -290,13 +473,100 @@ fn validate_report_references(
                 &index.executions,
                 "finding references unknown verification execution",
             )?;
-            if matches!(finding.state, crate::model::FindingState::Verified)
-                && identifiers.iter().any(|identifier| {
-                    index.executions[identifier].status != ExecutionStatus::Complete
-                })
-            {
+            for identifier in identifiers {
+                finding_fingerprints_by_execution
+                    .entry(identifier.clone())
+                    .or_default()
+                    .insert(finding.fingerprint.clone());
+            }
+            validate_finding_verification(
+                finding,
+                identifiers,
+                index,
+                matches!(finding.state, crate::model::FindingState::Verified),
+            )?;
+        }
+    }
+    Ok(finding_fingerprints_by_execution)
+}
+
+fn validate_finding_verification(
+    finding: &Finding,
+    identifiers: &[ObjectId],
+    index: &ReportIndex<'_>,
+    is_verified: bool,
+) -> Result<(), ContractError> {
+    let Some(fix_candidate_id) = finding.fix_candidate_id.as_ref() else {
+        return Err(model_error(
+            "citing finding is missing its fix candidate reference",
+        ));
+    };
+    let Some(candidate) = index.fixes.get(fix_candidate_id) else {
+        return Err(model_error(
+            "citing finding references unknown fix candidate",
+        ));
+    };
+    if is_verified && candidate.applicability != crate::model::Applicability::Safe {
+        return Err(model_error(
+            "verified finding requires a SAFE fix candidate",
+        ));
+    }
+    for identifier in identifiers {
+        let Some(execution) = index.executions.get(identifier) else {
+            return Err(model_error(
+                "citing finding references unknown verification execution",
+            ));
+        };
+        if execution.tool.name != finding.tool.name
+            || execution.tool.version != finding.tool.version
+        {
+            return Err(model_error(
+                "citing finding tool differs from execution tool",
+            ));
+        }
+        let Some(verification) = execution.verification.as_ref() else {
+            return Err(model_error(
+                "citing finding cites execution without verification attribution",
+            ));
+        };
+        if verification.fix_candidate_id != *fix_candidate_id {
+            return Err(model_error(
+                "citing finding execution attribution differs from fix candidate",
+            ));
+        }
+        if is_verified {
+            if execution.status != ExecutionStatus::Complete {
                 return Err(model_error("verified finding cites incomplete execution"));
             }
+            if execution.adapter_kind != AdapterKind::Provider {
+                return Err(model_error("verified finding cites non-provider execution"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_target_fingerprints(
+    report: &SessionReport,
+    finding_fingerprints_by_execution: &HashMap<ObjectId, HashSet<Fingerprint>>,
+) -> Result<(), ContractError> {
+    for execution in &report.executions {
+        let Some(verification) = execution.verification.as_ref() else {
+            continue;
+        };
+        let expected = finding_fingerprints_by_execution
+            .get(&execution.execution_id)
+            .cloned()
+            .unwrap_or_default();
+        let actual = verification
+            .target_fingerprints
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        if actual != expected {
+            return Err(model_error(
+                "execution verification target fingerprints do not match citing findings",
+            ));
         }
     }
     Ok(())
@@ -455,6 +725,7 @@ fn validate_payloads(
     let mut evidence = HashMap::new();
     let mut observations = HashMap::new();
     let mut fixes = Vec::new();
+    let mut executions = HashMap::new();
     let mut retained_bytes = 0_u64;
 
     for event in events {
@@ -488,6 +759,7 @@ fn validate_payloads(
             ProtocolEnvelope::FixCandidate(value) => fixes.push(&value.fix_candidate),
             ProtocolEnvelope::Execution(value) => {
                 validate_execution_attribution(manifest, &value.execution)?;
+                executions.insert(value.execution.execution_id.clone(), &value.execution);
             }
             ProtocolEnvelope::Manifest(_)
             | ProtocolEnvelope::Request(_)
@@ -503,6 +775,15 @@ fn validate_payloads(
             &evidence,
             "observation references unknown evidence",
         )?;
+    }
+    for item in evidence.values() {
+        if item
+            .execution_id
+            .as_ref()
+            .is_some_and(|identifier| !executions.contains_key(identifier))
+        {
+            return Err(protocol_error("evidence references unknown execution"));
+        }
     }
     for candidate in fixes {
         validate_fix_references(candidate, &observations, &evidence)?;
@@ -593,9 +874,9 @@ fn validate_execution_attribution(
     Ok(())
 }
 
-fn validate_fix_references<T>(
+fn validate_fix_references(
     candidate: &FixCandidate,
-    observations: &HashMap<ObjectId, T>,
+    observations: &HashMap<ObjectId, &Observation>,
     evidence: &HashMap<ObjectId, &Evidence>,
 ) -> Result<(), ContractError> {
     require_all(
@@ -603,6 +884,17 @@ fn validate_fix_references<T>(
         observations,
         "fix references unknown observation",
     )?;
+    let mut candidate_tool = None;
+    for identifier in &candidate.observation_ids {
+        let observation = observations
+            .get(identifier)
+            .expect("fix observation references were checked");
+        let tool_identity = (&observation.tool.name, &observation.tool.version);
+        if candidate_tool.is_some_and(|expected| expected != tool_identity) {
+            return Err(model_error("fix candidate spans multiple tool identities"));
+        }
+        candidate_tool = Some(tool_identity);
+    }
     let Some(patch) = evidence.get(&candidate.patch_evidence_id) else {
         return Err(model_error("fix references unknown patch evidence"));
     };
