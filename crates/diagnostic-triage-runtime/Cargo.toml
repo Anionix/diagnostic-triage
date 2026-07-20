@@ -1,0 +1,24 @@
+[package]
+name = "diagnostic-triage-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+camino.workspace = true
+csv.workspace = true
+diagnostic-triage-contracts.workspace = true
+diagnostic-triage-engine.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tracing.workspace = true
+wait-timeout.workspace = true
