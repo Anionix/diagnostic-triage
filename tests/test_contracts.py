@@ -548,6 +548,27 @@ def validate_report(
                 "citing findings"
             )
 
+    if any(
+        execution["required"] and execution["status"] == "INCOMPLETE"
+        for execution in execution_by_id.values()
+    ):
+        expected_verdict = "INCOMPLETE"
+    elif any(
+        execution["required"] and execution["status"] == "UNSUPPORTED"
+        for execution in execution_by_id.values()
+    ):
+        expected_verdict = "UNSUPPORTED"
+    elif any(
+        decision["action"] == "BLOCK" for decision in indexed["decisions"].values()
+    ):
+        expected_verdict = "POLICY_FAIL"
+    else:
+        expected_verdict = "PASS"
+    if report["verdict"] != expected_verdict:
+        raise ContractError(
+            "report verdict differs from required executions and decisions"
+        )
+
 
 def validate_session(path: Path, contracts: ContractSchemas) -> None:
     events = load_session(path)
@@ -878,6 +899,7 @@ class ContractTest(unittest.TestCase):
             execution["status"] = status
             execution["exit_code"] = None
             execution["message"] = f"verification execution is {status.lower()}"
+            report["verdict"] = status
             with self.subTest(status=status):
                 validate_report(report, self.contracts)
 
@@ -1366,6 +1388,7 @@ class ContractTest(unittest.TestCase):
         execution["status"] = "INCOMPLETE"
         execution["exit_code"] = None
         execution["message"] = "verification provider timed out"
+        failed_verification["verdict"] = "INCOMPLETE"
         candidates["failed verification"] = failed_verification
 
         missing_decision = copy.deepcopy(report)
@@ -1375,6 +1398,84 @@ class ContractTest(unittest.TestCase):
         for name, candidate in candidates.items():
             with self.subTest(name=name), self.assertRaises(ContractError):
                 validate_report(candidate, self.contracts)
+
+    def test_report_verdict_follows_execution_and_policy_precedence(self) -> None:
+        def set_execution_status(
+            report: dict[str, Any], index: int, status: str, required: bool
+        ) -> None:
+            execution = report["executions"][index]
+            execution["required"] = required
+            execution["status"] = status
+            if status == "COMPLETE":
+                execution["exit_code"] = 0
+                execution.pop("message", None)
+            else:
+                execution["exit_code"] = None
+                execution["message"] = f"required execution ended as {status}"
+
+        def assert_only_verdict(
+            name: str, report: dict[str, Any], expected: str
+        ) -> None:
+            for actual in ("PASS", "POLICY_FAIL", "INCOMPLETE", "UNSUPPORTED"):
+                candidate = copy.deepcopy(report)
+                candidate["verdict"] = actual
+                if actual == expected:
+                    with self.subTest(name=name, actual=actual):
+                        validate_report(candidate, self.contracts)
+                else:
+                    with self.subTest(name=name, actual=actual), self.assertRaises(
+                        ContractError
+                    ):
+                        validate_report(candidate, self.contracts)
+
+        block = load_json(FIXTURE_DIR / "valid-report.json")
+        assert_only_verdict("required complete with BLOCK", block, "POLICY_FAIL")
+
+        for action in ("OBSERVE", "WARN"):
+            report = load_json(FIXTURE_DIR / "valid-report.json")
+            report["decisions"][0]["action"] = action
+            assert_only_verdict(action, report, "PASS")
+
+        waived = load_json(FIXTURE_DIR / "valid-report.json")
+        waived["decisions"][0]["action"] = "WAIVE"
+        waived["decisions"][0]["waiver"] = {
+            "fingerprint": waived["findings"][0]["fingerprint"],
+            "waived_action": "BLOCK",
+            "reason": "accepted until the upstream fix lands",
+            "owner": "maintainers",
+            "expires_at": "2026-08-20T00:00:00Z",
+        }
+        assert_only_verdict("WAIVE", waived, "PASS")
+
+        incomplete = load_json(FIXTURE_DIR / "valid-report.json")
+        set_execution_status(incomplete, 0, "INCOMPLETE", True)
+        assert_only_verdict(
+            "required INCOMPLETE with BLOCK", incomplete, "INCOMPLETE"
+        )
+
+        unsupported = load_json(FIXTURE_DIR / "valid-report.json")
+        set_execution_status(unsupported, 0, "UNSUPPORTED", True)
+        assert_only_verdict(
+            "required UNSUPPORTED with BLOCK", unsupported, "UNSUPPORTED"
+        )
+
+        mixed = copy.deepcopy(unsupported)
+        second = copy.deepcopy(mixed["executions"][0])
+        second["execution_id"] = "019f7e95-0000-7000-8000-000000000199"
+        mixed["executions"].append(second)
+        set_execution_status(mixed, 1, "INCOMPLETE", True)
+        assert_only_verdict(
+            "required INCOMPLETE and UNSUPPORTED", mixed, "INCOMPLETE"
+        )
+
+        for status in ("INCOMPLETE", "UNSUPPORTED"):
+            optional = load_json(FIXTURE_DIR / "valid-unsupported-report.json")
+            set_execution_status(optional, 0, status, False)
+            assert_only_verdict(f"optional {status}", optional, "PASS")
+
+        empty = load_json(FIXTURE_DIR / "valid-unsupported-report.json")
+        empty["executions"] = []
+        assert_only_verdict("empty report", empty, "PASS")
 
     def test_request_rejects_noncanonical_paths(self) -> None:
         request = load_session(FIXTURE_DIR / "valid-empty-session.jsonl")[1]
@@ -1512,6 +1613,7 @@ class ContractTest(unittest.TestCase):
 
     def test_waive_expiry_uses_strict_parsed_instant_ordering(self) -> None:
         report = load_json(FIXTURE_DIR / "valid-report.json")
+        report["verdict"] = "PASS"
         decision = report["decisions"][0]
         decision["action"] = "WAIVE"
         decision["evaluated_at"] = "2026-07-21T00:00:00Z"
@@ -1563,6 +1665,7 @@ class ContractTest(unittest.TestCase):
 
     def test_waiver_is_bound_to_a_fingerprint(self) -> None:
         report = load_json(FIXTURE_DIR / "valid-report.json")
+        report["verdict"] = "PASS"
         decision = copy.deepcopy(report["decisions"][0])
         decision["action"] = "WAIVE"
         decision["waiver"] = {
@@ -1582,6 +1685,7 @@ class ContractTest(unittest.TestCase):
 
     def test_waiver_rfc3339_offset_boundaries(self) -> None:
         report = load_json(FIXTURE_DIR / "valid-report.json")
+        report["verdict"] = "PASS"
         decision = report["decisions"][0]
         decision["action"] = "WAIVE"
         decision["waiver"] = {

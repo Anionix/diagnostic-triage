@@ -75,6 +75,35 @@ fn rejects_report(value: &Value) -> bool {
     .is_err()
 }
 
+fn set_execution_status(report: &mut Value, index: usize, status: &str, required: bool) {
+    let execution = &mut report["executions"][index];
+    execution["required"] = json!(required);
+    execution["status"] = json!(status);
+    if status == "COMPLETE" {
+        execution["exit_code"] = json!(0);
+        execution
+            .as_object_mut()
+            .expect("execution is an object")
+            .remove("message");
+    } else {
+        execution["exit_code"] = Value::Null;
+        execution["message"] = json!(format!("required execution ended as {status}"));
+    }
+}
+
+fn assert_only_verdict_is_accepted(name: &str, report: &Value, expected: &str) {
+    for actual in ["PASS", "POLICY_FAIL", "INCOMPLETE", "UNSUPPORTED"] {
+        let mut candidate = report.clone();
+        candidate["verdict"] = json!(actual);
+        let accepted = validate_report_json(&serde_json::to_vec(&candidate).unwrap()).is_ok();
+        assert_eq!(
+            accepted,
+            actual == expected,
+            "{name}: verdict {actual} acceptance differs from expected {expected}",
+        );
+    }
+}
+
 fn evidence_mut<'a>(report: &'a mut Value, evidence_id: &str) -> &'a mut Value {
     report["evidence"]
         .as_array_mut()
@@ -129,6 +158,60 @@ fn accepts_every_valid_report_fixture() {
     for name in VALID_REPORTS {
         validate_report_json(&fixture(name)).unwrap_or_else(|error| panic!("{name}: {error}"));
     }
+}
+
+#[test]
+fn report_verdict_follows_required_execution_and_policy_precedence() {
+    let block = report_fixture();
+    assert_only_verdict_is_accepted("required complete with BLOCK", &block, "POLICY_FAIL");
+
+    for action in ["OBSERVE", "WARN"] {
+        let mut report = report_fixture();
+        report["decisions"][0]["action"] = json!(action);
+        assert_only_verdict_is_accepted(action, &report, "PASS");
+    }
+
+    let mut waived = report_fixture();
+    waived["decisions"][0]["action"] = json!("WAIVE");
+    waived["decisions"][0]["waiver"] = json!({
+        "fingerprint": waived["findings"][0]["fingerprint"].clone(),
+        "waived_action": "BLOCK",
+        "reason": "accepted until the upstream fix lands",
+        "owner": "maintainers",
+        "expires_at": "2026-08-20T00:00:00Z"
+    });
+    assert_only_verdict_is_accepted("WAIVE", &waived, "PASS");
+
+    let mut incomplete = report_fixture();
+    set_execution_status(&mut incomplete, 0, "INCOMPLETE", true);
+    assert_only_verdict_is_accepted("required INCOMPLETE with BLOCK", &incomplete, "INCOMPLETE");
+
+    let mut unsupported = report_fixture();
+    set_execution_status(&mut unsupported, 0, "UNSUPPORTED", true);
+    assert_only_verdict_is_accepted(
+        "required UNSUPPORTED with BLOCK",
+        &unsupported,
+        "UNSUPPORTED",
+    );
+
+    let mut mixed = unsupported.clone();
+    let mut second = mixed["executions"][0].clone();
+    second["execution_id"] = json!("019f7e95-0000-7000-8000-000000000199");
+    mixed["executions"].as_array_mut().unwrap().push(second);
+    set_execution_status(&mut mixed, 1, "INCOMPLETE", true);
+    assert_only_verdict_is_accepted("required INCOMPLETE and UNSUPPORTED", &mixed, "INCOMPLETE");
+
+    for status in ["INCOMPLETE", "UNSUPPORTED"] {
+        let mut optional: Value = serde_json::from_slice(&fixture("valid-unsupported-report.json"))
+            .expect("unsupported report fixture is JSON");
+        set_execution_status(&mut optional, 0, status, false);
+        assert_only_verdict_is_accepted(&format!("optional {status}"), &optional, "PASS");
+    }
+
+    let mut empty: Value = serde_json::from_slice(&fixture("valid-unsupported-report.json"))
+        .expect("unsupported report fixture is JSON");
+    empty["executions"] = json!([]);
+    assert_only_verdict_is_accepted("empty report", &empty, "PASS");
 }
 
 #[test]
@@ -231,6 +314,7 @@ fn report_rejects_decisions_with_mixed_evaluation_instants() {
 #[test]
 fn waive_expiry_must_be_strictly_after_evaluation_by_parsed_instant() {
     let mut report = report_fixture();
+    report["verdict"] = json!("PASS");
     report["decisions"][0]["action"] = json!("WAIVE");
     report["decisions"][0]["evaluated_at"] = json!("2026-07-21T00:00:00Z");
     report["decisions"][0]["waiver"] = json!({
@@ -412,6 +496,7 @@ fn rejects_semantically_inconsistent_reports() {
     failed_verification["executions"][0]["status"] = json!("INCOMPLETE");
     failed_verification["executions"][0]["exit_code"] = Value::Null;
     failed_verification["executions"][0]["message"] = json!("verification provider timed out");
+    failed_verification["verdict"] = json!("INCOMPLETE");
     candidates.push(("failed verification", failed_verification));
 
     let mut missing_decision = report_fixture();
@@ -426,6 +511,7 @@ fn rejects_semantically_inconsistent_reports() {
 #[test]
 fn waiver_must_be_complete_and_bound_to_its_finding() {
     let mut report = report_fixture();
+    report["verdict"] = json!("PASS");
     report["decisions"][0]["action"] = json!("WAIVE");
     report["decisions"][0]["waiver"] = json!({
         "waived_action": "BLOCK",
