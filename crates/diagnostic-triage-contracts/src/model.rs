@@ -991,7 +991,20 @@ impl Finding {
     }
 }
 
-fn valid_datetime(value: &str) -> bool {
+/// Return whether a wire timestamp satisfies the v1 RFC 3339 profile.
+///
+/// This lexical guard intentionally narrows Jiff's broader Temporal/ISO 8601
+/// parser before using Jiff for calendar and instant semantics. The v1 wire
+/// profile uses one to nine fractional digits and excludes leap seconds so
+/// every accepted value maps losslessly to the engine's nanosecond timestamp.
+/// Years are bounded to 0000 through 9998 because Jiff's instant range does
+/// not contain every offset-adjusted civil time in year 9999.
+///
+/// This function is public only for sibling unpublished workspace crates; it
+/// is not part of a supported Rust SDK.
+#[doc(hidden)]
+#[must_use]
+pub fn is_valid_rfc3339_datetime(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.len() < 20
         || !matches!(bytes[10], b'T' | b't')
@@ -1004,6 +1017,9 @@ fn valid_datetime(value: &str) -> bool {
     {
         return false;
     }
+    if &bytes[..4] == b"9999" {
+        return false;
+    }
 
     let mut zone_start = 19;
     if bytes[zone_start] == b'.' {
@@ -1012,11 +1028,16 @@ fn valid_datetime(value: &str) -> bool {
         while bytes.get(zone_start).is_some_and(u8::is_ascii_digit) {
             zone_start += 1;
         }
-        if zone_start == fraction_start {
+        if zone_start == fraction_start || zone_start - fraction_start > 9 {
             return false;
         }
     }
+    if (bytes[17] - b'0') * 10 + (bytes[18] - b'0') > 59 {
+        return false;
+    }
 
+    // Jiff's Temporal parser intentionally accepts wider ISO 8601 offsets;
+    // RFC 3339 fixes numeric offset hours to 00..=23 and minutes to 00..=59.
     match bytes.get(zone_start..) {
         Some([b'Z' | b'z']) => {}
         Some(
@@ -1031,7 +1052,9 @@ fn valid_datetime(value: &str) -> bool {
         ) if hour_tens.is_ascii_digit()
             && hour_ones.is_ascii_digit()
             && minute_tens.is_ascii_digit()
-            && minute_ones.is_ascii_digit() => {}
+            && minute_ones.is_ascii_digit()
+            && (hour_tens - b'0') * 10 + (hour_ones - b'0') <= 23
+            && (minute_tens - b'0') * 10 + (minute_ones - b'0') <= 59 => {}
         _ => return false,
     }
 
@@ -1042,7 +1065,7 @@ impl Waiver {
     pub fn validate(&self) -> Result<(), ContractError> {
         check_string(&self.reason, "waiver.reason", 2048, true)?;
         check_string(&self.owner, "waiver.owner", 256, true)?;
-        if valid_datetime(&self.expires_at) {
+        if is_valid_rfc3339_datetime(&self.expires_at) {
             Ok(())
         } else {
             Err(model_error(
@@ -1355,7 +1378,7 @@ impl SessionReport {
 mod tests {
     use super::{
         Evidence, EvidenceSchemaVersion, PhaseDuration, Sha256Digest, ToolchainFingerprint,
-        Unavailable, valid_datetime,
+        Unavailable, is_valid_rfc3339_datetime,
     };
 
     #[test]
@@ -1403,21 +1426,39 @@ mod tests {
     fn waiver_datetime_uses_strict_rfc3339_shape_and_timestamp_semantics() {
         for value in [
             "2024-02-29T23:59:59Z",
+            "0000-01-01T00:00:00+23:59",
+            "9998-12-31T23:59:59-23:59",
+            "2000-02-29T23:59:59Z",
+            "2400-02-29T23:59:59Z",
             "2024-02-29t23:59:59z",
-            "2024-02-29T23:59:59.123456+09:00",
+            "2024-02-29T23:59:59.123456789+09:00",
+            "2024-02-29T23:59:59+23:59",
+            "2024-02-29T23:59:59-23:59",
         ] {
-            assert!(valid_datetime(value), "expected valid date-time: {value}");
+            assert!(
+                is_valid_rfc3339_datetime(value),
+                "expected valid date-time: {value}"
+            );
         }
 
         for value in [
             "2023-02-29T23:59:59Z",
+            "9999-01-01T00:00:00Z",
+            "1900-02-29T23:59:59Z",
+            "2100-02-29T23:59:59Z",
             "2024-02-29T23:59Z",
             "2024-02-29T23:59:59+0900",
             "2024-02-29T23:59:59Z[Asia/Tokyo]",
             "2024-02-29T23:59:59.+09:00",
+            "2024-02-29T23:59:59.1234567890Z",
+            "2024-02-29T23:59:60Z",
+            "2024-02-29T23:59:59+24:00",
+            "2024-02-29T23:59:59-24:00",
+            "2024-02-29T23:59:59+23:60",
+            "2024-02-29T23:59:59-23:60",
         ] {
             assert!(
-                !valid_datetime(value),
+                !is_valid_rfc3339_datetime(value),
                 "expected invalid date-time: {value}"
             );
         }
