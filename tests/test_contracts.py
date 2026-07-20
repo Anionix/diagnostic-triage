@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import re
+import tempfile
 import unittest
 from collections import Counter
 from pathlib import Path
@@ -27,6 +28,7 @@ VALID_SESSION_FIXTURES = {
 VALID_REPORT_FIXTURES = {
     "valid-report.json",
     "valid-unsupported-report.json",
+    "valid-verified-report.json",
 }
 INVALID_SESSION_FIXTURES = {
     "invalid-completion-count.jsonl",
@@ -68,6 +70,8 @@ EVENT_IDENTIFIERS = {
     "fix_candidate": ("fix_candidate", "fix_candidate_id"),
     "execution": ("execution", "execution_id"),
 }
+RESULT_EVIDENCE_SOURCES = {"STDOUT", "DIAGNOSTIC", "ARTIFACT"}
+SNAPSHOT_MEDIA_TYPE = "application/vnd.diagnostic-triage.snapshot+json"
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -180,6 +184,94 @@ def validate_execution(execution: dict[str, Any]) -> None:
             raise ContractError("execution performance status is inconsistent")
 
 
+def validate_execution_attribution(
+    execution: dict[str, Any],
+    candidates: dict[str, dict[str, Any]],
+    evidence_by_id: dict[str, dict[str, Any]],
+) -> None:
+    verification = execution.get("verification")
+    if verification is None:
+        return
+    candidate_id = verification["fix_candidate_id"]
+    candidate = candidates.get(candidate_id)
+    if candidate is None:
+        raise ContractError("execution verification references unknown fix candidate")
+    if candidate["applicability"] != "SAFE":
+        raise ContractError("execution verification requires a SAFE fix candidate")
+
+    patch = evidence_by_id.get(candidate["patch_evidence_id"])
+    if patch is None:
+        raise ContractError("execution verification references unknown patch evidence")
+    if patch["source"] != "PATCH":
+        raise ContractError("execution verification patch evidence is not a patch")
+    if patch["truncated"]:
+        raise ContractError("execution verification patch evidence is truncated")
+    if "content" not in patch:
+        raise ContractError("execution verification patch evidence must be inline")
+    if verification["patch_sha256"] != patch["sha256"]:
+        raise ContractError(
+            "execution verification patch digest differs from patch evidence"
+        )
+
+    base_snapshot = evidence_by_id.get(verification["base_snapshot_evidence_id"])
+    if base_snapshot is None:
+        raise ContractError(
+            "execution verification references unknown base snapshot evidence"
+        )
+    if base_snapshot["source"] != "ARTIFACT":
+        raise ContractError(
+            "execution verification base snapshot evidence is not an artifact"
+        )
+    if "content" not in base_snapshot:
+        raise ContractError(
+            "execution verification base snapshot evidence must be inline"
+        )
+    if base_snapshot["media_type"] != SNAPSHOT_MEDIA_TYPE:
+        raise ContractError(
+            "execution verification base snapshot evidence has an invalid media type"
+        )
+    if base_snapshot["truncated"]:
+        raise ContractError(
+            "execution verification base snapshot evidence is truncated"
+        )
+    if verification["base_snapshot_sha256"] != base_snapshot["sha256"]:
+        raise ContractError(
+            "execution verification base snapshot digest differs from snapshot evidence"
+        )
+
+    if verification["base_snapshot_evidence_id"] == verification["result_evidence_id"]:
+        raise ContractError(
+            "execution verification base and result evidence must be distinct"
+        )
+    result = evidence_by_id.get(verification["result_evidence_id"])
+    if result is None:
+        raise ContractError("execution verification references unknown result evidence")
+    if result["source"] not in RESULT_EVIDENCE_SOURCES:
+        raise ContractError(
+            "execution verification result evidence has an invalid source"
+        )
+    if result["media_type"] == SNAPSHOT_MEDIA_TYPE:
+        raise ContractError(
+            "execution verification result evidence cannot use snapshot media type"
+        )
+    if execution["status"] == "COMPLETE" and result["truncated"]:
+        raise ContractError("complete execution result evidence must not be truncated")
+    if execution["status"] == "COMPLETE" and "content" not in result:
+        raise ContractError("complete verification result evidence must be inline")
+    if result.get("execution_id") != execution["execution_id"]:
+        raise ContractError(
+            "execution verification result evidence belongs to a different execution"
+        )
+
+
+def verified_report_with_attribution() -> dict[str, Any]:
+    report = load_json(FIXTURE_DIR / "valid-verified-report.json")
+    alternate = copy.deepcopy(report["fix_candidates"][0])
+    alternate["fix_candidate_id"] = "019f7e95-0000-7000-8000-000000000111"
+    report["fix_candidates"].append(alternate)
+    return report
+
+
 # LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED ->
 # VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
 def validate_report(report: dict[str, Any], contracts: ContractSchemas) -> None:
@@ -207,10 +299,16 @@ def validate_report(report: dict[str, Any], contracts: ContractSchemas) -> None:
             values[identifier] = value
         indexed[group] = values
 
+    execution_by_id = indexed["executions"]
+    execution_ids = set(execution_by_id)
     evidence_by_id = indexed["evidence"]
     evidence_ids = set(evidence_by_id)
     for evidence in evidence_by_id.values():
         validate_evidence(evidence)
+        if (
+            execution_id := evidence.get("execution_id")
+        ) is not None and execution_id not in execution_ids:
+            raise ContractError("evidence references unknown execution")
 
     observation_by_id = indexed["observations"]
     observation_ids = set(observation_by_id)
@@ -222,23 +320,68 @@ def validate_report(report: dict[str, Any], contracts: ContractSchemas) -> None:
     finding_by_id = indexed["findings"]
     finding_ids = set(finding_by_id)
     fix_ids = set(indexed["fix_candidates"])
-    execution_by_id = indexed["executions"]
-    execution_ids = set(execution_by_id)
+    cited_fingerprints_by_execution: dict[str, set[str]] = {}
+    fingerprints: set[str] = set()
     for finding in finding_by_id.values():
+        if finding["fingerprint"] in fingerprints:
+            raise ContractError("duplicate report finding fingerprint")
+        fingerprints.add(finding["fingerprint"])
         validate_location(finding.get("location"))
         if not set(finding["observation_ids"]) <= observation_ids:
             raise ContractError("finding references unknown observation")
         if not set(finding["evidence_ids"]) <= evidence_ids:
             raise ContractError("finding references unknown evidence")
-        if finding.get("fix_candidate_id") not in (None, *fix_ids):
+        fix_candidate_id = finding.get("fix_candidate_id")
+        if fix_candidate_id not in (None, *fix_ids):
             raise ContractError("finding references unknown fix candidate")
-        if not set(finding.get("verification_execution_ids", ())) <= execution_ids:
+        for observation_id in finding["observation_ids"]:
+            if finding["tool"] != observation_by_id[observation_id]["tool"]:
+                raise ContractError("finding tool differs from source observation tool")
+        cited_execution_ids = finding.get("verification_execution_ids", ())
+        if not set(cited_execution_ids) <= execution_ids:
             raise ContractError("finding references unknown verification execution")
-        if finding["state"] == "VERIFIED" and any(
-            execution_by_id[identifier]["status"] != "COMPLETE"
-            for identifier in finding["verification_execution_ids"]
-        ):
-            raise ContractError("verified finding cites incomplete execution")
+        if cited_execution_ids and fix_candidate_id is None:
+            raise ContractError("citing findings require a fix candidate")
+        if fix_candidate_id is not None:
+            candidate = indexed["fix_candidates"][fix_candidate_id]
+            if not set(finding["observation_ids"]) <= set(candidate["observation_ids"]):
+                raise ContractError(
+                    "citing finding observations are outside the fix candidate scope"
+                )
+        for identifier in cited_execution_ids:
+            execution = execution_by_id[identifier]
+            verification = execution.get("verification")
+            if verification is None:
+                raise ContractError(
+                    "citing findings reference execution without "
+                    "verification attribution"
+                )
+            if verification["fix_candidate_id"] != finding["fix_candidate_id"]:
+                raise ContractError(
+                    "citing findings execution attribution differs from fix candidate"
+                )
+            if (
+                execution["tool"]["name"] != finding["tool"]["name"]
+                or execution["tool"]["version"] != finding["tool"]["version"]
+            ):
+                raise ContractError("citing findings tool differs from execution tool")
+            cited_fingerprints_by_execution.setdefault(identifier, set()).add(
+                finding["fingerprint"]
+            )
+        if finding["state"] == "VERIFIED":
+            fix_candidate = indexed["fix_candidates"][finding["fix_candidate_id"]]
+            if fix_candidate["applicability"] != "SAFE":
+                raise ContractError(
+                    "verified finding references a non-safe fix candidate"
+                )
+            for identifier in cited_execution_ids:
+                execution = execution_by_id[identifier]
+                if execution["status"] != "COMPLETE":
+                    raise ContractError("verified finding cites incomplete execution")
+                if execution["adapter_kind"] != "PROVIDER":
+                    raise ContractError(
+                        "verified finding cites a non-provider execution"
+                    )
 
     decision_findings: list[str] = []
     for decision in indexed["decisions"].values():
@@ -260,14 +403,50 @@ def validate_report(report: dict[str, Any], contracts: ContractSchemas) -> None:
     for candidate in indexed["fix_candidates"].values():
         if not set(candidate["observation_ids"]) <= observation_ids:
             raise ContractError("fix references unknown observation")
+        candidate_tools = {
+            (
+                observation_by_id[observation_id]["tool"]["name"],
+                observation_by_id[observation_id]["tool"]["version"],
+            )
+            for observation_id in candidate["observation_ids"]
+        }
+        if len(candidate_tools) > 1:
+            raise ContractError(
+                "fix candidate observations must share tool name and version"
+            )
         patch_id = candidate["patch_evidence_id"]
         if patch_id not in evidence_ids:
             raise ContractError("fix references unknown patch evidence")
         if evidence_by_id[patch_id]["source"] != "PATCH":
             raise ContractError("fix evidence is not a patch")
 
+    base_snapshot_by_candidate: dict[str, str] = {}
     for execution in indexed["executions"].values():
+        validate_execution_attribution(
+            execution, indexed["fix_candidates"], evidence_by_id
+        )
         validate_execution(execution)
+        verification = execution.get("verification")
+        if verification is not None:
+            candidate_id = verification["fix_candidate_id"]
+            previous = base_snapshot_by_candidate.setdefault(
+                candidate_id, verification["base_snapshot_sha256"]
+            )
+            if previous != verification["base_snapshot_sha256"]:
+                raise ContractError(
+                    "execution verification base snapshot differs for fix candidate"
+                )
+
+    for execution in execution_by_id.values():
+        verification = execution.get("verification")
+        if verification is None:
+            continue
+        expected = cited_fingerprints_by_execution.get(execution["execution_id"], set())
+        if set(verification["target_fingerprints"]) != expected:
+            raise ContractError(
+                "execution verification target fingerprints do not match "
+                "citing findings"
+            )
 
 
 def validate_session(path: Path, contracts: ContractSchemas) -> None:
@@ -339,6 +518,8 @@ def validate_session(path: Path, contracts: ContractSchemas) -> None:
 
     evidence_by_id: dict[str, dict[str, Any]] = {}
     observations: set[str] = set()
+    observation_tools: dict[str, tuple[str, str]] = {}
+    execution_ids: set[str] = set()
     object_ids: set[str] = set()
     retained_bytes = 0
     for event in payload_events:
@@ -366,9 +547,14 @@ def validate_session(path: Path, contracts: ContractSchemas) -> None:
         elif event["kind"] == "observation":
             observation = event["observation"]
             observations.add(observation["observation_id"])
+            observation_tools[observation["observation_id"]] = (
+                observation["tool"]["name"],
+                observation["tool"]["version"],
+            )
             validate_location(observation.get("location"))
         elif event["kind"] == "execution":
             execution = event["execution"]
+            execution_ids.add(execution["execution_id"])
             if execution["adapter_id"] != manifest["adapter"]["id"]:
                 raise SessionError("execution adapter id differs from manifest")
             if execution["adapter_kind"] != adapter_kind:
@@ -377,6 +563,12 @@ def validate_session(path: Path, contracts: ContractSchemas) -> None:
 
     if completion["evidence_bytes"] != retained_bytes:
         raise SessionError("completion evidence byte count mismatch")
+
+    for evidence in evidence_by_id.values():
+        if (
+            execution_id := evidence.get("execution_id")
+        ) is not None and execution_id not in execution_ids:
+            raise SessionError("evidence references unknown execution")
 
     evidence_ids = set(evidence_by_id)
     for event in payload_events:
@@ -387,6 +579,14 @@ def validate_session(path: Path, contracts: ContractSchemas) -> None:
             candidate = event["fix_candidate"]
             if not set(candidate["observation_ids"]) <= observations:
                 raise SessionError("fix references unknown observation")
+            candidate_tools = {
+                observation_tools[observation_id]
+                for observation_id in candidate["observation_ids"]
+            }
+            if len(candidate_tools) > 1:
+                raise SessionError(
+                    "fix candidate observations must share tool name and version"
+                )
             if candidate["patch_evidence_id"] not in evidence_ids:
                 raise SessionError("fix references unknown patch evidence")
             if evidence_by_id[candidate["patch_evidence_id"]]["source"] != "PATCH":
@@ -425,6 +625,531 @@ class ContractTest(unittest.TestCase):
         for name in sorted(VALID_REPORT_FIXTURES):
             with self.subTest(name=name):
                 validate_report(load_json(FIXTURE_DIR / name), self.contracts)
+
+    def test_verified_finding_requires_safe_matching_attribution(self) -> None:
+        report = verified_report_with_attribution()
+        validate_report(report, self.contracts)
+
+        invalid_reports: dict[str, dict[str, Any]] = {}
+
+        missing_attribution = copy.deepcopy(report)
+        del missing_attribution["executions"][0]["verification"]
+        invalid_reports["missing attribution"] = missing_attribution
+
+        stale_same_tool_candidate = copy.deepcopy(report)
+        stale_same_tool_candidate["executions"][0]["verification"][
+            "fix_candidate_id"
+        ] = stale_same_tool_candidate["fix_candidates"][1]["fix_candidate_id"]
+        invalid_reports["stale same-tool candidate"] = stale_same_tool_candidate
+
+        dangling_candidate = copy.deepcopy(report)
+        dangling_candidate["executions"][0]["verification"]["fix_candidate_id"] = (
+            "019f7e95-0000-7000-8000-000000000109"
+        )
+        invalid_reports["dangling candidate"] = dangling_candidate
+
+        wrong_patch_digest = copy.deepcopy(report)
+        wrong_patch_digest["executions"][0]["verification"]["patch_sha256"] = "f" * 64
+        invalid_reports["wrong patch digest"] = wrong_patch_digest
+
+        wrong_target = copy.deepcopy(report)
+        wrong_target["executions"][0]["verification"]["target_fingerprints"] = [
+            "dtfp1:" + "f" * 64
+        ]
+        invalid_reports["wrong target"] = wrong_target
+
+        missing_target = copy.deepcopy(report)
+        del missing_target["executions"][0]["verification"]["target_fingerprints"]
+        invalid_reports["missing target"] = missing_target
+
+        wrong_result_evidence = copy.deepcopy(report)
+        wrong_result_evidence["executions"][0]["verification"]["result_evidence_id"] = (
+            "019f7e95-0000-8000-8000-000000000999"
+        )
+        invalid_reports["wrong result evidence"] = wrong_result_evidence
+
+        existing_wrong_result_evidence = copy.deepcopy(report)
+        existing_wrong_result_evidence["executions"][0]["verification"][
+            "result_evidence_id"
+        ] = existing_wrong_result_evidence["evidence"][0]["evidence_id"]
+        invalid_reports["existing but wrong result evidence"] = (
+            existing_wrong_result_evidence
+        )
+
+        dangling_evidence_execution = copy.deepcopy(report)
+        dangling_evidence_execution["evidence"][0]["execution_id"] = (
+            "019f7e95-0000-8000-8000-000000000999"
+        )
+        invalid_reports["dangling evidence execution"] = dangling_evidence_execution
+
+        wrong_result_execution = copy.deepcopy(report)
+        result_evidence_id = wrong_result_execution["executions"][0]["verification"][
+            "result_evidence_id"
+        ]
+        for evidence in wrong_result_execution["evidence"]:
+            if evidence["evidence_id"] == result_evidence_id:
+                evidence["execution_id"] = "019f7e95-0000-8000-8000-000000000999"
+                break
+        invalid_reports["wrong result execution ownership"] = wrong_result_execution
+
+        missing_result_execution = copy.deepcopy(report)
+        result_evidence_id = missing_result_execution["executions"][0]["verification"][
+            "result_evidence_id"
+        ]
+        for evidence in missing_result_execution["evidence"]:
+            if evidence["evidence_id"] == result_evidence_id:
+                del evidence["execution_id"]
+                break
+        invalid_reports["missing result execution ownership"] = missing_result_execution
+
+        unrelated_finding_observation = copy.deepcopy(report)
+        unrelated_observation = copy.deepcopy(
+            unrelated_finding_observation["observations"][0]
+        )
+        unrelated_observation["observation_id"] = "019f7e95-0000-7000-8000-000000000113"
+        unrelated_finding_observation["observations"].append(unrelated_observation)
+        unrelated_finding_observation["findings"][0]["observation_ids"].append(
+            unrelated_observation["observation_id"]
+        )
+        invalid_reports["unrelated candidate observation"] = (
+            unrelated_finding_observation
+        )
+
+        arbitrary_base_snapshot_digest = copy.deepcopy(report)
+        arbitrary_base_snapshot_digest["executions"][0]["verification"][
+            "base_snapshot_sha256"
+        ] = "f" * 64
+        invalid_reports["arbitrary base snapshot digest"] = (
+            arbitrary_base_snapshot_digest
+        )
+
+        mismatched_base_snapshot_evidence = copy.deepcopy(report)
+        mismatched_base_snapshot_evidence["executions"][0]["verification"][
+            "base_snapshot_evidence_id"
+        ] = mismatched_base_snapshot_evidence["fix_candidates"][0]["patch_evidence_id"]
+        invalid_reports["mismatched base snapshot evidence"] = (
+            mismatched_base_snapshot_evidence
+        )
+
+        missing_base_snapshot_evidence = copy.deepcopy(report)
+        missing_base_snapshot_evidence["executions"][0]["verification"][
+            "base_snapshot_evidence_id"
+        ] = "019f7e95-0000-8000-8000-000000000999"
+        invalid_reports["missing base snapshot evidence"] = (
+            missing_base_snapshot_evidence
+        )
+
+        invalid_result_source = copy.deepcopy(report)
+        result_evidence_id = invalid_result_source["executions"][0]["verification"][
+            "result_evidence_id"
+        ]
+        for evidence in invalid_result_source["evidence"]:
+            if evidence["evidence_id"] == result_evidence_id:
+                evidence["source"] = "PATCH"
+                break
+        invalid_reports["invalid result evidence source"] = invalid_result_source
+
+        for field, value in (("name", "black"), ("version", "0.12.3")):
+            wrong_tool = copy.deepcopy(report)
+            wrong_tool["executions"][0]["tool"][field] = value
+            invalid_reports[f"wrong execution tool {field}"] = wrong_tool
+
+        for applicability in ("MANUAL", "UNSAFE"):
+            non_safe_candidate = copy.deepcopy(report)
+            non_safe_candidate["fix_candidates"][0]["applicability"] = applicability
+            invalid_reports[f"{applicability.lower()} candidate"] = non_safe_candidate
+
+        for adapter_kind in ("ENGINE", "OBSERVER"):
+            non_provider_execution = copy.deepcopy(report)
+            non_provider_execution["executions"][0]["adapter_kind"] = adapter_kind
+            invalid_reports[f"{adapter_kind.lower()} execution"] = (
+                non_provider_execution
+            )
+
+        for name, candidate in invalid_reports.items():
+            with self.subTest(name=name), self.assertRaises(ContractError):
+                validate_report(candidate, self.contracts)
+
+    def test_receipt_targets_include_non_verified_citing_findings(self) -> None:
+        for status in ("INCOMPLETE", "UNSUPPORTED"):
+            report = verified_report_with_attribution()
+            report["findings"][0]["state"] = "FIX_PROPOSED"
+            execution = report["executions"][0]
+            execution["status"] = status
+            execution["exit_code"] = None
+            execution["message"] = f"verification execution is {status.lower()}"
+            with self.subTest(status=status):
+                validate_report(report, self.contracts)
+
+        missing_candidate = verified_report_with_attribution()
+        missing_candidate["findings"][0]["state"] = "DISCOVERED"
+        del missing_candidate["findings"][0]["fix_candidate_id"]
+        with self.assertRaises(ContractError):
+            validate_report(missing_candidate, self.contracts)
+
+        missing_attribution = verified_report_with_attribution()
+        missing_attribution["findings"][0]["state"] = "FIX_PROPOSED"
+        del missing_attribution["executions"][0]["verification"]
+        with self.assertRaises(ContractError):
+            validate_report(missing_attribution, self.contracts)
+
+        unsafe_receipt = verified_report_with_attribution()
+        unsafe_receipt["findings"][0]["state"] = "FIX_PROPOSED"
+        unsafe_receipt["fix_candidates"][0]["applicability"] = "UNSAFE"
+        with self.assertRaises(ContractError):
+            validate_report(unsafe_receipt, self.contracts)
+
+    def test_findings_and_candidates_preserve_tool_scope(self) -> None:
+        outside_candidate_scope = verified_report_with_attribution()
+        finding = outside_candidate_scope["findings"][0]
+        finding["state"] = "FIX_PROPOSED"
+        del finding["verification_execution_ids"]
+        del outside_candidate_scope["executions"][0]["verification"]
+        unrelated_observation = copy.deepcopy(
+            outside_candidate_scope["observations"][0]
+        )
+        unrelated_observation["observation_id"] = "019f7e95-0000-7000-8000-000000000113"
+        outside_candidate_scope["observations"].append(unrelated_observation)
+        finding["observation_ids"].append(unrelated_observation["observation_id"])
+        with self.assertRaises(ContractError):
+            validate_report(outside_candidate_scope, self.contracts)
+
+        mismatched_finding_tool = verified_report_with_attribution()
+        mismatched_finding_tool["observations"][0]["tool"]["rule_id"] = "E501"
+        with self.assertRaises(ContractError):
+            validate_report(mismatched_finding_tool, self.contracts)
+
+        mixed_candidate_tools = verified_report_with_attribution()
+        second_observation = copy.deepcopy(mixed_candidate_tools["observations"][0])
+        second_observation["observation_id"] = "019f7e95-0000-7000-8000-000000000114"
+        second_observation["tool"] = {"name": "black", "version": "25.1.0"}
+        mixed_candidate_tools["observations"].append(second_observation)
+        mixed_candidate_tools["fix_candidates"][0]["observation_ids"].append(
+            second_observation["observation_id"]
+        )
+        with self.assertRaises(ContractError):
+            validate_report(mixed_candidate_tools, self.contracts)
+
+    def test_candidate_allows_same_tool_version_with_multiple_rule_ids(self) -> None:
+        report = verified_report_with_attribution()
+        second_observation = copy.deepcopy(report["observations"][0])
+        second_observation["observation_id"] = "019f7e95-0000-7000-8000-000000000113"
+        second_observation["tool"]["rule_id"] = "E501"
+        report["observations"].append(second_observation)
+        report["fix_candidates"][0]["observation_ids"].append(
+            second_observation["observation_id"]
+        )
+        validate_report(report, self.contracts)
+
+    def test_report_rejects_duplicate_finding_fingerprints(self) -> None:
+        report = load_json(FIXTURE_DIR / "valid-report.json")
+        duplicate_finding = copy.deepcopy(report["findings"][0])
+        duplicate_finding["finding_id"] = "019f7e95-0000-7000-8000-000000000113"
+        duplicate_decision = copy.deepcopy(report["decisions"][0])
+        duplicate_decision["decision_id"] = "019f7e95-0000-7000-8000-000000000114"
+        duplicate_decision["finding_id"] = duplicate_finding["finding_id"]
+        report["findings"].append(duplicate_finding)
+        report["decisions"].append(duplicate_decision)
+        with self.assertRaises(ContractError):
+            validate_report(report, self.contracts)
+
+    def test_verification_evidence_boundaries_are_explicit(self) -> None:
+        valid = verified_report_with_attribution()
+        verification = valid["executions"][0]["verification"]
+        base_snapshot_id = verification["base_snapshot_evidence_id"]
+        result_id = verification["result_evidence_id"]
+
+        invalid_reports: dict[str, dict[str, Any]] = {}
+
+        truncated_base = copy.deepcopy(valid)
+        base_snapshot = next(
+            evidence
+            for evidence in truncated_base["evidence"]
+            if evidence["evidence_id"] == base_snapshot_id
+        )
+        base_snapshot["observed_bytes"] += 1
+        base_snapshot["truncated"] = True
+        invalid_reports["truncated base snapshot"] = truncated_base
+
+        truncated_patch = copy.deepcopy(valid)
+        patch = next(
+            evidence
+            for evidence in truncated_patch["evidence"]
+            if evidence["evidence_id"]
+            == truncated_patch["fix_candidates"][0]["patch_evidence_id"]
+        )
+        patch["observed_bytes"] += 1
+        patch["truncated"] = True
+        invalid_reports["truncated patch"] = truncated_patch
+
+        relative_path_base = copy.deepcopy(valid)
+        base_snapshot = next(
+            evidence
+            for evidence in relative_path_base["evidence"]
+            if evidence["evidence_id"] == base_snapshot_id
+        )
+        del base_snapshot["content"]
+        base_snapshot["relative_path"] = "snapshots/base.json"
+        invalid_reports["relative_path base snapshot"] = relative_path_base
+
+        relative_path_patch = copy.deepcopy(valid)
+        patch = next(
+            evidence
+            for evidence in relative_path_patch["evidence"]
+            if evidence["evidence_id"]
+            == relative_path_patch["fix_candidates"][0]["patch_evidence_id"]
+        )
+        del patch["content"]
+        patch["relative_path"] = "patches/fix.diff"
+        invalid_reports["relative_path patch"] = relative_path_patch
+
+        truncated_complete_result = copy.deepcopy(valid)
+        complete_result = next(
+            evidence
+            for evidence in truncated_complete_result["evidence"]
+            if evidence["evidence_id"] == result_id
+        )
+        complete_result["observed_bytes"] = 1
+        complete_result["truncated"] = True
+        invalid_reports["truncated complete result"] = truncated_complete_result
+
+        relative_path_complete_result = copy.deepcopy(valid)
+        complete_result = next(
+            evidence
+            for evidence in relative_path_complete_result["evidence"]
+            if evidence["evidence_id"] == result_id
+        )
+        del complete_result["content"]
+        complete_result["relative_path"] = "results/verification.txt"
+        invalid_reports["relative_path complete result"] = relative_path_complete_result
+
+        same_evidence = copy.deepcopy(valid)
+        same_evidence["executions"][0]["verification"]["result_evidence_id"] = (
+            base_snapshot_id
+        )
+        invalid_reports["same base and result evidence"] = same_evidence
+
+        snapshot_result = copy.deepcopy(valid)
+        snapshot_result_evidence = next(
+            evidence
+            for evidence in snapshot_result["evidence"]
+            if evidence["evidence_id"] == result_id
+        )
+        snapshot_result_evidence["media_type"] = SNAPSHOT_MEDIA_TYPE
+        invalid_reports["snapshot media type result"] = snapshot_result
+
+        for name, report in invalid_reports.items():
+            with self.subTest(name=name), self.assertRaises(ContractError):
+                validate_report(report, self.contracts)
+
+        for status in ("INCOMPLETE", "UNSUPPORTED"):
+            non_inline_result = copy.deepcopy(valid)
+            non_inline_result["verdict"] = status
+            non_inline_result["findings"][0]["state"] = "FIX_PROPOSED"
+            non_inline_result["executions"][0]["status"] = status
+            non_inline_result["executions"][0]["exit_code"] = None
+            non_inline_result["executions"][0]["message"] = (
+                f"verification {status.lower()}"
+            )
+            result = next(
+                evidence
+                for evidence in non_inline_result["evidence"]
+                if evidence["evidence_id"] == result_id
+            )
+            del result["content"]
+            result["relative_path"] = f"results/{status.lower()}.txt"
+            result["observed_bytes"] = 1
+            result["truncated"] = True
+            with self.subTest(status=status):
+                validate_report(non_inline_result, self.contracts)
+
+    def test_session_evidence_execution_id_must_resolve(self) -> None:
+        events = load_session(FIXTURE_DIR / "valid-session.jsonl")
+        events[2]["evidence"]["execution_id"] = "019f7e95-0000-7000-8000-000000000999"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid-execution-evidence.jsonl"
+            path.write_text(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(SessionError):
+                validate_session(path, self.contracts)
+
+    def test_provider_jsonl_rejects_execution_event(self) -> None:
+        events = load_session(FIXTURE_DIR / "valid-session.jsonl")
+        execution_event = copy.deepcopy(
+            load_session(FIXTURE_DIR / "valid-observer-session.jsonl")[2]
+        )
+        execution_event["request_id"] = events[1]["request_id"]
+        execution_event["sequence"] = 2
+        execution = execution_event["execution"]
+        execution["adapter_id"] = events[0]["adapter"]["id"]
+        execution["adapter_kind"] = "PROVIDER"
+        execution["tool"] = {"name": "ruff", "version": "0.12.4"}
+        execution["exit_code"] = 0
+        report = load_json(FIXTURE_DIR / "valid-verified-report.json")
+        execution["verification"] = copy.deepcopy(
+            report["executions"][0]["verification"]
+        )
+        events.insert(4, execution_event)
+        events[-1]["sequence"] = 3
+        events[-1]["counts"]["executions"] = 1
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid-provider-execution.jsonl"
+            path.write_text(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(SessionError):
+                validate_session(path, self.contracts)
+
+    def test_observer_jsonl_rejects_verification_receipt(self) -> None:
+        events = load_session(FIXTURE_DIR / "valid-observer-session.jsonl")
+        report = load_json(FIXTURE_DIR / "valid-verified-report.json")
+        events[2]["execution"]["verification"] = copy.deepcopy(
+            report["executions"][0]["verification"]
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid-observer-verification.jsonl"
+            path.write_text(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(SessionError):
+                validate_session(path, self.contracts)
+
+    def test_observer_evidence_may_resolve_to_its_execution_event(self) -> None:
+        events = load_session(FIXTURE_DIR / "valid-observer-session.jsonl")
+        execution_id = events[2]["execution"]["execution_id"]
+        events.insert(
+            3,
+            {
+                "protocol_version": "diagnostic-triage.protocol/v1",
+                "kind": "evidence",
+                "request_id": events[1]["request_id"],
+                "sequence": 1,
+                "evidence": {
+                    "schema_version": "diagnostic-triage.evidence/v1",
+                    "evidence_id": "019f7e95-0000-7000-8000-000000000203",
+                    "execution_id": execution_id,
+                    "source": "STDOUT",
+                    "media_type": "text/plain",
+                    "retained_bytes": 0,
+                    "observed_bytes": 0,
+                    "limit_bytes": 1048576,
+                    "truncated": False,
+                    "sha256": (
+                        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca"
+                        "495991b7852b855"
+                    ),
+                    "content": "",
+                },
+            },
+        )
+        events[-1]["sequence"] = 2
+        events[-1]["counts"]["evidence"] = 1
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "valid-observer-evidence.jsonl"
+            path.write_text(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                encoding="utf-8",
+            )
+            validate_session(path, self.contracts)
+
+    def test_session_candidate_rejects_mixed_tool_versions(self) -> None:
+        events = load_session(FIXTURE_DIR / "valid-session.jsonl")
+        second_observation = copy.deepcopy(events[3])
+        second_observation["observation"]["observation_id"] = (
+            "019f7e95-0000-7000-8000-000000000005"
+        )
+        second_observation["observation"]["tool"]["rule_id"] = "E501"
+
+        patch_evidence = copy.deepcopy(events[2])
+        patch_evidence["evidence"]["evidence_id"] = (
+            "019f7e95-0000-7000-8000-000000000004"
+        )
+        patch_evidence["evidence"]["source"] = "PATCH"
+        candidate = {
+            "protocol_version": "diagnostic-triage.protocol/v1",
+            "kind": "fix_candidate",
+            "request_id": events[1]["request_id"],
+            "sequence": 3,
+            "fix_candidate": {
+                "schema_version": "diagnostic-triage.fix-candidate/v1",
+                "fix_candidate_id": "019f7e95-0000-7000-8000-000000000006",
+                "observation_ids": [
+                    events[3]["observation"]["observation_id"],
+                    second_observation["observation"]["observation_id"],
+                ],
+                "applicability": "MANUAL",
+                "tool_native": False,
+                "patch_evidence_id": patch_evidence["evidence"]["evidence_id"],
+            },
+        }
+        events[2:4] = [
+            events[2],
+            events[3],
+            second_observation,
+            patch_evidence,
+            candidate,
+        ]
+        payload_events = events[2:-1]
+        for sequence, event in enumerate(payload_events):
+            event["sequence"] = sequence
+        events[-1]["sequence"] = len(payload_events)
+        events[-1]["counts"] = {
+            "observations": 2,
+            "evidence": 2,
+            "fix_candidates": 1,
+            "executions": 0,
+        }
+        events[-1]["evidence_bytes"] = 8
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "invalid-candidate-tools.jsonl"
+            path.write_text(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                encoding="utf-8",
+            )
+            validate_session(path, self.contracts)
+
+            second_observation["observation"]["tool"]["version"] = "0.12.5"
+            path.write_text(
+                "\n".join(json.dumps(event) for event in events) + "\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(SessionError):
+                validate_session(path, self.contracts)
+
+    def test_receipts_share_one_base_snapshot_per_candidate(self) -> None:
+        report = verified_report_with_attribution()
+        first_execution = report["executions"][0]
+        second_execution = copy.deepcopy(first_execution)
+        second_execution["execution_id"] = "019f7e95-0000-8000-8000-000000000112"
+        second_execution["adapter_id"] = "ruff-secondary"
+        second_result_evidence = next(
+            copy.deepcopy(evidence)
+            for evidence in report["evidence"]
+            if evidence["evidence_id"]
+            == second_execution["verification"]["result_evidence_id"]
+        )
+        second_result_evidence["evidence_id"] = "019f7e95-0000-8000-8000-000000000114"
+        second_result_evidence["execution_id"] = second_execution["execution_id"]
+        report["evidence"].append(second_result_evidence)
+        second_execution["verification"]["result_evidence_id"] = second_result_evidence[
+            "evidence_id"
+        ]
+        report["executions"].append(second_execution)
+        report["findings"][0]["verification_execution_ids"].append(
+            second_execution["execution_id"]
+        )
+        validate_report(report, self.contracts)
+
+        second_execution["verification"]["base_snapshot_sha256"] = "a" * 64
+        with self.assertRaises(ContractError):
+            validate_report(report, self.contracts)
 
     def test_missing_required_capability_becomes_unsupported(self) -> None:
         handshake = load_json(FIXTURE_DIR / "handshake-unsupported.json")

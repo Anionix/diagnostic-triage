@@ -392,6 +392,12 @@ pub enum EvidenceSource {
 pub struct Evidence {
     pub schema_version: EvidenceSchemaVersion,
     pub evidence_id: ObjectId,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub execution_id: Option<ObjectId>,
     pub source: EvidenceSource,
     pub media_type: String,
     pub retained_bytes: u64,
@@ -598,6 +604,23 @@ pub struct Runner {
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct VerificationAttribution {
+    pub fix_candidate_id: ObjectId,
+    pub patch_sha256: Sha256Digest,
+    pub base_snapshot_sha256: Sha256Digest,
+    pub base_snapshot_evidence_id: ObjectId,
+    pub target_fingerprints: Vec<Fingerprint>,
+    pub result_evidence_id: ObjectId,
+}
+
+impl VerificationAttribution {
+    fn validate(&self) -> Result<(), ContractError> {
+        check_unique(&self.target_fingerprints, "target_fingerprints", 1024, 1)
+    }
+}
+
+#[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Execution {
     pub schema_version: ExecutionSchemaVersion,
     pub execution_id: ObjectId,
@@ -619,6 +642,12 @@ pub struct Execution {
     pub cache: Cache,
     pub retry: Retry,
     pub runner: Runner,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub verification: Option<Box<VerificationAttribution>>,
 }
 
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
@@ -1302,6 +1331,14 @@ impl Runner {
 impl Execution {
     pub fn validate(&self) -> Result<(), ContractError> {
         validate_tool(&self.tool)?;
+        if let Some(verification) = &self.verification {
+            if self.adapter_kind != AdapterKind::Provider {
+                return Err(model_error(
+                    "verification attribution is valid only for Provider executions",
+                ));
+            }
+            verification.validate()?;
+        }
         if self.status != ExecutionStatus::Complete
             && (self.exit_code.0.is_some() || self.message.is_none())
         {
@@ -1377,8 +1414,8 @@ impl SessionReport {
 #[cfg(test)]
 mod tests {
     use super::{
-        Evidence, EvidenceSchemaVersion, PhaseDuration, Sha256Digest, ToolchainFingerprint,
-        Unavailable, is_valid_rfc3339_datetime,
+        Evidence, EvidenceSchemaVersion, PhaseDuration, SessionReport, Sha256Digest,
+        ToolchainFingerprint, Unavailable, VerificationAttribution, is_valid_rfc3339_datetime,
     };
 
     #[test]
@@ -1407,6 +1444,7 @@ mod tests {
         let evidence = Evidence {
             schema_version: EvidenceSchemaVersion::V1,
             evidence_id: "019f7e95-0000-7000-8000-000000000001".parse().unwrap(),
+            execution_id: None,
             source: super::EvidenceSource::Stdout,
             media_type: "text/plain".to_owned(),
             retained_bytes: 5,
@@ -1472,5 +1510,93 @@ mod tests {
             ToolchainFingerprint::Unavailable(Unavailable::Value)
         );
         assert!(serde_json::from_str::<ToolchainFingerprint>(r#""available""#).is_err());
+    }
+
+    #[test]
+    fn verification_attribution_is_optional_and_omits_null() {
+        let mut report = serde_json::from_str::<SessionReport>(include_str!(
+            "../../../tests/fixtures/v1/valid-report.json"
+        ))
+        .unwrap();
+        let without_verification = serde_json::to_value(&report).unwrap();
+        assert!(
+            without_verification["executions"][0]
+                .get("verification")
+                .is_none()
+        );
+
+        report.executions[0].verification = Some(Box::new(VerificationAttribution {
+            fix_candidate_id: "019f7e95-0000-7000-8000-000000000202".parse().unwrap(),
+            patch_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                .parse()
+                .unwrap(),
+            base_snapshot_sha256:
+                "1111111111111111111111111111111111111111111111111111111111111111"
+                    .parse()
+                    .unwrap(),
+            base_snapshot_evidence_id: "019f7e95-0000-7000-8000-000000000204".parse().unwrap(),
+            target_fingerprints: vec![
+                "dtfp1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .parse()
+                    .unwrap(),
+            ],
+            result_evidence_id: "019f7e95-0000-7000-8000-000000000203".parse().unwrap(),
+        }));
+        assert!(report.executions[0].validate().is_ok());
+        let with_verification = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            with_verification["executions"][0]["verification"],
+            serde_json::json!({
+                "fix_candidate_id": "019f7e95-0000-7000-8000-000000000202",
+                "patch_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+                "base_snapshot_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+                "base_snapshot_evidence_id": "019f7e95-0000-7000-8000-000000000204",
+                "target_fingerprints": [
+                    "dtfp1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                ],
+                "result_evidence_id": "019f7e95-0000-7000-8000-000000000203"
+            })
+        );
+
+        report.executions[0]
+            .verification
+            .as_mut()
+            .unwrap()
+            .target_fingerprints
+            .clear();
+        assert!(report.executions[0].validate().is_err());
+
+        report.executions[0]
+            .verification
+            .as_mut()
+            .unwrap()
+            .target_fingerprints = vec![
+            "dtfp1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .parse()
+                .unwrap(),
+            "dtfp1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .parse()
+                .unwrap(),
+        ];
+        assert!(report.executions[0].validate().is_err());
+
+        report.executions[0]
+            .verification
+            .as_mut()
+            .unwrap()
+            .target_fingerprints = vec![
+            "dtfp1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .parse()
+                .unwrap();
+            1025
+        ];
+        assert!(report.executions[0].validate().is_err());
+
+        let mut null_verification = with_verification["executions"][0].clone();
+        null_verification["verification"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<super::Execution>(null_verification).is_err());
+
+        report.executions[0].adapter_kind = super::AdapterKind::Observer;
+        assert!(report.executions[0].validate().is_err());
     }
 }
