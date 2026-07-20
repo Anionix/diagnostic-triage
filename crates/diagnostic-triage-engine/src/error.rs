@@ -13,6 +13,10 @@ pub enum EngineInputError {
     InvalidDeduplicationState,
     #[error("deduplication received an empty internal group")]
     EmptyDeduplicationGroup,
+    #[error("deduplication input exceeds the v1 limit of {max} findings: {actual}")]
+    DeduplicationInputTooLarge { actual: usize, max: usize },
+    #[error("deduplicated finding exceeds the v1 {field} limit of {max}")]
+    DeduplicatedReferenceLimit { field: &'static str, max: usize },
     #[error("classification rule ID must contain 1..=128 characters, got {length}")]
     InvalidClassificationRuleId { length: usize },
     #[error("classification rule {rule_id} has an invalid tool name")]
