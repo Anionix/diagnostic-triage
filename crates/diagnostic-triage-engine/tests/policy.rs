@@ -225,6 +225,61 @@ fn equal_actions_choose_the_lexicographically_smallest_rule_id() {
 }
 
 #[test]
+fn configured_and_default_equal_actions_share_the_rule_id_tie_break() {
+    for category in [
+        Category::Syntax,
+        Category::Type,
+        Category::Correctness,
+        Category::Build,
+        Category::Test,
+    ] {
+        let finding = finding(category.clone(), Severity::Error);
+        assert_policy_attribution(
+            &finding,
+            rule("z-block", PolicyAction::Block, Some(category.clone())),
+            &DecisionAction::Block,
+            default_rule_id(&category),
+        );
+        assert_policy_attribution(
+            &finding,
+            rule("a-block", PolicyAction::Block, Some(category)),
+            &DecisionAction::Block,
+            "a-block",
+        );
+    }
+
+    let finding = finding(Category::Runtime, Severity::Info);
+    assert_policy_attribution(
+        &finding,
+        rule("z-observe", PolicyAction::Observe, Some(Category::Runtime)),
+        &DecisionAction::Observe,
+        "default.observe",
+    );
+    assert_policy_attribution(
+        &finding,
+        rule("a-observe", PolicyAction::Observe, Some(Category::Runtime)),
+        &DecisionAction::Observe,
+        "a-observe",
+    );
+}
+
+fn assert_policy_attribution(
+    finding: &Finding,
+    rule: PolicyRule,
+    expected_action: &DecisionAction,
+    expected_rule_id: &str,
+) {
+    let decision =
+        evaluate_policy(finding, std::slice::from_ref(&rule), &[], EVALUATION_TIME).unwrap();
+    assert_eq!(&decision.action, expected_action);
+    assert_eq!(decision.matched_rule_id, expected_rule_id);
+
+    let decision = build_decision(finding, &[rule], &[], EVALUATION_TIME).unwrap();
+    assert_eq!(&decision.action, expected_action);
+    assert_eq!(decision.matched_rule_id, expected_rule_id);
+}
+
+#[test]
 fn waiver_requires_exact_fingerprint_and_action_and_strictly_future_expiry() {
     let finding = finding(Category::Syntax, Severity::Error);
     let fingerprint = finding.fingerprint.to_string();

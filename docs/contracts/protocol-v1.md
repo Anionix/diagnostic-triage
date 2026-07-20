@@ -119,9 +119,9 @@ Policy accepts valid Findings whose effective lifecycle is `CLASSIFIED`,
 `pre_report_state`. Rules may match severity, taxonomy, fingerprint, language,
 tool name, opaque case-sensitive tool version, and native rule ID. The highest
 matching action wins under `OBSERVE < WARN < BLOCK`, with the lexicographically
-smallest rule ID breaking equal-action ties. A configured rule cannot weaken
-the default block for ERROR Findings in `syntax`, `type`, `correctness`,
-`build`, or `test`.
+smallest rule ID breaking equal-action ties across configured and implicit
+default rules. A configured rule cannot weaken the default block for ERROR
+Findings in `syntax`, `type`, `correctness`, `build`, or `test`.
 
 One v1 policy snapshot contains at most 4,096 rules and 10,000 waivers. Bounds
 are checked before Finding validation and before cloning, sorting, or hashing
