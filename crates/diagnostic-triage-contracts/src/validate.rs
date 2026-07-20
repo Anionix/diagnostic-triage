@@ -8,8 +8,8 @@ use crate::{
     ContractError, Fingerprint, ObjectId, Sha256Digest, SourceRevision,
     jsonl::{decode_json_object, decode_jsonl, decode_line},
     model::{
-        AdapterKind, Decision, Evidence, EvidenceSource, Execution, ExecutionStatus, Finding,
-        FixCandidate, Observation, SessionReport,
+        AdapterKind, Decision, DecisionAction, Evidence, EvidenceSource, Execution,
+        ExecutionStatus, Finding, FixCandidate, Observation, SessionReport, Verdict,
     },
     protocol::{
         CompletionCounts, CompletionEnvelope, ManifestEnvelope, Operation, ProtocolEnvelope,
@@ -262,6 +262,7 @@ pub fn validate_report(report: &SessionReport) -> Result<(), ContractError> {
     for candidate in index.fixes.values() {
         validate_fix_references(candidate, &index.observations, &index.evidence)?;
     }
+    validate_report_verdict(report)?;
     Ok(())
 }
 
@@ -292,6 +293,36 @@ fn validate_contract_identity(report: &SessionReport) -> Result<(), ContractErro
     if report.contract_sha256.as_str() != expected {
         return Err(model_error(
             "contract digest differs from engine source revision",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_report_verdict(report: &SessionReport) -> Result<(), ContractError> {
+    let expected = if report
+        .executions
+        .iter()
+        .any(|execution| execution.required && execution.status == ExecutionStatus::Incomplete)
+    {
+        Verdict::Incomplete
+    } else if report
+        .executions
+        .iter()
+        .any(|execution| execution.required && execution.status == ExecutionStatus::Unsupported)
+    {
+        Verdict::Unsupported
+    } else if report
+        .decisions
+        .iter()
+        .any(|decision| decision.action == DecisionAction::Block)
+    {
+        Verdict::PolicyFail
+    } else {
+        Verdict::Pass
+    };
+    if report.verdict != expected {
+        return Err(model_error(
+            "report verdict differs from required executions and decisions",
         ));
     }
     Ok(())

@@ -130,6 +130,13 @@ and a `..` segment are invalid. An Evidence path is validated by the same rule.
 No partial session is promoted to PASS. Providers emit Observations, not
 Findings, fingerprints, Decisions, or final policy Verdicts.
 
+The SessionReport verdict is derived, not caller-selected. Required executions
+take precedence over policy: any required `INCOMPLETE` yields `INCOMPLETE`;
+otherwise any required `UNSUPPORTED` yields `UNSUPPORTED`; otherwise any
+`BLOCK` Decision yields `POLICY_FAIL`; otherwise the verdict is `PASS`.
+Optional incomplete or unsupported executions do not affect the verdict, and
+`OBSERVE`, `WARN`, and `WAIVE` Decisions are nonblocking.
+
 ## Verification and evidence attribution
 
 A `FixCandidate.observation_ids` list defines the candidate's observation
