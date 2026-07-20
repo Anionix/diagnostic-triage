@@ -1,0 +1,1 @@
+session_id	finding_id	fingerprint	tool_name	tool_version	rule_id	language	severity	category	micro_category	message	path	start_line	start_column	end_line	end_column	symbol	finding_state	pre_report_state	decision_id	action	evaluated_at	policy_digest	matched_rule_id	verdict
