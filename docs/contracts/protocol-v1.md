@@ -209,6 +209,35 @@ Optional incomplete or unsupported executions do not affect the verdict, and
 
 ## Verification and evidence attribution
 
+The Engine's safe-fix comparison is pure and deterministic. It accepts at most
+10,000 before Findings, 10,000 after Findings, 10,000 Evidence objects, 10,000
+Executions, 1,024 unique target fingerprints, 1,024 conflict paths, and 64 MiB
+of aggregate retained Evidence. Before and after Findings are integrity-checked,
+then deduplicated by fingerprint before comparison. Malformed objects, forged
+Finding identities, dangling or conflicting references, and exceeded bounds
+are input errors. Expected operational failures are structured rejection
+outcomes instead.
+
+Only a tool-native `SAFE` candidate can be authorized. Every target must be a
+before Finding in `FIX_PROPOSED` for that candidate and stay within its
+observation scope. Verification attribution binds the candidate, complete
+inline patch, one consistent inline base snapshot, result Evidence, target
+fingerprints, tool identity, and required Provider execution. The patch
+application result repeats both the patch and base snapshot digests; all three
+representations must agree. Candidate inapplicability, patch conflicts, and
+required terminal Provider states are returned before successful-verification
+attribution is required. These operational failures, a residual target, an
+existing severity escalation, or a new Finding at or above the target floor
+reject authorization. The floor is the least severe target after deterministic
+deduplication under `INFO < WARNING < ERROR`; therefore, a new Finding is
+allowed only when it is strictly less severe than every target.
+
+Success preserves each canonical before target and transitions that copy to
+`VERIFIED` with the exact candidate and verification Execution IDs. Canonical
+post-fix Findings and any allowed lower-severity new fingerprints remain in the
+result. Reordering Findings, Evidence, Executions, targets, or nested references
+does not change the structured result.
+
 A `FixCandidate.observation_ids` list defines the candidate's observation
 scope. Every Finding with a `fix_candidate_id` must have all of its observations
 covered by that scope. A Finding that cites verification

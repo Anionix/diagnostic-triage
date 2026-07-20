@@ -11,6 +11,7 @@ mod identity;
 pub mod normalize;
 pub mod policy;
 pub mod report;
+pub mod verification;
 
 pub use error::{EngineError, EngineInputError};
 pub use identity::deterministic_object_id;
