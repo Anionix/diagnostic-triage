@@ -51,6 +51,7 @@ fn finding(fingerprint_value: u64, finding_id: u64, line: u32) -> Finding {
         expected: None,
         observed: None,
         state: FindingState::Classified,
+        pre_report_state: None,
         evidence_ids: vec![id(finding_id + 200)],
         fix_candidate_id: None,
         verification_execution_ids: None,

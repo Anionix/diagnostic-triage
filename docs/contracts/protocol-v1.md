@@ -27,6 +27,18 @@ emit `evidence` and `execution`. An `observation`, `fix_candidate`, or
 boundary and cannot emit Engine-owned Findings or Decisions. Providers accept
 `CHECK`, `FIX`, and `VERIFY`; Observers accept only `OBSERVE`.
 
+A `REPORTED` Finding records its last material lifecycle state in mandatory
+`pre_report_state`: `CLASSIFIED`, `FIX_PROPOSED`, or `VERIFIED`. The field is
+absent before `REPORTED`. Reporting a Finding does not erase its proof status:
+`pre_report_state: VERIFIED` retains the same fix candidate and verification
+execution references and remains subject to every VERIFIED invariant. This is
+a structural lifecycle claim, not an append-only history or attestation.
+`verification_execution_ids` record verification attempts, not success by
+themselves. A `FIX_PROPOSED` Finding may retain failed or incomplete attempt
+receipts. Every verification-attributed execution is still Provider-owned;
+only an effective `VERIFIED` state additionally turns those references into a
+verified-proof claim requiring a SAFE candidate and COMPLETE execution.
+
 ## Capabilities and versions
 
 `protocol_version` is exactly `diagnostic-triage.protocol/v1`. Capabilities are

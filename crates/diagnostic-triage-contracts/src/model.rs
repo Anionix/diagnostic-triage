@@ -244,6 +244,14 @@ pub enum FindingState {
     Reported,
 }
 
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PreReportState {
+    Classified,
+    FixProposed,
+    Verified,
+}
+
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Observation {
@@ -318,6 +326,12 @@ pub struct Finding {
     )]
     pub observed: Option<String>,
     pub state: FindingState,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub pre_report_state: Option<PreReportState>,
     pub evidence_ids: Vec<ObjectId>,
     #[serde(
         default,
@@ -1005,19 +1019,72 @@ impl Finding {
         if let Some(ids) = &self.verification_execution_ids {
             check_unique(ids, "verification_execution_ids", 64, 1)?;
         }
-        match self.state {
-            FindingState::FixProposed | FindingState::Verified
-                if self.fix_candidate_id.is_none() =>
-            {
-                Err(model_error(
-                    "fix_candidate_id is required for this finding state",
-                ))
+        match (self.state, self.pre_report_state) {
+            (FindingState::Reported, None) => {
+                return Err(model_error(
+                    "pre_report_state is required for REPORTED findings",
+                ));
             }
-            FindingState::Verified if self.verification_execution_ids.is_none() => Err(
-                model_error("verification_execution_ids is required for VERIFIED findings"),
-            ),
-            _ => Ok(()),
+            (FindingState::Reported, Some(_)) | (_, None) => {}
+            (_, Some(_)) => {
+                return Err(model_error(
+                    "pre_report_state is allowed only for REPORTED findings",
+                ));
+            }
         }
+        let effective_state = match self.pre_report_state {
+            Some(PreReportState::Classified) => FindingState::Classified,
+            Some(PreReportState::FixProposed) => FindingState::FixProposed,
+            Some(PreReportState::Verified) => FindingState::Verified,
+            None => self.state,
+        };
+        if matches!(
+            effective_state,
+            FindingState::Discovered | FindingState::Normalized | FindingState::Classified
+        ) && (self.fix_candidate_id.is_some() || self.verification_execution_ids.is_some())
+        {
+            return Err(model_error(
+                "pre-fix findings cannot contain fix or verification references",
+            ));
+        }
+        if matches!(
+            effective_state,
+            FindingState::FixProposed | FindingState::Verified
+        ) && self.fix_candidate_id.is_none()
+        {
+            return Err(model_error(
+                "fix_candidate_id is required for this finding state",
+            ));
+        }
+        if effective_state == FindingState::Verified && self.verification_execution_ids.is_none() {
+            return Err(model_error(
+                "verification_execution_ids is required for verified findings",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Preserve the last material lifecycle state while entering `REPORTED`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContractError::Model`] when the Finding is invalid or has not
+    /// reached `CLASSIFIED`.
+    pub fn into_reported(mut self) -> Result<Self, ContractError> {
+        self.validate()?;
+        self.pre_report_state = Some(match self.state {
+            FindingState::Classified => PreReportState::Classified,
+            FindingState::FixProposed => PreReportState::FixProposed,
+            FindingState::Verified => PreReportState::Verified,
+            _ => {
+                return Err(model_error(
+                    "only CLASSIFIED, FIX_PROPOSED, or VERIFIED findings may be reported",
+                ));
+            }
+        });
+        self.state = FindingState::Reported;
+        self.validate()?;
+        Ok(self)
     }
 }
 

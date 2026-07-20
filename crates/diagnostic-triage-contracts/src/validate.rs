@@ -9,7 +9,8 @@ use crate::{
     jsonl::{decode_json_object, decode_jsonl, decode_line},
     model::{
         AdapterKind, Decision, DecisionAction, Evidence, EvidenceSource, Execution,
-        ExecutionStatus, Finding, FixCandidate, Observation, SessionReport, Verdict,
+        ExecutionStatus, Finding, FindingState, FixCandidate, Observation, PreReportState,
+        SessionReport, Verdict,
     },
     protocol::{
         CompletionCounts, CompletionEnvelope, ManifestEnvelope, Operation, ProtocolEnvelope,
@@ -367,11 +368,6 @@ fn validate_execution_verifications(
                 "execution verification references unknown fix candidate",
             ));
         };
-        if candidate.applicability != crate::model::Applicability::Safe {
-            return Err(model_error(
-                "execution verification requires a SAFE fix candidate",
-            ));
-        }
         validate_verification_evidence(execution, verification, candidate, index)?;
         if let Some(previous) = base_snapshots_by_candidate.get(&verification.fix_candidate_id) {
             if previous != &verification.base_snapshot_sha256 {
@@ -545,12 +541,9 @@ fn validate_finding_references(
                     .or_default()
                     .insert(finding.fingerprint.clone());
             }
-            validate_finding_verification(
-                finding,
-                identifiers,
-                index,
-                matches!(finding.state, crate::model::FindingState::Verified),
-            )?;
+            let is_verified = finding.state == FindingState::Verified
+                || finding.pre_report_state == Some(PreReportState::Verified);
+            validate_finding_verification(finding, identifiers, index, is_verified)?;
         }
     }
     Ok(finding_fingerprints_by_execution)

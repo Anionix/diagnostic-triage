@@ -4,8 +4,8 @@ use std::{collections::HashSet, fs, path::PathBuf};
 
 use diagnostic_triage_contracts::{
     COMMON_SCHEMA_V1, MODEL_SCHEMA_V1, PROTOCOL_SCHEMA_V1, SourceRevision, TAXONOMY_SCHEMA_V1,
-    model::{SessionReport, Taxonomy},
-    validate_report_for_revision, validate_report_json, validate_session_jsonl,
+    model::{FindingState, PreReportState, SessionReport, Taxonomy},
+    validate_report, validate_report_for_revision, validate_report_json, validate_session_jsonl,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -490,6 +490,10 @@ fn rejects_semantically_inconsistent_reports() {
         "patch_evidence_id": evidence_id
     }]);
     failed_verification["findings"][0]["state"] = json!("VERIFIED");
+    failed_verification["findings"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("pre_report_state");
     failed_verification["findings"][0]["fix_candidate_id"] =
         json!("019f7e95-0000-7000-8000-000000000107");
     failed_verification["findings"][0]["verification_execution_ids"] = json!([execution_id]);
@@ -591,6 +595,74 @@ fn verified_finding_requires_exact_execution_attribution() {
             "accepted a {applicability} candidate as VERIFIED"
         );
     }
+}
+
+#[test]
+fn reported_verified_finding_preserves_and_revalidates_proof() {
+    let valid = verified_report_fixture();
+    let mut reported = valid.clone();
+    reported["findings"][0]["state"] = json!("REPORTED");
+    reported["findings"][0]["pre_report_state"] = json!("VERIFIED");
+    validate_report_json(&serde_json::to_vec(&reported).unwrap())
+        .expect("reported verified proof remains valid");
+
+    let mut typed = validate_report_json(&serde_json::to_vec(&valid).unwrap()).unwrap();
+    let finding = typed.findings.remove(0);
+    let fix_candidate_id = finding.fix_candidate_id.clone();
+    let execution_ids = finding.verification_execution_ids.clone();
+    let transitioned = finding.into_reported().expect("VERIFIED may be reported");
+    assert_eq!(transitioned.state, FindingState::Reported);
+    assert_eq!(
+        transitioned.pre_report_state,
+        Some(PreReportState::Verified)
+    );
+    assert_eq!(transitioned.fix_candidate_id, fix_candidate_id);
+    assert_eq!(transitioned.verification_execution_ids, execution_ids);
+    typed.findings.push(transitioned);
+    validate_report(&typed).expect("typed reporting transition preserves valid proof");
+
+    let mut missing_pre_state = reported.clone();
+    missing_pre_state["findings"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("pre_report_state");
+    assert!(rejects_report(&missing_pre_state));
+
+    let mut missing_candidate = reported.clone();
+    missing_candidate["findings"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("fix_candidate_id");
+    assert!(rejects_report(&missing_candidate));
+
+    let mut missing_executions = reported.clone();
+    missing_executions["findings"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("verification_execution_ids");
+    assert!(rejects_report(&missing_executions));
+
+    let mut incomplete = reported.clone();
+    incomplete["executions"][0]["status"] = json!("INCOMPLETE");
+    incomplete["executions"][0]["exit_code"] = Value::Null;
+    incomplete["executions"][0]["message"] = json!("verification timed out");
+    incomplete["verdict"] = json!("INCOMPLETE");
+    assert!(rejects_report(&incomplete));
+
+    let mut unsafe_candidate = reported.clone();
+    unsafe_candidate["fix_candidates"][0]["applicability"] = json!("UNSAFE");
+    assert!(rejects_report(&unsafe_candidate));
+
+    let mut non_provider = reported.clone();
+    non_provider["executions"][0]["adapter_kind"] = json!("OBSERVER");
+    assert!(rejects_report(&non_provider));
+
+    let mut downgraded_claim = reported;
+    downgraded_claim["findings"][0]["pre_report_state"] = json!("CLASSIFIED");
+    assert!(
+        rejects_report(&downgraded_claim),
+        "accepted a classified report that retained verified proof references"
+    );
 }
 
 #[test]
@@ -714,6 +786,10 @@ fn fix_proposed_finding_must_stay_within_candidate_observation_scope() {
         .expect("observations is an array")
         .push(out_of_scope);
     report["findings"][0]["state"] = json!("FIX_PROPOSED");
+    report["findings"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("pre_report_state");
     report["findings"][0]["observation_ids"] = json!([out_of_scope_id]);
     report["findings"][0]
         .as_object_mut()
@@ -1089,6 +1165,10 @@ fn failed_verification_receipts_remain_reportable_and_share_the_base_snapshot() 
         let mut report = verified_report_fixture();
         report["verdict"] = json!(verdict);
         report["findings"][0]["state"] = json!("FIX_PROPOSED");
+        report["findings"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("pre_report_state");
         report["executions"][0]["status"] = json!(status);
         report["executions"][0]["exit_code"] = Value::Null;
         report["executions"][0]["message"] = json!(format!(
@@ -1112,14 +1192,40 @@ fn failed_verification_receipts_remain_reportable_and_share_the_base_snapshot() 
         result["truncated"] = json!(true);
         validate_report_json(&serde_json::to_vec(&report).unwrap())
             .unwrap_or_else(|error| panic!("rejected non-inline {status} receipt: {error}"));
+
+        report["findings"][0]["state"] = json!("REPORTED");
+        report["findings"][0]["pre_report_state"] = json!("FIX_PROPOSED");
+        validate_report_json(&serde_json::to_vec(&report).unwrap()).unwrap_or_else(|error| {
+            panic!("rejected reported FIX_PROPOSED {status} receipt: {error}")
+        });
     }
 
     let mut unsafe_receipt = verified_report_fixture();
     unsafe_receipt["findings"][0]["state"] = json!("FIX_PROPOSED");
+    unsafe_receipt["findings"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("pre_report_state");
     unsafe_receipt["fix_candidates"][0]["applicability"] = json!("UNSAFE");
+    validate_report_json(&serde_json::to_vec(&unsafe_receipt).unwrap())
+        .expect("FIX_PROPOSED may retain an UNSAFE verification attempt receipt");
+
+    unsafe_receipt["findings"][0]["state"] = json!("REPORTED");
+    unsafe_receipt["findings"][0]["pre_report_state"] = json!("FIX_PROPOSED");
+    validate_report_json(&serde_json::to_vec(&unsafe_receipt).unwrap())
+        .expect("reported FIX_PROPOSED may retain an UNSAFE verification attempt receipt");
+
+    let mut non_provider_receipt = unsafe_receipt.clone();
+    non_provider_receipt["executions"][0]["adapter_kind"] = json!("OBSERVER");
+    assert!(
+        rejects_report(&non_provider_receipt),
+        "accepted a non-Provider FIX_PROPOSED verification attempt receipt"
+    );
+
+    unsafe_receipt["findings"][0]["pre_report_state"] = json!("VERIFIED");
     assert!(
         rejects_report(&unsafe_receipt),
-        "accepted an UNSAFE candidate as a verification subject"
+        "accepted an UNSAFE candidate as a VERIFIED proof claim"
     );
 
     let mut report = verified_report_fixture();

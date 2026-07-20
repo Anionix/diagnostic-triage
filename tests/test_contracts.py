@@ -266,13 +266,14 @@ def validate_execution_attribution(
     verification = execution.get("verification")
     if verification is None:
         return
+    if execution["adapter_kind"] != "PROVIDER":
+        raise ContractError(
+            "verification attribution is valid only for Provider executions"
+        )
     candidate_id = verification["fix_candidate_id"]
     candidate = candidates.get(candidate_id)
     if candidate is None:
         raise ContractError("execution verification references unknown fix candidate")
-    if candidate["applicability"] != "SAFE":
-        raise ContractError("execution verification requires a SAFE fix candidate")
-
     patch = evidence_by_id.get(candidate["patch_evidence_id"])
     if patch is None:
         raise ContractError("execution verification references unknown patch evidence")
@@ -420,6 +421,13 @@ def validate_report(
         if not set(finding["evidence_ids"]) <= evidence_ids:
             raise ContractError("finding references unknown evidence")
         fix_candidate_id = finding.get("fix_candidate_id")
+        effective_state = finding.get("pre_report_state", finding["state"])
+        if effective_state in ("DISCOVERED", "NORMALIZED", "CLASSIFIED") and (
+            fix_candidate_id is not None or "verification_execution_ids" in finding
+        ):
+            raise ContractError(
+                "pre-fix findings cannot contain fix or verification references"
+            )
         if fix_candidate_id not in (None, *fix_ids):
             raise ContractError("finding references unknown fix candidate")
         for observation_id in finding["observation_ids"]:
@@ -456,7 +464,7 @@ def validate_report(
             cited_fingerprints_by_execution.setdefault(identifier, set()).add(
                 finding["fingerprint"]
             )
-        if finding["state"] == "VERIFIED":
+        if effective_state == "VERIFIED":
             fix_candidate = indexed["fix_candidates"][finding["fix_candidate_id"]]
             if fix_candidate["applicability"] != "SAFE":
                 raise ContractError(
@@ -895,6 +903,7 @@ class ContractTest(unittest.TestCase):
         for status in ("INCOMPLETE", "UNSUPPORTED"):
             report = verified_report_with_attribution()
             report["findings"][0]["state"] = "FIX_PROPOSED"
+            report["findings"][0].pop("pre_report_state", None)
             execution = report["executions"][0]
             execution["status"] = status
             execution["exit_code"] = None
@@ -905,19 +914,94 @@ class ContractTest(unittest.TestCase):
 
         missing_candidate = verified_report_with_attribution()
         missing_candidate["findings"][0]["state"] = "DISCOVERED"
+        missing_candidate["findings"][0].pop("pre_report_state", None)
         del missing_candidate["findings"][0]["fix_candidate_id"]
         with self.assertRaises(ContractError):
             validate_report(missing_candidate, self.contracts)
 
         missing_attribution = verified_report_with_attribution()
         missing_attribution["findings"][0]["state"] = "FIX_PROPOSED"
+        missing_attribution["findings"][0].pop("pre_report_state", None)
         del missing_attribution["executions"][0]["verification"]
         with self.assertRaises(ContractError):
             validate_report(missing_attribution, self.contracts)
 
+    def test_reported_verified_finding_preserves_proof(self) -> None:
+        verified = load_json(FIXTURE_DIR / "valid-verified-report.json")
+        reported = copy.deepcopy(verified)
+        reported["findings"][0]["state"] = "REPORTED"
+        reported["findings"][0]["pre_report_state"] = "VERIFIED"
+        validate_report(reported, self.contracts)
+
+        invalid_reports: dict[str, dict[str, Any]] = {}
+
+        missing_pre_state = copy.deepcopy(reported)
+        del missing_pre_state["findings"][0]["pre_report_state"]
+        invalid_reports["missing pre-report state"] = missing_pre_state
+
+        missing_candidate = copy.deepcopy(reported)
+        del missing_candidate["findings"][0]["fix_candidate_id"]
+        invalid_reports["missing fix candidate"] = missing_candidate
+
+        missing_executions = copy.deepcopy(reported)
+        del missing_executions["findings"][0]["verification_execution_ids"]
+        invalid_reports["missing verification executions"] = missing_executions
+
+        incomplete = copy.deepcopy(reported)
+        incomplete["executions"][0]["status"] = "INCOMPLETE"
+        incomplete["executions"][0]["exit_code"] = None
+        incomplete["executions"][0]["message"] = "verification timed out"
+        incomplete["verdict"] = "INCOMPLETE"
+        invalid_reports["incomplete verification"] = incomplete
+
+        unsafe_candidate = copy.deepcopy(reported)
+        unsafe_candidate["fix_candidates"][0]["applicability"] = "UNSAFE"
+        invalid_reports["unsafe candidate"] = unsafe_candidate
+
+        non_provider = copy.deepcopy(reported)
+        non_provider["executions"][0]["adapter_kind"] = "OBSERVER"
+        invalid_reports["non-provider verification"] = non_provider
+
+        downgraded_claim = copy.deepcopy(reported)
+        downgraded_claim["findings"][0]["pre_report_state"] = "CLASSIFIED"
+        invalid_reports["classified claim with verified references"] = downgraded_claim
+
+        pre_state_before_report = copy.deepcopy(verified)
+        pre_state_before_report["findings"][0]["pre_report_state"] = "VERIFIED"
+        invalid_reports["pre-report state before REPORTED"] = pre_state_before_report
+
+        for name, candidate in invalid_reports.items():
+            with self.subTest(name=name), self.assertRaises(ContractError):
+                validate_report(candidate, self.contracts)
+
         unsafe_receipt = verified_report_with_attribution()
         unsafe_receipt["findings"][0]["state"] = "FIX_PROPOSED"
+        unsafe_receipt["findings"][0].pop("pre_report_state", None)
         unsafe_receipt["fix_candidates"][0]["applicability"] = "UNSAFE"
+        validate_report(unsafe_receipt, self.contracts)
+
+        unsafe_receipt["findings"][0]["state"] = "REPORTED"
+        unsafe_receipt["findings"][0]["pre_report_state"] = "FIX_PROPOSED"
+        validate_report(unsafe_receipt, self.contracts)
+
+        non_provider_receipt = copy.deepcopy(unsafe_receipt)
+        non_provider_receipt["executions"][0]["adapter_kind"] = "OBSERVER"
+        with self.assertRaises(ContractError):
+            validate_report(non_provider_receipt, self.contracts)
+        with self.assertRaisesRegex(ContractError, "only for Provider"):
+            validate_execution_attribution(
+                non_provider_receipt["executions"][0],
+                {
+                    unsafe_receipt["fix_candidates"][0]["fix_candidate_id"]:
+                        unsafe_receipt["fix_candidates"][0]
+                },
+                {
+                    evidence["evidence_id"]: evidence
+                    for evidence in unsafe_receipt["evidence"]
+                },
+            )
+
+        unsafe_receipt["findings"][0]["pre_report_state"] = "VERIFIED"
         with self.assertRaises(ContractError):
             validate_report(unsafe_receipt, self.contracts)
 
@@ -925,6 +1009,7 @@ class ContractTest(unittest.TestCase):
         outside_candidate_scope = verified_report_with_attribution()
         finding = outside_candidate_scope["findings"][0]
         finding["state"] = "FIX_PROPOSED"
+        finding.pop("pre_report_state", None)
         del finding["verification_execution_ids"]
         del outside_candidate_scope["executions"][0]["verification"]
         unrelated_observation = copy.deepcopy(
@@ -1068,6 +1153,7 @@ class ContractTest(unittest.TestCase):
             non_inline_result = copy.deepcopy(valid)
             non_inline_result["verdict"] = status
             non_inline_result["findings"][0]["state"] = "FIX_PROPOSED"
+            non_inline_result["findings"][0].pop("pre_report_state", None)
             non_inline_result["executions"][0]["status"] = status
             non_inline_result["executions"][0]["exit_code"] = None
             non_inline_result["executions"][0]["message"] = (
@@ -1083,6 +1169,11 @@ class ContractTest(unittest.TestCase):
             result["observed_bytes"] = 1
             result["truncated"] = True
             with self.subTest(status=status):
+                validate_report(non_inline_result, self.contracts)
+
+            non_inline_result["findings"][0]["state"] = "REPORTED"
+            non_inline_result["findings"][0]["pre_report_state"] = "FIX_PROPOSED"
+            with self.subTest(status=status, state="REPORTED"):
                 validate_report(non_inline_result, self.contracts)
 
     def test_session_evidence_execution_id_must_resolve(self) -> None:
@@ -1378,6 +1469,7 @@ class ContractTest(unittest.TestCase):
         ]
         finding = failed_verification["findings"][0]
         finding["state"] = "VERIFIED"
+        finding.pop("pre_report_state", None)
         finding["fix_candidate_id"] = failed_verification["fix_candidates"][0][
             "fix_candidate_id"
         ]

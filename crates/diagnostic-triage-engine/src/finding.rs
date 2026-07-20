@@ -91,6 +91,7 @@ pub fn build_finding_with_taxonomy(
         expected,
         observed,
         state: FindingState::Classified,
+        pre_report_state: None,
         evidence_ids: observation.evidence_ids.clone(),
         fix_candidate_id: None,
         verification_execution_ids: None,

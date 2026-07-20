@@ -44,6 +44,7 @@ pub fn deduplicate_findings(findings: Vec<Finding>) -> Result<Vec<Finding>, Engi
     for finding in findings {
         validate_finding_integrity(&finding)?;
         if finding.state != FindingState::Classified
+            || finding.pre_report_state.is_some()
             || finding.fix_candidate_id.is_some()
             || finding.verification_execution_ids.is_some()
         {
