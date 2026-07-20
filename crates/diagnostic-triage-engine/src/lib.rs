@@ -3,6 +3,7 @@
 // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
 
 pub mod classification;
+pub mod dedup;
 mod error;
 pub mod finding;
 pub mod fingerprint;
