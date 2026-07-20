@@ -1,0 +1,99 @@
+{
+  "schema_version": "diagnostic-triage.session-report/v1",
+  "session_id": "019f7e95-0000-7000-8000-000000000101",
+  "engine": {
+    "version": "0.1.0",
+    "source_revision": "84563c93ee06e3a834a03ff53f21b62b6ab0cc89"
+  },
+  "contract_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "policy_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "verdict": "POLICY_FAIL",
+  "observations": [
+    {
+      "schema_version": "diagnostic-triage.observation/v1",
+      "observation_id": "019f7e95-0000-7000-8000-000000000103",
+      "tool": { "name": "ruff", "version": "0.12.4", "rule_id": "F821" },
+      "language": "python",
+      "severity": "ERROR",
+      "origin": "NORMAL",
+      "message": "Undefined name `x`",
+      "location": {
+        "path": "src/example.py",
+        "start": { "line": 7, "column": 12 },
+        "end": { "line": 7, "column": 13 }
+      },
+      "symbol": "x",
+      "evidence_ids": ["019f7e95-0000-7000-8000-000000000102"]
+    }
+  ],
+  "findings": [
+    {
+      "schema_version": "diagnostic-triage.finding/v1",
+      "finding_id": "019f7e95-0000-7000-8000-000000000105",
+      "fingerprint": "dtfp1:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "observation_ids": ["019f7e95-0000-7000-8000-000000000103"],
+      "tool": { "name": "ruff", "version": "0.12.4", "rule_id": "F821" },
+      "language": "python",
+      "severity": "ERROR",
+      "classification": { "category": "type", "micro_category": "unresolved-symbol" },
+      "message": "Undefined name `x`",
+      "location": {
+        "path": "src/example.py",
+        "start": { "line": 7, "column": 12 },
+        "end": { "line": 7, "column": 13 }
+      },
+      "symbol": "x",
+      "state": "REPORTED",
+      "evidence_ids": ["019f7e95-0000-7000-8000-000000000102"]
+    }
+  ],
+  "decisions": [
+    {
+      "schema_version": "diagnostic-triage.decision/v1",
+      "decision_id": "019f7e95-0000-7000-8000-000000000106",
+      "finding_id": "019f7e95-0000-7000-8000-000000000105",
+      "action": "BLOCK",
+      "policy_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "matched_rule_id": "default.error.type"
+    }
+  ],
+  "evidence": [
+    {
+      "schema_version": "diagnostic-triage.evidence/v1",
+      "evidence_id": "019f7e95-0000-7000-8000-000000000102",
+      "source": "DIAGNOSTIC",
+      "media_type": "text/plain",
+      "retained_bytes": 4,
+      "observed_bytes": 4,
+      "limit_bytes": 1048576,
+      "truncated": false,
+      "sha256": "a70c83c40d7e2ef96c8ed8d033cf2cc0909a37b415020c316380ccb1d40520d8",
+      "content": "F821"
+    }
+  ],
+  "fix_candidates": [],
+  "executions": [
+    {
+      "schema_version": "diagnostic-triage.execution/v1",
+      "execution_id": "019f7e95-0000-7000-8000-000000000104",
+      "adapter_id": "ruff",
+      "adapter_kind": "PROVIDER",
+      "tool": { "name": "ruff", "version": "0.12.4" },
+      "toolchain_fingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "required": true,
+      "status": "COMPLETE",
+      "exit_code": 1,
+      "phases_ms": {
+        "queue": "NOT_APPLICABLE",
+        "setup": 0,
+        "run": 180,
+        "normalize": 4,
+        "total": 184
+      },
+      "performance": { "status": "WITHIN_BUDGET", "budget_ms": 60000 },
+      "cache": { "status": "NOT_APPLICABLE" },
+      "retry": { "status": "RECORDED", "attempt": 1, "same_revision": true },
+      "runner": { "status": "UNAVAILABLE" }
+    }
+  ]
+}

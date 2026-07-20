@@ -1,0 +1,41 @@
+{
+  "schema_version": "diagnostic-triage.session-report/v1",
+  "session_id": "019f7e95-0000-7000-8000-000000000401",
+  "engine": {
+    "version": "0.1.0",
+    "source_revision": "84563c93ee06e3a834a03ff53f21b62b6ab0cc89"
+  },
+  "contract_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "policy_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "verdict": "UNSUPPORTED",
+  "observations": [],
+  "findings": [],
+  "decisions": [],
+  "evidence": [],
+  "fix_candidates": [],
+  "executions": [
+    {
+      "schema_version": "diagnostic-triage.execution/v1",
+      "execution_id": "019f7e95-0000-7000-8000-000000000402",
+      "adapter_id": "ruff",
+      "adapter_kind": "PROVIDER",
+      "tool": { "name": "ruff", "version": "0.12.4" },
+      "toolchain_fingerprint": "UNAVAILABLE",
+      "required": true,
+      "status": "UNSUPPORTED",
+      "exit_code": null,
+      "message": "required capability fix.propose/v1 is unsupported",
+      "phases_ms": {
+        "queue": "NOT_APPLICABLE",
+        "setup": "NOT_APPLICABLE",
+        "run": "NOT_APPLICABLE",
+        "normalize": "NOT_APPLICABLE",
+        "total": "NOT_APPLICABLE"
+      },
+      "performance": { "status": "NOT_EVALUATED", "budget_ms": 60000 },
+      "cache": { "status": "NOT_APPLICABLE" },
+      "retry": { "status": "NOT_APPLICABLE" },
+      "runner": { "status": "UNAVAILABLE" }
+    }
+  ]
+}

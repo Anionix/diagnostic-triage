@@ -1,0 +1,441 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://anionix.dev/schemas/diagnostic-triage/v1/model.schema.json",
+  "title": "Diagnostic Triage Model V1",
+  "oneOf": [
+    { "$ref": "#/$defs/observation" },
+    { "$ref": "#/$defs/finding" },
+    { "$ref": "#/$defs/decision" },
+    { "$ref": "#/$defs/evidence" },
+    { "$ref": "#/$defs/fixCandidate" },
+    { "$ref": "#/$defs/execution" },
+    { "$ref": "#/$defs/sessionReport" }
+  ],
+  "$defs": {
+    "observation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "observation_id", "tool", "language", "severity",
+        "origin", "message", "evidence_ids"
+      ],
+      "properties": {
+        "schema_version": { "const": "diagnostic-triage.observation/v1" },
+        "observation_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "tool": { "$ref": "common.schema.json#/$defs/tool" },
+        "language": { "$ref": "common.schema.json#/$defs/language" },
+        "severity": { "$ref": "common.schema.json#/$defs/severity" },
+        "origin": { "$ref": "common.schema.json#/$defs/origin" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 8192 },
+        "location": { "$ref": "common.schema.json#/$defs/location" },
+        "symbol": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "expected": { "type": "string", "minLength": 1, "maxLength": 8192 },
+        "observed": { "type": "string", "minLength": 1, "maxLength": 8192 },
+        "evidence_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 64,
+          "items": { "$ref": "common.schema.json#/$defs/uuid" }
+        }
+      }
+    },
+    "finding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "finding_id", "fingerprint", "observation_ids",
+        "tool", "language", "severity", "classification", "message", "state",
+        "evidence_ids"
+      ],
+      "properties": {
+        "schema_version": { "const": "diagnostic-triage.finding/v1" },
+        "finding_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "fingerprint": {
+          "type": "string",
+          "pattern": "^dtfp1:[a-f0-9]{64}$"
+        },
+        "observation_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": { "$ref": "common.schema.json#/$defs/uuid" }
+        },
+        "tool": { "$ref": "common.schema.json#/$defs/tool" },
+        "language": { "$ref": "common.schema.json#/$defs/language" },
+        "severity": { "$ref": "common.schema.json#/$defs/severity" },
+        "classification": { "$ref": "taxonomy.schema.json" },
+        "message": { "type": "string", "minLength": 1, "maxLength": 8192 },
+        "location": { "$ref": "common.schema.json#/$defs/location" },
+        "symbol": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "expected": { "type": "string", "minLength": 1, "maxLength": 8192 },
+        "observed": { "type": "string", "minLength": 1, "maxLength": 8192 },
+        "state": {
+          "enum": [
+            "DISCOVERED", "NORMALIZED", "CLASSIFIED", "FIX_PROPOSED",
+            "VERIFIED", "REPORTED"
+          ]
+        },
+        "evidence_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 64,
+          "items": { "$ref": "common.schema.json#/$defs/uuid" }
+        },
+        "fix_candidate_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "verification_execution_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "common.schema.json#/$defs/uuid" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "state": { "enum": ["FIX_PROPOSED", "VERIFIED"] } },
+            "required": ["state"]
+          },
+          "then": { "required": ["fix_candidate_id"] }
+        },
+        {
+          "if": {
+            "properties": { "state": { "const": "VERIFIED" } },
+            "required": ["state"]
+          },
+          "then": { "required": ["verification_execution_ids"] }
+        }
+      ]
+    },
+    "decision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "decision_id", "finding_id", "action",
+        "policy_digest", "matched_rule_id"
+      ],
+      "properties": {
+        "schema_version": { "const": "diagnostic-triage.decision/v1" },
+        "decision_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "finding_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "action": { "enum": ["OBSERVE", "WARN", "BLOCK", "WAIVE"] },
+        "policy_digest": { "$ref": "common.schema.json#/$defs/sha256" },
+        "matched_rule_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "waiver": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "fingerprint", "waived_action", "reason", "owner", "expires_at"
+          ],
+          "properties": {
+            "fingerprint": {
+              "type": "string",
+              "pattern": "^dtfp1:[a-f0-9]{64}$"
+            },
+            "waived_action": { "enum": ["WARN", "BLOCK"] },
+            "reason": { "type": "string", "minLength": 1, "maxLength": 2048 },
+            "owner": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "expires_at": { "type": "string", "format": "date-time" }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "action": { "const": "WAIVE" } },
+            "required": ["action"]
+          },
+          "then": { "required": ["waiver"] },
+          "else": { "not": { "required": ["waiver"] } }
+        }
+      ]
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "evidence_id", "source", "media_type",
+        "retained_bytes", "observed_bytes", "limit_bytes", "truncated", "sha256"
+      ],
+      "properties": {
+        "schema_version": { "const": "diagnostic-triage.evidence/v1" },
+        "evidence_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "source": {
+          "enum": ["STDOUT", "STDERR", "DIAGNOSTIC", "PATCH", "ARTIFACT", "TRACEBACK"]
+        },
+        "media_type": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "retained_bytes": { "type": "integer", "minimum": 0, "maximum": 1048576 },
+        "observed_bytes": { "type": "integer", "minimum": 0 },
+        "limit_bytes": { "type": "integer", "minimum": 0, "maximum": 1048576 },
+        "truncated": { "type": "boolean" },
+        "sha256": { "$ref": "common.schema.json#/$defs/sha256" },
+        "relative_path": { "$ref": "common.schema.json#/$defs/relativePath" },
+        "content": { "type": "string", "maxLength": 1048576 }
+      },
+      "oneOf": [
+        { "required": ["relative_path"], "not": { "required": ["content"] } },
+        { "required": ["content"], "not": { "required": ["relative_path"] } }
+      ]
+    },
+    "fixCandidate": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "fix_candidate_id", "observation_ids",
+        "applicability", "tool_native", "patch_evidence_id"
+      ],
+      "properties": {
+        "schema_version": { "const": "diagnostic-triage.fix-candidate/v1" },
+        "fix_candidate_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "observation_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": { "$ref": "common.schema.json#/$defs/uuid" }
+        },
+        "applicability": { "enum": ["SAFE", "UNSAFE", "MANUAL"] },
+        "tool_native": { "type": "boolean" },
+        "patch_evidence_id": { "$ref": "common.schema.json#/$defs/uuid" }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "applicability": { "const": "SAFE" } },
+            "required": ["applicability"]
+          },
+          "then": { "properties": { "tool_native": { "const": true } } }
+        },
+        {
+          "if": {
+            "properties": { "tool_native": { "const": false } },
+            "required": ["tool_native"]
+          },
+          "then": { "properties": { "applicability": { "const": "MANUAL" } } }
+        }
+      ]
+    },
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "execution_id", "adapter_id", "adapter_kind",
+        "tool", "toolchain_fingerprint", "required", "status", "exit_code",
+        "phases_ms", "performance", "cache", "retry", "runner"
+      ],
+      "properties": {
+        "schema_version": { "const": "diagnostic-triage.execution/v1" },
+        "execution_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "adapter_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "adapter_kind": { "enum": ["ENGINE", "PROVIDER", "OBSERVER"] },
+        "tool": { "$ref": "common.schema.json#/$defs/tool" },
+        "toolchain_fingerprint": {
+          "oneOf": [
+            { "$ref": "common.schema.json#/$defs/sha256" },
+            { "const": "UNAVAILABLE" }
+          ]
+        },
+        "required": { "type": "boolean" },
+        "status": { "enum": ["COMPLETE", "INCOMPLETE", "UNSUPPORTED"] },
+        "exit_code": { "type": ["integer", "null"], "minimum": 0, "maximum": 255 },
+        "message": { "type": "string", "minLength": 1, "maxLength": 8192 },
+        "phases_ms": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["queue", "setup", "run", "normalize", "total"],
+          "properties": {
+            "queue": { "$ref": "#/$defs/phaseDuration" },
+            "setup": { "$ref": "#/$defs/phaseDuration" },
+            "run": { "$ref": "#/$defs/phaseDuration" },
+            "normalize": { "$ref": "#/$defs/phaseDuration" },
+            "total": { "$ref": "#/$defs/phaseDuration" }
+          }
+        },
+        "performance": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status", "budget_ms"],
+          "properties": {
+            "status": {
+              "enum": ["NOT_EVALUATED", "WITHIN_BUDGET", "IMPROVEMENT_CANDIDATE"]
+            },
+            "budget_ms": { "type": "integer", "minimum": 1, "maximum": 600000 }
+          }
+        },
+        "cache": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": {
+            "status": { "enum": ["HIT", "MISS", "NOT_APPLICABLE", "UNAVAILABLE"] },
+            "restore_ms": { "$ref": "common.schema.json#/$defs/durationMs" },
+            "save_ms": { "$ref": "common.schema.json#/$defs/durationMs" }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": { "status": { "enum": ["HIT", "MISS"] } },
+                "required": ["status"]
+              },
+              "then": { "required": ["restore_ms"] },
+              "else": {
+                "not": {
+                  "anyOf": [
+                    { "required": ["restore_ms"] },
+                    { "required": ["save_ms"] }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "retry": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": {
+            "status": {
+              "enum": ["RECORDED", "NOT_APPLICABLE", "UNAVAILABLE"]
+            },
+            "attempt": { "type": "integer", "minimum": 1, "maximum": 100 },
+            "same_revision": { "type": "boolean" },
+            "group_id": { "$ref": "common.schema.json#/$defs/uuid" }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": { "status": { "const": "RECORDED" } },
+                "required": ["status"]
+              },
+              "then": { "required": ["attempt", "same_revision"] },
+              "else": {
+                "not": {
+                  "anyOf": [
+                    { "required": ["attempt"] },
+                    { "required": ["same_revision"] },
+                    { "required": ["group_id"] }
+                  ]
+                }
+              }
+            }
+          ]
+        },
+        "runner": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["status"],
+          "properties": {
+            "status": { "enum": ["RECORDED", "UNAVAILABLE"] },
+            "os": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "arch": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "image": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "fingerprint": { "$ref": "common.schema.json#/$defs/sha256" }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": { "status": { "const": "RECORDED" } },
+                "required": ["status"]
+              },
+              "then": { "required": ["os", "arch", "fingerprint"] },
+              "else": {
+                "not": {
+                  "anyOf": [
+                    { "required": ["os"] },
+                    { "required": ["arch"] },
+                    { "required": ["image"] },
+                    { "required": ["fingerprint"] }
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "status": { "enum": ["INCOMPLETE", "UNSUPPORTED"] } },
+            "required": ["status"]
+          },
+          "then": {
+            "required": ["message"],
+            "properties": { "exit_code": { "type": "null" } }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": { "const": "COMPLETE" },
+              "adapter_kind": { "enum": ["ENGINE", "PROVIDER"] }
+            },
+            "required": ["status", "adapter_kind"]
+          },
+          "then": { "properties": { "exit_code": { "type": "integer" } } }
+        }
+      ]
+    },
+    "phaseDuration": {
+      "oneOf": [
+        { "$ref": "common.schema.json#/$defs/durationMs" },
+        { "enum": ["NOT_APPLICABLE", "UNAVAILABLE"] }
+      ]
+    },
+    "sessionReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version", "session_id", "engine", "contract_sha256",
+        "policy_digest", "verdict", "observations", "findings", "decisions",
+        "evidence", "fix_candidates", "executions"
+      ],
+      "properties": {
+        "schema_version": { "const": "diagnostic-triage.session-report/v1" },
+        "session_id": { "$ref": "common.schema.json#/$defs/uuid" },
+        "engine": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["version", "source_revision"],
+          "properties": {
+            "version": { "type": "string", "minLength": 1, "maxLength": 64 },
+            "source_revision": { "$ref": "common.schema.json#/$defs/sourceRevision" }
+          }
+        },
+        "contract_sha256": { "$ref": "common.schema.json#/$defs/sha256" },
+        "policy_digest": { "$ref": "common.schema.json#/$defs/sha256" },
+        "verdict": { "enum": ["PASS", "POLICY_FAIL", "INCOMPLETE", "UNSUPPORTED"] },
+        "observations": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": { "$ref": "#/$defs/observation" }
+        },
+        "findings": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": { "$ref": "#/$defs/finding" }
+        },
+        "decisions": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": { "$ref": "#/$defs/decision" }
+        },
+        "evidence": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": { "$ref": "#/$defs/evidence" }
+        },
+        "fix_candidates": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": { "$ref": "#/$defs/fixCandidate" }
+        },
+        "executions": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": { "$ref": "#/$defs/execution" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://anionix.dev/schemas/diagnostic-triage/v1/taxonomy.schema.json",
+  "title": "Diagnostic Triage Classification V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["category", "micro_category"],
+  "properties": {
+    "category": {
+      "enum": [
+        "syntax", "type", "correctness", "runtime", "build", "test",
+        "resource", "concurrency", "security", "environment", "tooling",
+        "style", "robustness"
+      ]
+    },
+    "micro_category": { "type": "string" }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "category": { "const": "syntax" },
+        "micro_category": { "enum": ["parse-error", "invalid-token", "invalid-structure", "unknown"] }
+      }
+    },
+    {
+      "properties": {
+        "category": { "const": "type" },
+        "micro_category": { "enum": ["incompatible-type", "missing-type", "nullability", "unresolved-symbol", "invalid-call", "contract-mismatch", "unknown"] }
+      }
+    },
+    {
+      "properties": {
+        "category": { "const": "correctness" },
+        "micro_category": { "enum": ["assertion", "invariant", "wrong-result", "data-loss", "state-transition", "nondeterminism", "unknown"] }
+      }
+    },
+    {
+      "properties": {
+        "category": { "const": "runtime" },
+        "micro_category": { "enum": ["exception", "panic", "abort", "signal", "import-failure", "initialization", "unknown"] }
+      }
+    },
+    {
+      "properties": {
+        "category": { "const": "build" },
+        "micro_category": { "enum": ["compile", "link", "dependency-resolution", "code-generation", "configuration", "unknown"] }
+      }
+    },
+    {
+      "properties": {
+        "category": { "const": "test" },
+        "micro_category": { "enum": ["collection", "setup", "assertion", "teardown", "flaky", "coverage-gate", "unknown"] }
+      }
+    },
+    {
+      "properties": {
+        "category": { "const": "resource" },
+        "micro_category": { "enum": ["timeout", "memory-limit", "disk-limit", "output-limit", "file-descriptor-limit", "unknown"] }
+      }
+    },
+    {
+      "properties": {
+        "category": { "const": "concurrency" },
+        "micro_category": { "enum": ["race", "deadlock", "livelock", "ordering", "atomicity", "unknown"] }
+      }
+    },
+    {
+      "properties": {
+        "category": { "const": "security" },
+        "micro_category": { "enum": ["input-validation", "path-escape", "injection", "unsafe-deserialization", "permission", "secret-exposure", "unknown"] }
+      }
+    },
+    {
+      "properties": {
+        "category": { "const": "environment" },
+        "micro_category": { "enum": ["tool-missing", "version-mismatch", "platform", "locale", "timezone", "network", "filesystem", "unknown"] }
+      }
+    },
+    {
+      "properties": {
+        "category": { "const": "tooling" },
+        "micro_category": { "enum": ["protocol", "malformed-output", "provider-crash", "unsupported-version", "configuration", "unknown"] }
+      }
+    },
+    {
+      "properties": {
+        "category": { "const": "style" },
+        "micro_category": { "enum": ["format", "lint", "documentation", "complexity", "deprecation", "unknown"] }
+      }
+    },
+    {
+      "properties": {
+        "category": { "const": "robustness" },
+        "micro_category": { "enum": ["boundary-input", "malformed-input", "crash-resistance", "roundtrip-mismatch", "fuzz-finding", "unknown"] }
+      }
+    }
+  ]
+}

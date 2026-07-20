@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://anionix.dev/schemas/diagnostic-triage/v1/common.schema.json",
+  "title": "Diagnostic Triage Common Types V1",
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "sourceRevision": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40,64}$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?:\\.|(?!/)(?![A-Za-z]:)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*(?:^|/)\\.(?:/|$))(?!.*//)(?!.*\/$)[^\\\\\\u0000]+)$"
+    },
+    "language": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9+.#-]{0,63}$"
+    },
+    "severity": {
+      "enum": ["ERROR", "WARNING", "INFO"]
+    },
+    "origin": {
+      "enum": ["NORMAL", "BOUNDARY", "MALFORMED", "FUZZ", "GENERATED", "UNKNOWN"]
+    },
+    "position": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["line", "column"],
+      "properties": {
+        "line": { "type": "integer", "minimum": 1 },
+        "column": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "location": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "start"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "start": { "$ref": "#/$defs/position" },
+        "end": { "$ref": "#/$defs/position" }
+      }
+    },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "version": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "rule_id": { "type": "string", "minLength": 1, "maxLength": 128 }
+      }
+    },
+    "durationMs": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 600000
+    },
+    "eventSequence": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10000
+    },
+    "capability": {
+      "type": "string",
+      "minLength": 4,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9.-]*/v[1-9][0-9]*$"
+    }
+  }
+}
