@@ -1,0 +1,48 @@
+[workspace]
+members = [
+  "crates/diagnostic-triage",
+  "crates/diagnostic-triage-contracts",
+  "crates/diagnostic-triage-engine",
+  "crates/diagnostic-triage-observer-github-actions",
+  "crates/diagnostic-triage-provider-biome",
+  "crates/diagnostic-triage-provider-python",
+  "crates/diagnostic-triage-provider-rust",
+  "crates/diagnostic-triage-runtime",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Anionix/diagnostic-triage"
+
+[workspace.dependencies]
+camino = { version = "=1.2.2", features = ["serde1"] }
+clap = { version = "=4.6.1", features = ["derive"] }
+csv = "=1.3.1"
+diagnostic-triage-contracts = { path = "crates/diagnostic-triage-contracts" }
+diagnostic-triage-engine = { path = "crates/diagnostic-triage-engine" }
+diagnostic-triage-runtime = { path = "crates/diagnostic-triage-runtime" }
+indexmap = { version = "=2.14.0", features = ["serde"] }
+schemars = { version = "=1.2.1", features = ["indexmap2", "uuid1"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+sha2 = "=0.10.9"
+similar = "=2.7.0"
+tempfile = "=3.27.0"
+thiserror = "=2.0.18"
+time = { version = "=0.3.45", features = ["parsing"] }
+toml = "=0.8.23"
+tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
+uuid = { version = "=1.24.0", features = ["serde", "v7"] }
+wait-timeout = "=0.2.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
