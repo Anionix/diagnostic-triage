@@ -1082,6 +1082,7 @@ impl Finding {
                 ));
             }
         });
+        // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
         self.state = FindingState::Reported;
         self.validate()?;
         Ok(self)
@@ -1505,6 +1506,20 @@ mod tests {
         Evidence, EvidenceSchemaVersion, PhaseDuration, SessionReport, Sha256Digest,
         ToolchainFingerprint, Unavailable, VerificationAttribution, is_valid_rfc3339_datetime,
     };
+
+    #[test]
+    fn reported_transition_keeps_adjacent_lifecycle_contract() {
+        let transition = concat!(
+            "// LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> ",
+            "FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: ",
+            "INCOMPLETE | UNSUPPORTED.\n",
+            "        self.state = FindingState::Reported;"
+        );
+        assert!(
+            include_str!("model.rs").contains(transition),
+            "Finding::into_reported must keep the lifecycle contract adjacent to the transition"
+        );
+    }
 
     #[test]
     fn schema_version_is_exact_and_optional_null_is_rejected() {
