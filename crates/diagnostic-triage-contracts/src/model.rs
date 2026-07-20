@@ -366,6 +366,7 @@ pub struct Decision {
     pub decision_id: ObjectId,
     pub finding_id: ObjectId,
     pub action: DecisionAction,
+    pub evaluated_at: String,
     pub policy_digest: Sha256Digest,
     pub matched_rule_id: String,
     #[serde(
@@ -1107,8 +1108,28 @@ impl Waiver {
 impl Decision {
     pub fn validate(&self) -> Result<(), ContractError> {
         check_string(&self.matched_rule_id, "matched_rule_id", 128, true)?;
+        if !is_valid_rfc3339_datetime(&self.evaluated_at) {
+            return Err(model_error(
+                "decision.evaluated_at must be an RFC 3339 date-time",
+            ));
+        }
         match (&self.action, &self.waiver) {
-            (DecisionAction::Waive, Some(waiver)) => waiver.validate(),
+            (DecisionAction::Waive, Some(waiver)) => {
+                waiver.validate()?;
+                let evaluated_at = self.evaluated_at.parse::<jiff::Timestamp>().map_err(|_| {
+                    model_error("decision.evaluated_at must be an RFC 3339 date-time")
+                })?;
+                let expires_at = waiver
+                    .expires_at
+                    .parse::<jiff::Timestamp>()
+                    .map_err(|_| model_error("waiver.expires_at must be an RFC 3339 date-time"))?;
+                if expires_at <= evaluated_at {
+                    return Err(model_error(
+                        "WAIVE decisions require expiry strictly after evaluation",
+                    ));
+                }
+                Ok(())
+            }
             (DecisionAction::Waive, None) => Err(model_error("WAIVE decisions require waiver")),
             (_, Some(_)) => Err(model_error("only WAIVE decisions may contain waiver")),
             (_, None) => Ok(()),

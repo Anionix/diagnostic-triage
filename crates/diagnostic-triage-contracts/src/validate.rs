@@ -577,6 +577,7 @@ fn validate_report_decisions(
     index: &ReportIndex<'_>,
 ) -> Result<(), ContractError> {
     let mut decided_findings = HashSet::new();
+    let mut evaluation_instant = None;
     for decision in index.decisions.values() {
         let Some(finding) = index.findings.get(&decision.finding_id) else {
             return Err(model_error("decision references unknown finding"));
@@ -587,6 +588,19 @@ fn validate_report_decisions(
         if decision.policy_digest != report.policy_digest {
             return Err(model_error("decision policy digest differs from report"));
         }
+        let decision_instant = decision
+            .evaluated_at
+            .parse::<jiff::Timestamp>()
+            .map_err(|_| model_error("decision evaluation time is invalid"))?;
+        if evaluation_instant
+            .as_ref()
+            .is_some_and(|expected| expected != &decision_instant)
+        {
+            return Err(model_error(
+                "report decisions use different policy evaluation instants",
+            ));
+        }
+        evaluation_instant = Some(decision_instant);
         if decision
             .waiver
             .as_ref()

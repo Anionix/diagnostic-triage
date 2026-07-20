@@ -115,6 +115,80 @@ class SessionError(ContractError):
     pass
 
 
+_RFC3339_TIMESTAMP = re.compile(
+    r"(?P<year>[0-9]{4})-(?P<month>[0-9]{2})-(?P<day>[0-9]{2})"
+    r"[Tt](?P<hour>[0-9]{2}):(?P<minute>[0-9]{2}):(?P<second>[0-9]{2})"
+    r"(?:\.(?P<fraction>[0-9]{1,9}))?"
+    r"(?P<zone>[Zz]|(?P<sign>[+-])(?P<offset_hour>[0-9]{2})"
+    r":(?P<offset_minute>[0-9]{2}))"
+)
+
+
+def parse_rfc3339_instant(value: str) -> int:
+    """Return a v1 RFC 3339 timestamp as nanoseconds from year 0000-01-01."""
+    match = _RFC3339_TIMESTAMP.fullmatch(value)
+    if match is None:
+        raise ContractError("decision timestamp must be an RFC 3339 date-time")
+
+    parts = {
+        name: int(match.group(name))
+        for name in ("year", "month", "day", "hour", "minute", "second")
+    }
+    year = parts["year"]
+    month = parts["month"]
+    day = parts["day"]
+    if year > 9998 or not 1 <= month <= 12 or not 0 <= parts["second"] <= 59:
+        raise ContractError("decision timestamp must be an RFC 3339 date-time")
+    if not 0 <= parts["hour"] <= 23 or not 0 <= parts["minute"] <= 59:
+        raise ContractError("decision timestamp must be an RFC 3339 date-time")
+
+    leap_year = year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+    month_lengths = (
+        31,
+        29 if leap_year else 28,
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    )
+    if not 1 <= day <= month_lengths[month - 1]:
+        raise ContractError("decision timestamp must be an RFC 3339 date-time")
+
+    completed_years = 0 if year == 0 else year - 1
+    leap_years = sum(
+        completed_years // period + 1 if year else 0 for period in (4, 400)
+    )
+    leap_years -= 0 if year == 0 else completed_years // 100 + 1
+    days_before_year = 365 * year + leap_years
+    days_before_month = sum(month_lengths[: month - 1])
+    local_seconds = (
+        (days_before_year + days_before_month + day - 1) * 86_400
+        + parts["hour"] * 3_600
+        + parts["minute"] * 60
+        + parts["second"]
+    )
+    fraction = match.group("fraction") or ""
+    nanoseconds = int(fraction.ljust(9, "0") or "0")
+
+    zone = match.group("zone")
+    offset_seconds = 0
+    if zone not in "Zz":
+        offset_hour = int(match.group("offset_hour"))
+        offset_minute = int(match.group("offset_minute"))
+        if offset_hour > 23 or offset_minute > 59:
+            raise ContractError("decision timestamp must be an RFC 3339 date-time")
+        offset_seconds = (offset_hour * 60 + offset_minute) * 60
+        if match.group("sign") == "-":
+            offset_seconds = -offset_seconds
+    return (local_seconds - offset_seconds) * 1_000_000_000 + nanoseconds
+
+
 def load_session(path: Path) -> list[dict[str, Any]]:
     lines = path.read_text(encoding="utf-8").splitlines()
     if not lines or any(not line for line in lines):
@@ -384,6 +458,7 @@ def validate_report(report: dict[str, Any], contracts: ContractSchemas) -> None:
                     )
 
     decision_findings: list[str] = []
+    evaluation_instant: int | None = None
     for decision in indexed["decisions"].values():
         finding_id = decision["finding_id"]
         if finding_id not in finding_ids:
@@ -391,10 +466,21 @@ def validate_report(report: dict[str, Any], contracts: ContractSchemas) -> None:
         decision_findings.append(finding_id)
         if decision["policy_digest"] != report["policy_digest"]:
             raise ContractError("decision policy digest differs from report")
+        decision_instant = parse_rfc3339_instant(decision["evaluated_at"])
+        if evaluation_instant is not None and decision_instant != evaluation_instant:
+            raise ContractError(
+                "report decisions use different policy evaluation instants"
+            )
+        evaluation_instant = decision_instant
         if "waiver" in decision:
             expected = finding_by_id[finding_id]["fingerprint"]
             if decision["waiver"]["fingerprint"] != expected:
                 raise ContractError("waiver fingerprint differs from finding")
+            expires_at = parse_rfc3339_instant(decision["waiver"]["expires_at"])
+            if expires_at <= decision_instant:
+                raise ContractError(
+                    "WAIVE decisions require expiry strictly after evaluation"
+                )
     if len(decision_findings) != len(set(decision_findings)):
         raise ContractError("finding has multiple policy decisions")
     if set(decision_findings) != finding_ids:
@@ -1341,6 +1427,81 @@ class ContractTest(unittest.TestCase):
         )
         self.assertTrue(errors)
 
+    def test_decision_evaluation_time_is_required_and_report_wide(self) -> None:
+        report = load_json(FIXTURE_DIR / "valid-report.json")
+        validate_report(report, self.contracts)
+
+        missing = copy.deepcopy(report)
+        del missing["decisions"][0]["evaluated_at"]
+        with self.assertRaises(ContractError):
+            validate_report(missing, self.contracts)
+
+        for invalid_timestamp in (
+            "not-a-date",
+            "2026-07-21T00:00:00+24:00",
+            "2026-02-29T00:00:00Z",
+            "2026-07-21T00:00:00.1234567890Z",
+        ):
+            invalid = copy.deepcopy(report)
+            invalid["decisions"][0]["evaluated_at"] = invalid_timestamp
+            with self.subTest(invalid_timestamp=invalid_timestamp), self.assertRaises(
+                ContractError
+            ):
+                validate_report(invalid, self.contracts)
+
+        mixed = copy.deepcopy(report)
+        second_finding = copy.deepcopy(mixed["findings"][0])
+        second_finding["finding_id"] = "019f7e95-0000-7000-8000-000000000107"
+        second_finding["fingerprint"] = "dtfp1:" + "d" * 64
+        second_finding["message"] = "A second finding evaluated in the same report"
+        mixed["findings"].append(second_finding)
+        second_decision = copy.deepcopy(mixed["decisions"][0])
+        second_decision["decision_id"] = "019f7e95-0000-7000-8000-000000000108"
+        second_decision["finding_id"] = second_finding["finding_id"]
+        second_decision["evaluated_at"] = "2026-07-21T01:00:00+01:00"
+        mixed["decisions"].append(second_decision)
+
+        validate_report(mixed, self.contracts)
+
+        mixed["decisions"][1]["evaluated_at"] = "2026-07-21T00:00:01Z"
+        with self.assertRaises(ContractError):
+            validate_report(mixed, self.contracts)
+
+    def test_waive_expiry_uses_strict_parsed_instant_ordering(self) -> None:
+        report = load_json(FIXTURE_DIR / "valid-report.json")
+        decision = report["decisions"][0]
+        decision["action"] = "WAIVE"
+        decision["evaluated_at"] = "2026-07-21T00:00:00Z"
+        decision["waiver"] = {
+            "fingerprint": report["findings"][0]["fingerprint"],
+            "waived_action": "BLOCK",
+            "reason": "accepted until the upstream fix lands",
+            "owner": "maintainers",
+            "expires_at": "2026-08-20T00:00:00Z",
+        }
+
+        accepted_expiries = (
+            "2026-07-20T23:30:00-01:00",
+            "2026-07-21T00:00:00.000000001Z",
+        )
+        for expiry in accepted_expiries:
+            candidate = copy.deepcopy(report)
+            candidate["decisions"][0]["waiver"]["expires_at"] = expiry
+            with self.subTest(accepted_expiry=expiry):
+                validate_report(candidate, self.contracts)
+
+        rejected_expiries = (
+            "2026-07-21T00:00:00Z",
+            "2026-07-20T23:59:59.999999999Z",
+            "2026-07-21T01:00:00+01:00",
+            "2026-07-21T00:30:00+01:00",
+        )
+        for expiry in rejected_expiries:
+            candidate = copy.deepcopy(report)
+            candidate["decisions"][0]["waiver"]["expires_at"] = expiry
+            with self.subTest(rejected_expiry=expiry), self.assertRaises(ContractError):
+                validate_report(candidate, self.contracts)
+
     def test_waiver_is_bound_to_a_fingerprint(self) -> None:
         report = load_json(FIXTURE_DIR / "valid-report.json")
         decision = copy.deepcopy(report["decisions"][0])
@@ -1385,6 +1546,17 @@ class ContractTest(unittest.TestCase):
             candidate = copy.deepcopy(report)
             candidate["decisions"][0]["waiver"]["expires_at"] = valid_expiry
             with self.subTest(valid_expiry=valid_expiry):
+                self.contracts.validator("model.schema.json").validate(candidate)
+
+        for valid_expiry in (
+            "2026-08-20T00:00:00Z",
+            "2026-08-20T00:00:00+23:59",
+            "2026-08-20T00:00:00-23:59",
+            "2026-08-20T00:00:00.123456789Z",
+        ):
+            candidate = copy.deepcopy(report)
+            candidate["decisions"][0]["waiver"]["expires_at"] = valid_expiry
+            with self.subTest(semantic_valid_expiry=valid_expiry):
                 validate_report(candidate, self.contracts)
 
         validator = self.contracts.validator("model.schema.json")

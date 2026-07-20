@@ -58,12 +58,22 @@ schema alone is therefore necessary but not a valid Diagnostic Triage session.
 
 ### Timestamp profile
 
-Waiver timestamps use a deterministic RFC 3339 subset: calendar-valid years
-0000 through 9998, seconds 00 through 59, optional fractional seconds of one
-through nine digits, and either Z/z or a numeric offset whose hour is 00
-through 23 and minute is 00 through 59. Year 9999, leap seconds, and precision
-finer than one nanosecond are unsupported in v1 so every accepted value maps
-losslessly to the Engine timestamp used for expiry comparisons.
+Waiver and policy-evaluation timestamps use a deterministic RFC 3339 subset:
+calendar-valid years 0000 through 9998, seconds 00 through 59, optional
+fractional seconds of one through nine digits, and either Z/z or a numeric
+offset whose hour is 00 through 23 and minute is 00 through 59. Year 9999,
+leap seconds, and precision finer than one nanosecond are unsupported in v1 so
+every accepted value maps losslessly to the Engine timestamp used for expiry
+comparisons. Every Decision records `evaluated_at` in this strict v1 RFC 3339
+profile. All Decisions in one SessionReport represent the same parsed
+evaluation instant; Engine producers reuse one `evaluated_at` wire value for
+the entire report. Expiry comparison is by parsed instant, not by textual
+ordering or offset spelling, and an active waiver expires strictly after
+`evaluated_at`.
+
+A report without Findings has no Decisions and therefore no policy-evaluation
+instant. Its `PASS`, `INCOMPLETE`, or `UNSUPPORTED` verdict is determined from
+the required Execution results; no placeholder Decision is emitted.
 
 The schema pattern enforces both the lexical profile and Gregorian month,
 day, and leap-year bounds without lookaround extensions. The Draft 2020-12
