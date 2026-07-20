@@ -9,6 +9,7 @@ pub mod finding;
 pub mod fingerprint;
 mod identity;
 pub mod normalize;
+pub mod policy;
 
 pub use error::{EngineError, EngineInputError};
 pub use identity::deterministic_object_id;

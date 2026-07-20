@@ -112,6 +112,40 @@ A report without Findings has no Decisions and therefore no policy-evaluation
 instant. Its `PASS`, `INCOMPLETE`, or `UNSUPPORTED` verdict is determined from
 the required Execution results; no placeholder Decision is emitted.
 
+### Policy evaluation
+
+Policy accepts valid Findings whose effective lifecycle is `CLASSIFIED`,
+`FIX_PROPOSED`, or `VERIFIED`; a `REPORTED` Finding uses its mandatory
+`pre_report_state`. Rules may match severity, taxonomy, fingerprint, language,
+tool name, opaque case-sensitive tool version, and native rule ID. The highest
+matching action wins under `OBSERVE < WARN < BLOCK`, with the lexicographically
+smallest rule ID breaking equal-action ties. A configured rule cannot weaken
+the default block for ERROR Findings in `syntax`, `type`, `correctness`,
+`build`, or `test`.
+
+One v1 policy snapshot contains at most 4,096 rules and 10,000 waivers. Bounds
+are checked before Finding validation and before cloning, sorting, or hashing
+the snapshot. For bounded input, Finding integrity precedes detailed policy
+validation. Rule validation, waiver selection, policy digesting, and Decision
+materialization form one atomic Engine boundary: exposing only a subset would
+permit a Decision whose attribution is not bound to the exact validated policy
+result.
+
+Default Decisions use `default.observe` or the category-specific IDs
+`default.error.syntax`, `default.error.type`, `default.error.correctness`,
+`default.error.build`, and `default.error.test`; consumer rules cannot reserve
+these IDs. Waivers match one exact fingerprint and one exact WARN or BLOCK
+action. They require canonical nonblank reason and owner text and an expiry
+strictly after the evaluation instant. Exact duplicate waivers are invalid.
+If several active waivers match, the earliest expiry wins, followed by reason,
+owner, and expiry wire text; input order never selects the winner.
+
+The policy digest is versioned and independent of rule and waiver order.
+Decision identity binds the Finding ID, policy digest, matched rule, action,
+exact `evaluated_at` wire value, and optional waiver. Equivalent timestamp
+spellings compare as the same instant for expiry but remain distinct Decision
+identities.
+
 The schema pattern enforces both the lexical profile and Gregorian month,
 day, and leap-year bounds without lookaround extensions. The Draft 2020-12
 date-time format remains a semantic annotation and optional second assertion;
