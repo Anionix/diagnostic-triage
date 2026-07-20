@@ -78,10 +78,10 @@ validated_string!(
     "expected 64 lowercase hexadecimal characters"
 );
 validated_string!(
-    /// Lowercase source revision with 40 through 64 hexadecimal characters.
+    /// Full lowercase SHA-1 or SHA-256 Git object identifier.
     SourceRevision,
     valid_source_revision,
-    "expected 40 through 64 lowercase hexadecimal characters"
+    "expected exactly 40 or 64 lowercase hexadecimal characters"
 );
 validated_string!(
     /// Versioned stable Finding fingerprint.
@@ -191,7 +191,7 @@ fn valid_sha256(value: &str) -> bool {
 }
 
 fn valid_source_revision(value: &str) -> bool {
-    (40..=64).contains(&value.len()) && lowercase_hex(value)
+    matches!(value.len(), 40 | 64) && lowercase_hex(value)
 }
 
 fn valid_fingerprint(value: &str) -> bool {
@@ -257,7 +257,7 @@ fn valid_repo_path(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdapterId, Capability, ObjectId, RepoPath};
+    use super::{AdapterId, Capability, ObjectId, RepoPath, SourceRevision};
 
     #[test]
     fn rejects_noncanonical_paths() {
@@ -295,6 +295,16 @@ mod tests {
         assert!("diagnostic.check/v1".parse::<Capability>().is_ok());
         assert!("diagnostic.check/v2".parse::<Capability>().is_ok());
         assert!("diagnostic.check/v0".parse::<Capability>().is_err());
+    }
+
+    #[test]
+    fn source_revision_accepts_only_full_git_object_ids() {
+        for length in [40, 64] {
+            assert!("a".repeat(length).parse::<SourceRevision>().is_ok());
+        }
+        for length in [39, 41, 63, 65] {
+            assert!("a".repeat(length).parse::<SourceRevision>().is_err());
+        }
     }
 
     #[test]

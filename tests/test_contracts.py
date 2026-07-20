@@ -348,11 +348,25 @@ def verified_report_with_attribution() -> dict[str, Any]:
 
 # LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED ->
 # VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
-def validate_report(report: dict[str, Any], contracts: ContractSchemas) -> None:
+def validate_report(
+    report: dict[str, Any],
+    contracts: ContractSchemas,
+    expected_source_revision: str | None = None,
+) -> None:
     try:
         contracts.validator("model.schema.json").validate(report)
     except ValidationError as error:
         raise ContractError(error.message) from error
+    expected_contract_digest = hashlib.sha256(
+        report["engine"]["source_revision"].encode("ascii")
+    ).hexdigest()
+    if report["contract_sha256"] != expected_contract_digest:
+        raise ContractError("contract digest differs from engine source revision")
+    if (
+        expected_source_revision is not None
+        and report["engine"]["source_revision"] != expected_source_revision
+    ):
+        raise ContractError("engine source revision differs from consumer pin")
     groups = {
         "observations": "observation_id",
         "findings": "finding_id",
@@ -1284,6 +1298,10 @@ class ContractTest(unittest.TestCase):
         corrupt_evidence["evidence"][0]["sha256"] = "f" * 64
         candidates["evidence digest"] = corrupt_evidence
 
+        wrong_contract_digest = copy.deepcopy(report)
+        wrong_contract_digest["contract_sha256"] = "f" * 64
+        candidates["contract identity"] = wrong_contract_digest
+
         reversed_location = copy.deepcopy(report)
         reversed_location["findings"][0]["location"]["end"] = {
             "line": 6,
@@ -1407,6 +1425,16 @@ class ContractTest(unittest.TestCase):
                 self.assertTrue(list(validator.iter_errors(report)))
                 self.assertTrue(list(protocol_validator.iter_errors(manifest)))
 
+        for valid_length in (40, 64):
+            candidate = load_json(FIXTURE_DIR / "valid-report.json")
+            candidate["engine"]["source_revision"] = "a" * valid_length
+            validator.validate(candidate)
+        for invalid_length in (39, 41, 63, 65):
+            candidate = load_json(FIXTURE_DIR / "valid-report.json")
+            candidate["engine"]["source_revision"] = "a" * invalid_length
+            with self.subTest(source_revision_length=invalid_length):
+                self.assertTrue(list(validator.iter_errors(candidate)))
+
         for field in ("line", "column"):
             report = load_json(FIXTURE_DIR / "valid-report.json")
             position = report["observations"][0]["location"]["start"]
@@ -1426,6 +1454,21 @@ class ContractTest(unittest.TestCase):
             self.contracts.validator("model.schema.json").iter_errors(finding)
         )
         self.assertTrue(errors)
+
+    def test_report_can_be_bound_to_an_external_source_pin(self) -> None:
+        report = load_json(FIXTURE_DIR / "valid-report.json")
+        expected = report["engine"]["source_revision"]
+        validate_report(report, self.contracts, expected)
+
+        forged = copy.deepcopy(report)
+        forged_revision = "f" * 40
+        forged["engine"]["source_revision"] = forged_revision
+        forged["contract_sha256"] = hashlib.sha256(
+            forged_revision.encode("ascii")
+        ).hexdigest()
+        validate_report(forged, self.contracts)
+        with self.assertRaises(ContractError):
+            validate_report(forged, self.contracts, expected)
 
     def test_decision_evaluation_time_is_required_and_report_wide(self) -> None:
         report = load_json(FIXTURE_DIR / "valid-report.json")

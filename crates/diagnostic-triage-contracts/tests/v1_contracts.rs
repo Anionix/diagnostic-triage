@@ -3,11 +3,12 @@
 use std::{collections::HashSet, fs, path::PathBuf};
 
 use diagnostic_triage_contracts::{
-    COMMON_SCHEMA_V1, MODEL_SCHEMA_V1, PROTOCOL_SCHEMA_V1, TAXONOMY_SCHEMA_V1,
+    COMMON_SCHEMA_V1, MODEL_SCHEMA_V1, PROTOCOL_SCHEMA_V1, SourceRevision, TAXONOMY_SCHEMA_V1,
     model::{SessionReport, Taxonomy},
-    validate_report_json, validate_session_jsonl,
+    validate_report_for_revision, validate_report_json, validate_session_jsonl,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
 
@@ -128,6 +129,28 @@ fn accepts_every_valid_report_fixture() {
     for name in VALID_REPORTS {
         validate_report_json(&fixture(name)).unwrap_or_else(|error| panic!("{name}: {error}"));
     }
+}
+
+#[test]
+fn report_can_be_bound_to_an_external_source_pin() {
+    let mut value = report_fixture();
+    let expected = value["engine"]["source_revision"]
+        .as_str()
+        .expect("fixture source revision is a string")
+        .parse::<SourceRevision>()
+        .expect("fixture source revision is canonical");
+    let report = validate_report_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+    validate_report_for_revision(&report, &expected).expect("matching source pin is valid");
+
+    let forged_revision = "f".repeat(40);
+    value["engine"]["source_revision"] = json!(forged_revision);
+    value["contract_sha256"] = json!(format!("{:x}", Sha256::digest(forged_revision.as_bytes())));
+    let forged = validate_report_json(&serde_json::to_vec(&value).unwrap())
+        .expect("a self-consistent report identity is locally valid");
+    assert!(
+        validate_report_for_revision(&forged, &expected).is_err(),
+        "accepted a self-consistent identity that differs from the consumer pin"
+    );
 }
 
 #[test]
@@ -334,6 +357,10 @@ fn rejects_semantically_inconsistent_reports() {
     let mut corrupt_evidence = report_fixture();
     corrupt_evidence["evidence"][0]["sha256"] = json!("f".repeat(64));
     candidates.push(("evidence digest", corrupt_evidence));
+
+    let mut wrong_contract_digest = report_fixture();
+    wrong_contract_digest["contract_sha256"] = json!("f".repeat(64));
+    candidates.push(("contract identity", wrong_contract_digest));
 
     let mut reversed_location = report_fixture();
     reversed_location["findings"][0]["location"]["end"] = json!({"line": 6, "column": 1});
