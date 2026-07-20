@@ -13,8 +13,8 @@ pub use scalar::{
     AdapterId, Capability, Fingerprint, Language, ObjectId, RepoPath, Sha256Digest, SourceRevision,
 };
 pub use validate::{
-    ValidatedSession, validate_report, validate_report_for_revision, validate_report_json,
-    validate_session_jsonl,
+    MAX_REPORT_BYTES, ValidatedSession, derive_session_verdict, validate_report,
+    validate_report_for_revision, validate_report_json, validate_session_jsonl,
 };
 pub use wire::Nullable;
 
