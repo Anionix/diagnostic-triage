@@ -1,0 +1,57 @@
+{
+  "schema_version": "diagnostic-triage.provenance/v1",
+  "source_repository": "https://github.com/Anionix/data-format-lab",
+  "source_main_revision": "f582eb40732a492841fd816dda3bfa13663a96a2",
+  "source_changes": [
+    {
+      "revision": "01cb984b85e311344e2a4d487dcc30d883fb51ea",
+      "pull_request": 393,
+      "purpose": "initial diagnostic contracts"
+    },
+    {
+      "revision": "70ceca781c1a839c76f539dfcf1d5ffd27b7ec88",
+      "pull_request": 395,
+      "purpose": "reject malformed UUIDs"
+    },
+    {
+      "revision": "018f70731844c14dbc1b69881a392de7902b9c50",
+      "pull_request": 398,
+      "purpose": "pin the prototype schema validator"
+    }
+  ],
+  "committed_artifacts": [
+    {
+      "path": "docs/adr/0004-diagnostic-triage-contracts.md",
+      "source_revision": "f582eb40732a492841fd816dda3bfa13663a96a2",
+      "git_blob_oid": "1dd4b1f8aa31fd8dec1c20565d46365002bf7e92",
+      "sha256": "26b4981097f45a001c478537509f6b0fadaadb912017aa82ce2c04b7411fecd6"
+    },
+    {
+      "path": "docs/diagnostic-triage/taxonomy.md",
+      "source_revision": "f582eb40732a492841fd816dda3bfa13663a96a2",
+      "git_blob_oid": "b278f96f80d49822b20ab70de7e191fa1f64188e",
+      "sha256": "b5e7ec134aed6fd589db69d93960e06d9f2708520953cbdf0f0e3305da39192b"
+    },
+    {
+      "path": "schemas/diagnostic-triage/v1/finding.schema.json",
+      "source_revision": "f582eb40732a492841fd816dda3bfa13663a96a2",
+      "git_blob_oid": "9bd507074e96b426c12a1ef84f275f3049714753",
+      "sha256": "09f42be98a55abd7b165bdd30e6671b08abcf7bc5579ca8ba5dff5930d50d4ca"
+    },
+    {
+      "path": "tests/test_diagnostic_triage_contracts.py",
+      "source_revision": "f582eb40732a492841fd816dda3bfa13663a96a2",
+      "git_blob_oid": "08e2ece8d8fffe44fbb6f648a045105dbe14bcfa",
+      "sha256": "aaf039ec79fc6fe0227e97ac18dbf0067c3712f0b2b0a8565b7bd0799d130b89"
+    }
+  ],
+  "uncommitted_candidate": {
+    "stash_commit": "702e05159d4ae537c982cd99fcc3327888a1cbaa",
+    "source_parent": "4ec126ea5aadd96deda60b52ca20834f9c577b84",
+    "untracked_tree": "f7a69179b090b8bd27b2d7ace7ef02597e2b2c69",
+    "protocol_schema_sha256": "5edb306bfd70429fc0bb011d956a13b06951dd175924f531e96720c3fa19f848",
+    "status": "review input only; never canonical"
+  },
+  "license": "Apache-2.0",
+  "migration": "The standalone v1 separates Observation, Finding, Decision, and Execution and does not preserve prototype wire compatibility."
+}

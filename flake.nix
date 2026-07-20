@@ -32,6 +32,10 @@
         system:
         let
           pkgs = pkgsFor system;
+          python = pkgs.python3.withPackages (pythonPackages: [
+            pythonPackages.jsonschema
+            pythonPackages.pytest
+          ]);
           rust = pkgs.rust-bin.stable."1.85.1".default.override {
             extensions = [
               "clippy"
@@ -45,6 +49,10 @@
               rust
               pkgs.jq
               pkgs.nixfmt
+              pkgs.pyright
+              pkgs.ruff
+              pkgs.ty
+              python
             ];
           };
         }

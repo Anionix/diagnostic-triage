@@ -1,0 +1,16 @@
+{
+  "schema_version": "diagnostic-triage.handshake-fixture/v1",
+  "manifest": {
+    "protocol_version": "diagnostic-triage.protocol/v1",
+    "kind": "manifest",
+    "adapter": {
+      "id": "ruff",
+      "version": "0.12.4",
+      "kind": "PROVIDER",
+      "capabilities": ["diagnostic.check/v1"],
+      "languages": ["python"]
+    }
+  },
+  "required_capabilities": ["fix.propose/v1"],
+  "session_report_fixture": "valid-unsupported-report.json"
+}
