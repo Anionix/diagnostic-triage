@@ -252,6 +252,7 @@ version = "0.1.0"
 dependencies = [
  "diagnostic-triage-contracts",
  "indexmap",
+ "jiff",
  "serde",
  "serde_json",
  "sha2",
