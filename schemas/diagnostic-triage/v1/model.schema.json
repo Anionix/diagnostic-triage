@@ -227,7 +227,12 @@
       "properties": {
         "schema_version": { "const": "diagnostic-triage.execution/v1" },
         "execution_id": { "$ref": "common.schema.json#/$defs/uuid" },
-        "adapter_id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "adapter_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9.-]{0,127}(?![\\s\\S])"
+        },
         "adapter_kind": { "enum": ["ENGINE", "PROVIDER", "OBSERVER"] },
         "tool": { "$ref": "common.schema.json#/$defs/tool" },
         "toolchain_fingerprint": {

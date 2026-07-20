@@ -574,6 +574,45 @@ class ContractTest(unittest.TestCase):
             with self.subTest(path=repr(invalid_path)):
                 self.assertTrue(list(validator.iter_errors(candidate)))
 
+    def test_model_schema_matches_rust_wire_boundaries(self) -> None:
+        validator = self.contracts.validator("model.schema.json")
+        report = load_json(FIXTURE_DIR / "valid-report.json")
+        protocol_validator = self.contracts.validator("protocol.schema.json")
+        manifest = load_session(FIXTURE_DIR / "valid-empty-session.jsonl")[0]
+
+        for valid_id in ("a", "github-actions", "a" * 128):
+            report["executions"][0]["adapter_id"] = valid_id
+            manifest["adapter"]["id"] = valid_id
+            validator.validate(report)
+            protocol_validator.validate(manifest)
+
+        invalid_ids = (
+            "",
+            "GitHub Actions",
+            "abc\n",
+            "abc\r",
+            "abc\r\n",
+            "abc\u2028",
+            "a" * 129,
+        )
+        for invalid_id in invalid_ids:
+            report["executions"][0]["adapter_id"] = invalid_id
+            manifest["adapter"]["id"] = invalid_id
+            with self.subTest(adapter_id=repr(invalid_id)):
+                self.assertTrue(list(validator.iter_errors(report)))
+                self.assertTrue(list(protocol_validator.iter_errors(manifest)))
+
+        for field in ("line", "column"):
+            report = load_json(FIXTURE_DIR / "valid-report.json")
+            position = report["observations"][0]["location"]["start"]
+            for valid_value in (1, 4_294_967_295):
+                position[field] = valid_value
+                validator.validate(report)
+            for invalid_value in (0, 4_294_967_296):
+                position[field] = invalid_value
+                with self.subTest(field=field, value=invalid_value):
+                    self.assertTrue(list(validator.iter_errors(report)))
+
     def test_finding_rejects_policy_verdict(self) -> None:
         report = load_json(FIXTURE_DIR / "valid-report.json")
         finding = copy.deepcopy(report["findings"][0])

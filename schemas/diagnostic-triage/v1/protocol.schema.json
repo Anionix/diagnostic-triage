@@ -28,7 +28,7 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 128,
-              "pattern": "^[a-z][a-z0-9.-]{0,127}$"
+            "pattern": "^[a-z][a-z0-9.-]{0,127}(?![\\s\\S])"
             },
             "version": { "type": "string", "minLength": 1, "maxLength": 64 },
             "kind": { "enum": ["PROVIDER", "OBSERVER"] },
