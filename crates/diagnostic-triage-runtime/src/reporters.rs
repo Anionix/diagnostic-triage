@@ -114,6 +114,8 @@ impl TryFrom<SessionReport> for ValidatedSessionReport {
 pub enum ReportFormat {
     /// Compact canonical JSON representing the complete v1 report.
     Json,
+    /// A SARIF 2.1.0 projection for external diagnostic consumers.
+    Sarif,
     /// A tab-separated finding/decision projection.
     Tsv,
     /// GitHub workflow-command annotations for policy decisions.
@@ -124,6 +126,7 @@ impl fmt::Display for ReportFormat {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Json => "JSON",
+            Self::Sarif => "SARIF",
             Self::Tsv => "TSV",
             Self::GitHubAnnotations => "GitHub annotations",
         })
@@ -257,7 +260,7 @@ pub fn tsv_bytes(report: &ValidatedSessionReport) -> Result<Vec<u8>, ReporterErr
     encode_tsv(report.as_report(), MAX_REPORT_OUTPUT_BYTES)
 }
 
-fn write_encoded<W: Write + ?Sized>(
+pub(crate) fn write_encoded<W: Write + ?Sized>(
     format: ReportFormat,
     bytes: &[u8],
     writer: &mut W,
@@ -707,14 +710,14 @@ fn write_hex_escape<W: Write + ?Sized>(output: &mut W, byte: u8) -> io::Result<(
     ])
 }
 
-struct BoundedBuffer {
-    bytes: Vec<u8>,
-    limit: usize,
-    exceeded: bool,
+pub(crate) struct BoundedBuffer {
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) limit: usize,
+    pub(crate) exceeded: bool,
 }
 
 impl BoundedBuffer {
-    const fn new(limit: usize) -> Self {
+    pub(crate) const fn new(limit: usize) -> Self {
         Self {
             bytes: Vec::new(),
             limit,

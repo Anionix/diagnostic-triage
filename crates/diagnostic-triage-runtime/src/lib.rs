@@ -19,6 +19,7 @@ pub mod config;
 pub mod github_annotations;
 pub mod process;
 pub mod reporters;
+pub mod sarif;
 pub mod session;
 
 pub use config::{ConfigError, RuntimeConfig};
@@ -30,6 +31,7 @@ pub use reporters::{
     TSV_HEADER, TsvReporter, ValidatedSessionReport, canonical_json_bytes, tsv_bytes,
     write_canonical_json, write_tsv,
 };
+pub use sarif::{SarifReporter, sarif_bytes, write_sarif};
 pub use session::{
     ProviderSessionError, ProviderSessionOutcome, ProviderSessionState, run_provider_session,
 };
