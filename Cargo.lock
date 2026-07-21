@@ -267,6 +267,7 @@ version = "0.1.0"
 dependencies = [
  "camino",
  "diagnostic-triage-contracts",
+ "jiff",
  "serde",
  "serde_json",
  "thiserror",
