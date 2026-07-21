@@ -60,6 +60,10 @@ pub enum ObserverError {
     Source(String),
     #[error("generated model violates the v1 contract: {0}")]
     Model(String),
+    #[error(
+        "max_stdout_bytes={limit} cannot encode the required manifest and completion ({minimum} bytes)"
+    )]
+    OutputLimit { limit: u64, minimum: u64 },
     #[error("Observer I/O failed: {0}")]
     Io(#[from] io::Error),
 }
@@ -146,7 +150,7 @@ pub fn run_stdio() -> Result<(), ObserverError> {
         .read_until(b'\n', &mut input)?;
     let (request, response) = match decode_request(&input) {
         Ok(request) => {
-            let response = execute(&request);
+            let response = execute(&request)?;
             (Some(request), response)
         }
         Err(error) => (
@@ -218,48 +222,56 @@ fn decode_request(input: &[u8]) -> Result<RequestEnvelope, ObserverError> {
 }
 
 /// Observe one caller-provided local workflow-run JSON file without network I/O.
-#[must_use]
-pub fn execute(request: &RequestEnvelope) -> ObserverResponse {
+///
+/// # Errors
+///
+/// Returns [`ObserverError`] when the repository cannot be inspected safely or
+/// the negotiated stdout budget cannot encode a valid terminal response.
+pub fn execute(request: &RequestEnvelope) -> Result<ObserverResponse, ObserverError> {
     let repository = match std::env::current_dir().and_then(std::fs::canonicalize) {
         Ok(repository) => repository,
         Err(error) => {
-            return incomplete(
+            return Ok(incomplete(
                 request,
                 Vec::new(),
                 format!("repository is unavailable: {error}"),
-            );
+            ));
         }
     };
     execute_in_repository(request, &repository)
 }
 
-fn execute_in_repository(request: &RequestEnvelope, repository: &Path) -> ObserverResponse {
+fn execute_in_repository(
+    request: &RequestEnvelope,
+    repository: &Path,
+) -> Result<ObserverResponse, ObserverError> {
     if let Err(error) = ProtocolEnvelope::Request(request.clone()).validate() {
-        return incomplete(request, Vec::new(), error.to_string());
+        return Ok(incomplete(request, Vec::new(), error.to_string()));
     }
     if let Some(message) = unsupported_request(request) {
-        return finish(
+        return Ok(finish(
             request,
             Vec::new(),
             ExecutionStatus::Unsupported,
             None,
             Some(message),
-        );
+        ));
     }
     let (run, mut events, mut ids) = match load_run(request, repository) {
         Ok(loaded) => loaded,
-        Err(response) => return *response,
+        // LLM contract: LOAD_FAILED -> BOUNDED -> INCOMPLETE -> REPORTED.
+        Err(response) => return bound_response(request, *response),
     };
     if run.status != "completed" {
-        return incomplete(
+        return Ok(incomplete(
             request,
             events,
             format!("workflow run status is not completed: {}", run.status),
-        );
+        ));
     }
     let execution = match normalize_run(&run, ids.next()) {
         Ok(execution) => execution,
-        Err(error) => return incomplete(request, events, error.to_string()),
+        Err(error) => return Ok(incomplete(request, events, error.to_string())),
     };
     let envelope = ProtocolEnvelope::Execution(ExecutionEnvelope {
         protocol_version: ProtocolVersion::V1,
@@ -269,11 +281,11 @@ fn execute_in_repository(request: &RequestEnvelope, repository: &Path) -> Observ
         execution,
     });
     if let Err(error) = envelope.validate() {
-        return incomplete(
+        return Ok(incomplete(
             request,
             events,
             ObserverError::Model(error.to_string()).to_string(),
-        );
+        ));
     }
     events.push(envelope);
     let response = if u64::try_from(events.len()).unwrap_or(u64::MAX) > request.limits.max_events {
@@ -744,6 +756,12 @@ fn bounded_events(
     request: &RequestEnvelope,
     mut events: Vec<ProtocolEnvelope>,
 ) -> Vec<ProtocolEnvelope> {
+    events.retain(|event| match event {
+        ProtocolEnvelope::Evidence(value) => {
+            value.evidence.retained_bytes <= request.limits.max_evidence_bytes
+        }
+        _ => true,
+    });
     events.truncate(usize::try_from(request.limits.max_events).unwrap_or(usize::MAX));
     resequence_events(&mut events);
     events
@@ -783,6 +801,21 @@ fn incomplete(
         None,
         Some(message),
     )
+}
+
+fn bound_response(
+    request: &RequestEnvelope,
+    response: ObserverResponse,
+) -> Result<ObserverResponse, ObserverError> {
+    let ObserverResponse { events, completion } = response;
+    let response = finish(
+        request,
+        bounded_events(request, events),
+        completion.status,
+        completion.tool_exit_code.0,
+        completion.message,
+    );
+    enforce_output_limit(request, response)
 }
 
 fn finish(
@@ -830,25 +863,52 @@ fn finish(
     }
 }
 
-fn enforce_output_limit(request: &RequestEnvelope, response: ObserverResponse) -> ObserverResponse {
+fn enforce_output_limit(
+    request: &RequestEnvelope,
+    response: ObserverResponse,
+) -> Result<ObserverResponse, ObserverError> {
+    if serialized_output_bytes(&response)? <= request.limits.max_stdout_bytes {
+        return Ok(response);
+    }
+
+    let fallback = incomplete(
+        request,
+        Vec::new(),
+        "Observer output exceeds max_stdout_bytes".to_owned(),
+    );
+    if serialized_output_bytes(&fallback)? <= request.limits.max_stdout_bytes {
+        return Ok(fallback);
+    }
+
+    // INCOMPLETE requires a non-empty message; one ASCII byte is the smallest
+    // valid terminal payload for an edge-sized output budget.
+    let minimal = finish(
+        request,
+        Vec::new(),
+        ExecutionStatus::Incomplete,
+        None,
+        Some("x".to_owned()),
+    );
+    let minimum = serialized_output_bytes(&minimal)?;
+    if minimum <= request.limits.max_stdout_bytes {
+        return Ok(minimal);
+    }
+
+    Err(ObserverError::OutputLimit {
+        limit: request.limits.max_stdout_bytes,
+        minimum,
+    })
+}
+
+fn serialized_output_bytes(response: &ObserverResponse) -> Result<u64, ObserverError> {
     let mut bytes = Vec::new();
-    let serialized = std::iter::once(ProtocolEnvelope::Manifest(manifest()))
+    std::iter::once(ProtocolEnvelope::Manifest(manifest()))
         .chain(response.events.iter().cloned())
         .chain(std::iter::once(ProtocolEnvelope::Completion(
             response.completion.clone(),
         )))
-        .try_for_each(|event| write_envelope(&mut bytes, &event));
-    if serialized.is_ok()
-        && u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= request.limits.max_stdout_bytes
-    {
-        response
-    } else {
-        incomplete(
-            request,
-            Vec::new(),
-            "Observer output exceeds max_stdout_bytes".to_owned(),
-        )
-    }
+        .try_for_each(|event| write_envelope(&mut bytes, &event))?;
+    Ok(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
 }
 
 fn terminal_for_id(
@@ -973,7 +1033,9 @@ impl IdFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_INPUT_BYTES, OBSERVE_CAPABILITY, execute_in_repository, manifest, read_request,
+        MAX_INPUT_BYTES, OBSERVE_CAPABILITY, ObserverError,
+        execute_in_repository as try_execute_in_repository, manifest, read_request,
+        validate_response,
     };
     use diagnostic_triage_contracts::{
         model::{
@@ -1055,6 +1117,14 @@ mod tests {
         execute_in_repository(&request(), &repository.root)
     }
 
+    fn execute_in_repository(
+        request: &RequestEnvelope,
+        repository: &Path,
+    ) -> super::ObserverResponse {
+        try_execute_in_repository(request, repository)
+            .expect("representable request must produce a response")
+    }
+
     fn observed_execution(response: &super::ObserverResponse) -> &Execution {
         response
             .events
@@ -1075,6 +1145,21 @@ mod tests {
                 _ => None,
             })
             .expect("response must include inline evidence")
+    }
+
+    fn assert_bounded_load_error(repository: &TempRepo) {
+        let mut limited = request();
+        limited.limits.max_events = 0;
+        limited.limits.max_stdout_bytes = 1_024;
+
+        let response = execute_in_repository(&limited, &repository.root);
+
+        assert!(response.events.is_empty());
+        assert_eq!(response.completion.sequence, 0);
+        assert_eq!(response.completion.counts.evidence, 0);
+        assert_eq!(response.completion.status, ExecutionStatus::Incomplete);
+        validate_response(&limited, &response)
+            .expect("bounded load error must retain a terminal completion");
     }
 
     #[test]
@@ -1229,6 +1314,34 @@ mod tests {
     }
 
     #[test]
+    fn load_errors_obey_zero_event_and_tiny_stdout_limits() {
+        assert_bounded_load_error(&TempRepo::with_source(MALFORMED));
+
+        let root = TempRepo::new_root();
+        let file = File::create(root.join("run.json")).expect("fixture file must be creatable");
+        file.set_len(u64::try_from(MAX_INPUT_BYTES).unwrap_or(u64::MAX) + 1)
+            .expect("sparse fixture must be sizable");
+        assert_bounded_load_error(&TempRepo { root });
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let repository = TempRepo::with_source(SUCCESS);
+            let path = repository.root.join("run.json");
+            let original = path
+                .metadata()
+                .expect("fixture metadata exists")
+                .permissions();
+            let mut denied = original.clone();
+            denied.set_mode(0o000);
+            fs::set_permissions(&path, denied).expect("fixture must become unreadable");
+            assert_bounded_load_error(&repository);
+            fs::set_permissions(path, original).expect("fixture permissions must be restored");
+        }
+    }
+
+    #[test]
     fn source_object_order_does_not_change_canonical_evidence() {
         let first = observe(
             r#"{"id":1,"name":"CI","status":"completed","conclusion":"success","run_attempt":1}"#,
@@ -1330,7 +1443,7 @@ mod tests {
     fn output_limit_returns_only_an_incomplete_completion() {
         let repository = TempRepo::with_source(SUCCESS);
         let mut limited = request();
-        limited.limits.max_stdout_bytes = 1;
+        limited.limits.max_stdout_bytes = 1_024;
         let response = execute_in_repository(&limited, &repository.root);
 
         assert_eq!(response.completion.status, ExecutionStatus::Incomplete);
@@ -1341,6 +1454,22 @@ mod tests {
                 .message
                 .as_deref()
                 .is_some_and(|value| value.contains("output"))
+        );
+        validate_response(&limited, &response)
+            .expect("tiny output fallback must retain a terminal completion");
+    }
+
+    #[test]
+    fn impossible_output_limit_is_explicitly_rejected() {
+        let repository = TempRepo::with_source(SUCCESS);
+        let mut limited = request();
+        limited.limits.max_stdout_bytes = 1;
+
+        let error = try_execute_in_repository(&limited, &repository.root)
+            .expect_err("an impossible output limit must not emit an invalid fallback");
+        assert!(
+            matches!(error, ObserverError::OutputLimit { limit: 1, .. }),
+            "unexpected error: {error:?}"
         );
     }
 
