@@ -206,16 +206,19 @@ from authoritative source text or reject the diagnostic as unsupported; it
 must not relabel or guess the column unit.
 
 The exact Nix-locked Ruff and rustc versions have tool-produced non-BMP
-fixtures proving that their JSON character columns use this unit. Biome is not
-present in the locked shell, so the Provider does not infer a unit from the
-tool name or version. It accepts an explicit SARIF `unicodeCodePoints`, rejects
-an explicit `utf16CodeUnits`, and treats an omitted `run.columnKind` on every
-non-empty run as `UNSUPPORTED`. Omission is accepted only for an empty result
-set, where no coordinate can cross the boundary. Unknown values and explicit
-`null` are malformed SARIF. The Provider preserves the SARIF end-position
-boundary: a region with both `endLine` and `endColumn` omitted has no end,
-while a partial end position is invalid. When both are present, it copies them
-as the exclusive v1 endpoint; it does not infer a missing line-end position.
+fixtures proving that their JSON character columns use this unit. Biome 2.4.15
+tag commit `9dd3271eef16090416b6e77615a01e3bfbcf7993` omits `columnKind`, but its
+SARIF reporter derives columns through `SourceFile::location`, whose
+`column_index` counts Unicode character boundaries. The Provider therefore
+accepts omission only when the probed tool version is exactly 2.4.15. Omission
+from any other non-empty Biome version is `UNSUPPORTED`; an empty result set has
+no coordinate to interpret. An explicit SARIF `unicodeCodePoints` remains
+accepted for every version, while `utf16CodeUnits` is `UNSUPPORTED`. Unknown
+values and explicit `null` are malformed SARIF. The Provider preserves the
+SARIF end-position boundary: a region with both `endLine` and `endColumn`
+omitted has no end, while a partial end position is invalid. When both are
+present, it copies them as the exclusive v1 endpoint; it does not infer a
+missing line-end position.
 
 ## Completion semantics
 

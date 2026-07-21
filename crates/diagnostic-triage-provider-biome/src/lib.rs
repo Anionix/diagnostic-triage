@@ -332,7 +332,7 @@ fn response_from_outcome(
             format!("Biome check failed with exit code {:?}", outcome.exit_code),
         );
     };
-    let report = match parse_sarif(&outcome.stdout.bytes) {
+    let report = match parse_sarif(&outcome.stdout.bytes, tool_version) {
         Ok(report) => report,
         Err(error @ SarifError::UnsupportedColumnKind) => {
             return finish(
@@ -452,8 +452,8 @@ fn location(
     };
     Ok(Some(diagnostic_triage_contracts::model::Location {
         path,
-        // SARIF endColumn is exclusive. parse_sarif has already required an
-        // explicit unicodeCodePoints declaration for every non-empty run.
+        // SARIF endColumn is exclusive. parse_sarif has already required
+        // explicit Unicode points or Biome's source-backed native omission.
         start: Position {
             line: to_u32(range.start_line, "startLine")?,
             column: to_u32(range.start_column, "startColumn")?,
@@ -1249,6 +1249,52 @@ mod tests {
         assert_eq!(locations[2].end.as_ref().unwrap().column, 4);
         assert_eq!(locations[3].end.as_ref().unwrap().line, 5);
         assert_eq!(locations[3].end.as_ref().unwrap().column, 1);
+    }
+
+    #[test]
+    fn omitted_column_kind_preserves_source_backed_unicode_point_locations() {
+        let sarif = include_str!("../tests/golden/biome-locations.sarif.json").replacen(
+            ",\"columnKind\":\"unicodeCodePoints\"",
+            "",
+            1,
+        );
+        assert!(!sarif.contains("columnKind"));
+        let request = request();
+        let response = response_from_outcome(
+            &request,
+            Path::new("."),
+            "2.4.15",
+            &complete_output(&sarif, 1),
+            Duration::from_millis(14),
+        );
+        let locations = response
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ProtocolEnvelope::Observation(value) => value.observation.location.as_ref(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(response.completion.status, ExecutionStatus::Complete);
+        assert_eq!(locations.len(), 4);
+        assert_eq!(locations[0].start.column, 2);
+        assert_eq!(locations[0].end.as_ref().unwrap().column, 3);
+        assert_eq!(locations[1].start, locations[1].end.clone().unwrap());
+        assert_eq!(locations[3].end.as_ref().unwrap().line, 5);
+        assert_eq!(locations[3].end.as_ref().unwrap().column, 1);
+        validate_response(&request, &response).expect("omitted Biome column kind remains valid");
+
+        let unpinned = response_from_outcome(
+            &request,
+            Path::new("."),
+            "2.4.14",
+            &complete_output(&sarif, 1),
+            Duration::from_millis(14),
+        );
+        assert_eq!(unpinned.completion.status, ExecutionStatus::Unsupported);
+        assert_eq!(unpinned.completion.counts.observations, 0);
+        validate_response(&request, &unpinned).expect("unpinned omission remains unsupported");
     }
 
     #[test]
