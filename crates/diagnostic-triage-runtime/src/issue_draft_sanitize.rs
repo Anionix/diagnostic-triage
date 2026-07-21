@@ -585,7 +585,7 @@ fn json_quoted_secret_at(neutralized: &NeutralizedText, index: usize) -> Option<
         return None;
     }
     let end = if escaped_value {
-        escaped_quoted_value_end(bytes, start, b'"')
+        escaped_json_quoted_value_end(bytes, start, b'"')
     } else {
         raw_quoted_value_end(bytes, start, b'"')
     };
@@ -973,6 +973,25 @@ fn escaped_quoted_value_end(bytes: &[u8], start: usize, quote: u8) -> usize {
         if bytes[cursor] == b'\\' && bytes[cursor + 1] == quote && !is_escaped(bytes, start, cursor)
         {
             return cursor;
+        }
+        cursor += 1;
+    }
+    bytes.len()
+}
+
+fn escaped_json_quoted_value_end(bytes: &[u8], start: usize, quote: u8) -> usize {
+    // LLM contract: ESCAPED_JSON_VALUE -> INNER_QUOTE_SKIPPED -> OUTER_QUOTE | EOF.
+    // One escaped JSON layer gives outer quotes 4k+1 slashes and inner quotes 4k+3.
+    let mut cursor = start;
+    let mut backslash_run = 0;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'\\' {
+            backslash_run += 1;
+        } else {
+            if bytes[cursor] == quote && backslash_run % 4 == 1 {
+                return cursor - 1;
+            }
+            backslash_run = 0;
         }
         cursor += 1;
     }
@@ -1859,6 +1878,14 @@ mod tests {
             (
                 r#"{\"Authorization\":\"Credential=abcdef\",\"name\":\"ok\"}"#,
                 r#"{\"Authorization\":\"[REDACTED_SECRET]\",\"name\":\"ok\"}"#,
+            ),
+            (
+                r#"{\"Authorization\":\"Credential=\\\"abcdef\\\"\",\"name\":\"ok\"}"#,
+                r#"{\"Authorization\":\"[REDACTED_SECRET]\",\"name\":\"ok\"}"#,
+            ),
+            (
+                r#"{\"Authorization\":\"Credential=\\\"abcdef"#,
+                r#"{\"Authorization\":\"[REDACTED_SECRET]"#,
             ),
             (
                 r#"{"Authorization":"Credential=\"abcdef\"","name":"ok"}"#,
