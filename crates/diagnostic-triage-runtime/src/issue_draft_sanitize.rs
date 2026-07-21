@@ -80,7 +80,8 @@ pub(crate) fn sanitize_external_text(
             output.push_char(character)?;
         }
     }
-    Ok(output.finish())
+    let neutralized = output.finish();
+    redact_unquoted_assignments(neutralized.as_str(), max_bytes)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -191,6 +192,26 @@ fn is_secret_key(value: &str) -> bool {
             | "refreshtoken"
             | "privatekey"
     )
+}
+
+fn redact_unquoted_assignments(
+    value: &str,
+    max_bytes: usize,
+) -> Result<SanitizedText, SanitizeError> {
+    let mut output = BoundedText::new(value.len(), max_bytes);
+    let mut index = 0;
+    while index < value.len() {
+        if let Some((start, end)) = unquoted_secret_at(value, index) {
+            output.push_str(&value[index..start])?;
+            output.push_str("[REDACTED_SECRET]")?;
+            index = end;
+        } else {
+            let character = value[index..].chars().next().expect("UTF-8 boundary");
+            output.push_char(character)?;
+            index += character.len_utf8();
+        }
+    }
+    Ok(output.finish())
 }
 
 fn unquoted_secret_at(value: &str, index: usize) -> Option<(usize, usize)> {
@@ -501,6 +522,69 @@ mod tests {
         ] {
             assert_eq!(unquoted_secret_at(input, 0), None, "input {input:?}");
         }
+    }
+
+    #[test]
+    fn redacts_every_parsed_unquoted_secret_span() {
+        let cases = [
+            ("token=secret next=ok", "token=[REDACTED_SECRET] next=ok"),
+            (
+                "--client-secret tiny rest",
+                "--client-secret [REDACTED_SECRET] rest",
+            ),
+            ("token=foo\\ bar tail", "token=[REDACTED_SECRET] tail"),
+            ("token=trailing\\", "token=[REDACTED_SECRET]"),
+            ("token\t=secret", "token[CONTROL-U+0009]=[REDACTED_SECRET]"),
+            ("token\u{2003}=secret", "token\u{2003}=[REDACTED_SECRET]"),
+            ("token=secret\nnext=ok", "token=[REDACTED_SECRET]"),
+            (
+                "token=one name=ok api_key=two;done",
+                "token=[REDACTED_SECRET] name=ok api_key=[REDACTED_SECRET];done",
+            ),
+            ("日本 token=秘密 rest", "日本 token=[REDACTED_SECRET] rest"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                sanitize_external_text(input, 4096).unwrap().as_str(),
+                expected,
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn redaction_obeys_delimiter_parity_and_exact_output_bound() {
+        for delimiter in [' ', ',', ';', '&'] {
+            for slash_count in 0..=4 {
+                let slashes = "\\".repeat(slash_count);
+                let input = format!("token=value{slashes}{delimiter}tail");
+                let expected = if slash_count % 2 == 0 {
+                    format!("token=[REDACTED_SECRET]{delimiter}tail")
+                } else {
+                    "token=[REDACTED_SECRET]".to_owned()
+                };
+                assert_eq!(
+                    sanitize_external_text(&input, expected.len())
+                        .unwrap()
+                        .as_str(),
+                    expected
+                );
+            }
+        }
+
+        let expected = "token=[REDACTED_SECRET]";
+        assert_eq!(
+            sanitize_external_text("token=x", expected.len())
+                .unwrap()
+                .as_str(),
+            expected
+        );
+        assert_eq!(
+            sanitize_external_text("token=x", expected.len() - 1),
+            Err(SanitizeError::OutputLimitExceeded {
+                max_bytes: expected.len() - 1,
+            })
+        );
     }
 
     #[test]
