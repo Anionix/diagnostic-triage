@@ -92,19 +92,31 @@ pub fn manifest() -> ManifestEnvelope {
 /// Returns [`ProviderError`] when request framing, process execution, typed
 /// normalization, or protocol output cannot be completed safely.
 pub fn run_stdio() -> Result<(), ProviderError> {
+    let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut output = stdout.lock();
+    run_stdio_with(stdin.lock(), stdout.lock(), execute)
+}
+
+fn run_stdio_with<R, W, F>(
+    reader: R,
+    mut output: W,
+    execute_request: F,
+) -> Result<(), ProviderError>
+where
+    R: Read,
+    W: Write,
+    F: Fn(&RequestEnvelope) -> ProviderResponse,
+{
     write_envelope(&mut output, &ProtocolEnvelope::Manifest(manifest()))?;
     output.flush()?;
 
-    let stdin = io::stdin();
     let mut input = Vec::new();
-    BufReader::new(stdin.lock())
+    BufReader::new(reader)
         .take(u64::try_from(MAX_REQUEST_BYTES).unwrap_or(u64::MAX) + 1)
         .read_until(b'\n', &mut input)?;
     let (request, response) = match decode_request(&input) {
         Ok(request) => {
-            let response = execute(&request);
+            let response = execute_request(&request);
             (Some(request), response)
         }
         Err(error) => (
@@ -116,9 +128,22 @@ pub fn run_stdio() -> Result<(), ProviderError> {
             ),
         ),
     };
-    if let Some(request) = &request {
-        validate_response(request, &response)?;
-    }
+    let response = if let Some(request) = &request {
+        if validate_response(request, &response).is_err() {
+            // LLM contract: GENERATED -> VALIDATION_FAILED -> INCOMPLETE -> REPORTED.
+            let fallback = terminal_for_id(
+                request.request_id.clone(),
+                diagnostic_triage_contracts::model::ExecutionStatus::Incomplete,
+                "provider response exceeded negotiated limits".to_owned(),
+            );
+            validate_response(request, &fallback)?;
+            fallback
+        } else {
+            response
+        }
+    } else {
+        response
+    };
     for event in &response.events {
         write_envelope(&mut output, event)?;
     }
@@ -993,7 +1018,7 @@ impl IdFactory {
 mod tests {
     use super::{
         CHECK_CAPABILITY, ProviderError, biome_argv, decode_request, manifest, read_request,
-        response_from_outcome, validate_response,
+        response_from_outcome, run_stdio_with, validate_response,
     };
     use crate::process::{CapturedOutput, ProcessOutcome, ProcessState};
     use diagnostic_triage_contracts::{
@@ -1316,6 +1341,53 @@ mod tests {
         assert_eq!(response.completion.counts.observations, 0);
         assert_eq!(response.completion.counts.evidence, 1);
         validate_response(&request, &response).expect("UNSUPPORTED response satisfies protocol v1");
+    }
+
+    #[test]
+    fn stdio_validation_overflows_emit_bounded_incomplete_completion() {
+        let baseline_request = request();
+        let invalid = response_from_outcome(
+            &baseline_request,
+            Path::new("."),
+            "2.4.15",
+            &complete_output(include_str!("../tests/golden/biome-findings.sarif.json"), 1),
+            Duration::from_millis(14),
+        );
+        assert!(!invalid.events.is_empty());
+
+        let mut event_overflow = baseline_request.clone();
+        event_overflow.limits.max_events = 0;
+        let mut evidence_overflow = baseline_request.clone();
+        evidence_overflow.limits.max_evidence_bytes = 0;
+        let mut stdout_overflow = baseline_request;
+        stdout_overflow.limits.max_stdout_bytes = 1_024;
+
+        for limited in [event_overflow, evidence_overflow, stdout_overflow] {
+            let mut input = serde_json::to_vec(&ProtocolEnvelope::Request(limited.clone()))
+                .expect("request serializes");
+            input.push(b'\n');
+            let mut output = Vec::new();
+            run_stdio_with(Cursor::new(input), &mut output, |_| invalid.clone())
+                .expect("validation overflow emits a fallback");
+            let lines = output
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice::<ProtocolEnvelope>(line).unwrap())
+                .collect::<Vec<_>>();
+
+            assert_eq!(lines.len(), 2);
+            assert!(matches!(lines[0], ProtocolEnvelope::Manifest(_)));
+            let ProtocolEnvelope::Completion(completion) = lines[1].clone() else {
+                panic!("terminal line must be completion")
+            };
+            assert_eq!(completion.status, ExecutionStatus::Incomplete);
+            let fallback = super::ProviderResponse {
+                events: Vec::new(),
+                completion,
+            };
+            validate_response(&limited, &fallback)
+                .expect("fallback must fit the negotiated limits");
+        }
     }
 
     #[test]
