@@ -1012,7 +1012,7 @@ mod tests {
 
         SIGNAL_CALLS.store(0, Ordering::SeqCst);
         let error = run_direct_with_group_signal(
-            OsStr::new("/usr/bin/true"),
+            OsStr::new("true"),
             &[],
             Path::new("."),
             limits(64, 64),
@@ -1032,7 +1032,7 @@ mod tests {
         }
 
         let error = run_direct_with_group_signal(
-            OsStr::new("/usr/bin/true"),
+            OsStr::new("true"),
             &[],
             Path::new("."),
             limits(64, 64),
@@ -1064,7 +1064,7 @@ mod tests {
             }
         }
 
-        let mut command = Command::new("/usr/bin/true");
+        let mut command = Command::new("true");
         command.process_group(0);
         let mut child = command
             .spawn()

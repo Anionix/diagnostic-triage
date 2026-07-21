@@ -1027,7 +1027,7 @@ mod tests {
 
         SIGNAL_CALLS.store(0, Ordering::SeqCst);
         let error = run_direct_with_group_signal(
-            OsStr::new("/usr/bin/true"),
+            OsStr::new("true"),
             &[],
             Path::new("."),
             limits(64, 64),
@@ -1047,7 +1047,7 @@ mod tests {
         }
 
         let error = run_direct_with_group_signal(
-            OsStr::new("/usr/bin/true"),
+            OsStr::new("true"),
             &[],
             Path::new("."),
             limits(64, 64),
@@ -1066,7 +1066,7 @@ mod tests {
         }
 
         let outcome = super::run_direct_with_reader_probe(
-            OsStr::new("/usr/bin/true"),
+            OsStr::new("true"),
             &[],
             Path::new("."),
             limits(64, 64),
@@ -1093,7 +1093,7 @@ mod tests {
                 .ok_or_else(|| std::io::Error::other("process-group ID must be nonzero"))
         }
 
-        let mut command = Command::new("/usr/bin/true");
+        let mut command = Command::new("true");
         command.process_group(0);
         let mut child = command
             .spawn()
@@ -1169,7 +1169,7 @@ mod tests {
         let mut process_limits = limits(64, 64);
         process_limits.timeout = Duration::from_millis(30);
         let outcome = run_direct_with_group_signal(
-            OsStr::new("/bin/sleep"),
+            OsStr::new("sleep"),
             &["1".to_owned()],
             Path::new("."),
             process_limits,

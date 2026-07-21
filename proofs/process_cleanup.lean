@@ -16,6 +16,12 @@ def maySuppressPermissionError
     (isNativeEperm leaderReaped groupAbsent : Bool) : Bool :=
   origin == .native && isNativeEperm && leaderReaped && groupAbsent
 
+theorem suppression_gate_iff
+    (origin : SignalOrigin) (isNativeEperm leaderReaped groupAbsent : Bool) :
+    maySuppressPermissionError origin isNativeEperm leaderReaped groupAbsent = true ↔
+      origin = .native ∧ isNativeEperm = true ∧ leaderReaped = true ∧ groupAbsent = true := by
+  cases origin <;> simp [maySuppressPermissionError, and_assoc]
+
 theorem injected_never_suppressed
     (isNativeEperm leaderReaped groupAbsent : Bool) :
     maySuppressPermissionError .injected isNativeEperm leaderReaped groupAbsent = false := by
