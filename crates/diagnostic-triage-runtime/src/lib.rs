@@ -10,11 +10,15 @@ pub use scratch::{
 // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
 
 pub mod config;
+pub mod github_annotations;
 pub mod process;
 pub mod reporters;
 pub mod session;
 
 pub use config::{ConfigError, RuntimeConfig};
+pub use github_annotations::{
+    GitHubAnnotationReporter, github_annotations_bytes, write_github_annotations,
+};
 pub use reporters::{
     CanonicalJsonReporter, MAX_REPORT_OUTPUT_BYTES, ReportFormat, Reporter, ReporterError,
     TSV_HEADER, TsvReporter, ValidatedSessionReport, canonical_json_bytes, tsv_bytes,

@@ -1,0 +1,1 @@
+::error file=src/example.py,line=7,endLine=7,col=12,endColumn=12,title=ruff%3A F821::Undefined name `x`
