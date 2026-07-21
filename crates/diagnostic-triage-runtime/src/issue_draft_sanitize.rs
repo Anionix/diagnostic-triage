@@ -927,6 +927,7 @@ fn secret_value_start(
                 return None;
             }
         } else {
+            // LLM contract: CLI_SEPARATOR -> PROVENANCE_ONLY_REJECTED | LITERAL_VALUE_BOUNDED.
             let (separator_end, provenance_backed) =
                 skip_key_separator_whitespace(value, cursor, neutralized);
             if separator_end <= cursor {
@@ -934,9 +935,16 @@ fn secret_value_start(
             }
             cursor = separator_end;
             if matches!(bytes.get(cursor), Some(b'=' | b':')) {
-                return None;
-            }
-            if provenance_backed && looks_like_assignment(value, cursor, neutralized) {
+                if provenance_backed {
+                    return None;
+                }
+                let value_start = cursor + 1;
+                cursor =
+                    skip_assignment_whitespace_with_provenance(value, value_start, neutralized);
+                if cursor > value_start && looks_like_assignment(value, cursor, neutralized) {
+                    return None;
+                }
+            } else if provenance_backed && looks_like_assignment(value, cursor, neutralized) {
                 return None;
             }
         }
@@ -2348,6 +2356,27 @@ mod tests {
             (
                 "--token\t[CONTROL-U+0009]secret",
                 "--token[CONTROL-U+0009][CONTROL-U+0009][REDACTED_SECRET]",
+            ),
+            (
+                "--token\t[CONTROL-U+0009]=secret",
+                "--token[CONTROL-U+0009][CONTROL-U+0009]=[REDACTED_SECRET]",
+            ),
+            (
+                "--token\r[CONTROL-U+000D]:secret",
+                "--token[CONTROL-U+000D][CONTROL-U+000D]:[REDACTED_SECRET]",
+            ),
+            (
+                "--token[CONTROL-U+0009]=secret",
+                "--token[CONTROL-U+0009]=[REDACTED_SECRET]",
+            ),
+            ("--token\t=secret", "--token[CONTROL-U+0009]=secret"),
+            (
+                "--token\t[CONTROL-U+0009]=\nnext=ok",
+                "--token[CONTROL-U+0009][CONTROL-U+0009]=[CONTROL-U+000A]next=ok",
+            ),
+            (
+                "--token\t[CONTROL-U+0009]=",
+                "--token[CONTROL-U+0009][CONTROL-U+0009]=",
             ),
             (
                 "--token\n[CONTROL-U+000A]next=ok",
