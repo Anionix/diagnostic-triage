@@ -963,6 +963,44 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn transient_group_probe_permission_error_is_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn deny_once_then_absent(_: u32) -> std::io::Result<bool> {
+            if PROBE_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            Ok(false)
+        }
+
+        PROBE_CALLS.store(0, Ordering::SeqCst);
+        let reaped = super::wait_for_process_group_with_probe(
+            1,
+            Instant::now() + Duration::from_millis(100),
+            deny_once_then_absent,
+        )
+        .expect("a transient group-probe EPERM is retried");
+
+        assert!(reaped);
+        assert_eq!(PROBE_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn persistent_group_probe_permission_error_is_typed() {
+        fn always_deny(_: u32) -> std::io::Result<bool> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+
+        let error = super::wait_for_process_group_with_probe(1, Instant::now(), always_deny)
+            .expect_err("a persistent group-probe EPERM must propagate");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn group_signal_failure_is_typed_after_reap_and_reader_join() {
         fn signal_then_fail(process_group: u32) -> std::io::Result<()> {
             signal_process_group(process_group)?;
