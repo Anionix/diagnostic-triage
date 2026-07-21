@@ -1,0 +1,67 @@
+{
+  "$schema": "https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/schemas/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "diagnostic-triage",
+          "version": "0.1.0",
+          "rules": [],
+          "notifications": [
+            {
+              "id": "diagnostic-triage.execution.unsupported",
+              "name": "UNSUPPORTED",
+              "shortDescription": { "text": "The requested diagnostic execution is unsupported." }
+            }
+          ],
+          "properties": {
+            "sourceRevision": "84563c93ee06e3a834a03ff53f21b62b6ab0cc89",
+            "contractSha256": "7b8652989f914ceb44a174fb015b3f990e23670e977cc5f77e997a15cfa7f3d3"
+          }
+        }
+      },
+      "automationDetails": { "id": "019f7e95-0000-7000-8000-000000000401" },
+      "columnKind": "unicodeCodePoints",
+      "invocations": [
+        {
+          "executionSuccessful": false,
+          "toolExecutionNotifications": [
+            {
+              "descriptor": { "id": "diagnostic-triage.execution.unsupported", "index": 0 },
+              "level": "error",
+              "message": { "text": "required capability fix.propose/v1 is unsupported" }
+            }
+          ],
+          "properties": {
+            "executionId": "019f7e95-0000-7000-8000-000000000402",
+            "adapterId": "ruff",
+            "adapterKind": "PROVIDER",
+            "toolName": "ruff",
+            "toolVersion": "0.12.4",
+            "toolchainFingerprint": "UNAVAILABLE",
+            "required": true,
+            "status": "UNSUPPORTED",
+            "message": "required capability fix.propose/v1 is unsupported",
+            "phasesMs": {
+              "queue": "NOT_APPLICABLE",
+              "setup": "NOT_APPLICABLE",
+              "run": "NOT_APPLICABLE",
+              "normalize": "NOT_APPLICABLE",
+              "total": "NOT_APPLICABLE"
+            },
+            "performance": { "status": "NOT_EVALUATED", "budget_ms": 60000 },
+            "cache": { "status": "NOT_APPLICABLE" },
+            "retry": { "status": "NOT_APPLICABLE" },
+            "runner": { "status": "UNAVAILABLE" }
+          }
+        }
+      ],
+      "results": [],
+      "properties": {
+        "policyDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "verdict": "UNSUPPORTED"
+      }
+    }
+  ]
+}

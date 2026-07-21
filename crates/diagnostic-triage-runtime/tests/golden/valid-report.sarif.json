@@ -1,0 +1,99 @@
+{
+  "$schema": "https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/schemas/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "diagnostic-triage",
+          "version": "0.1.0",
+          "rules": [
+            {
+              "id": "ruff/F821",
+              "name": "F821",
+              "shortDescription": { "text": "F821" }
+            }
+          ],
+          "notifications": [],
+          "properties": {
+            "sourceRevision": "84563c93ee06e3a834a03ff53f21b62b6ab0cc89",
+            "contractSha256": "7b8652989f914ceb44a174fb015b3f990e23670e977cc5f77e997a15cfa7f3d3"
+          }
+        }
+      },
+      "automationDetails": { "id": "019f7e95-0000-7000-8000-000000000101" },
+      "columnKind": "unicodeCodePoints",
+      "invocations": [
+        {
+          "executionSuccessful": true,
+          "exitCode": 1,
+          "properties": {
+            "executionId": "019f7e95-0000-7000-8000-000000000104",
+            "adapterId": "ruff",
+            "adapterKind": "PROVIDER",
+            "toolName": "ruff",
+            "toolVersion": "0.12.4",
+            "toolchainFingerprint": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "required": true,
+            "status": "COMPLETE",
+            "phasesMs": {
+              "queue": "NOT_APPLICABLE",
+              "setup": 0,
+              "run": 180,
+              "normalize": 4,
+              "total": 184
+            },
+            "performance": { "status": "WITHIN_BUDGET", "budget_ms": 60000 },
+            "cache": { "status": "NOT_APPLICABLE" },
+            "retry": { "status": "RECORDED", "attempt": 1, "same_revision": true },
+            "runner": { "status": "UNAVAILABLE" }
+          }
+        }
+      ],
+      "results": [
+        {
+          "ruleId": "ruff/F821",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": { "text": "Undefined name `x`" },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": { "uri": "src/example.py" },
+                "region": { "startLine": 7, "startColumn": 12, "endLine": 7, "endColumn": 13 }
+              },
+              "logicalLocations": [{ "name": "x" }]
+            }
+          ],
+          "partialFingerprints": {
+            "diagnosticTriageFingerprint/v1": "dtfp1:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+          },
+          "properties": {
+            "findingId": "019f7e95-0000-7000-8000-000000000105",
+            "toolName": "ruff",
+            "toolVersion": "0.12.4",
+            "nativeRuleId": "F821",
+            "language": "python",
+            "category": "type",
+            "microCategory": "unresolved-symbol",
+            "lifecycleState": "REPORTED",
+            "preReportState": "CLASSIFIED",
+            "observationIds": ["019f7e95-0000-7000-8000-000000000103"],
+            "evidenceIds": ["019f7e95-0000-7000-8000-000000000102"],
+            "symbol": "x",
+            "decisionId": "019f7e95-0000-7000-8000-000000000106",
+            "decisionAction": "BLOCK",
+            "evaluatedAt": "2026-07-21T00:00:00Z",
+            "policyDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "matchedRuleId": "default.error.type",
+            "sessionVerdict": "POLICY_FAIL"
+          }
+        }
+      ],
+      "properties": {
+        "policyDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "verdict": "POLICY_FAIL"
+      }
+    }
+  ]
+}
