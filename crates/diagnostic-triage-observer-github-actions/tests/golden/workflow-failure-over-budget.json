@@ -1,0 +1,10 @@
+{
+  "id": 1002,
+  "name": "CI",
+  "status": "completed",
+  "conclusion": "failure",
+  "created_at": "2026-07-21T00:00:00Z",
+  "run_started_at": "2026-07-21T00:00:01Z",
+  "updated_at": "2026-07-21T00:01:02Z",
+  "run_attempt": 1
+}
