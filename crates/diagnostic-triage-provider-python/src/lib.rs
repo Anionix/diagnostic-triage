@@ -567,14 +567,19 @@ pub fn run_ruff_session(
     let started = Instant::now();
     let mut builder = CompletionBuilder::new(request);
     let mut events = Vec::new();
-    let workspace_root = match resolve_workspace(launch_root, &request.workspace) {
-        Ok(path) => path,
+    let (repository_root, workspace_root) = match resolve_workspace(launch_root, &request.workspace)
+    {
+        Ok(roots) => roots,
         Err(error) => {
             return finish_incomplete(builder, events, started, error.to_string());
         }
     };
+    // LLM contract: REPOSITORY_RESOLVED -> SCOPE_VALIDATED -> EXECUTED -> SCOPE_REVALIDATED -> NORMALIZED.
+    if let Err(error) = validate_targets(request, &repository_root, &workspace_root) {
+        return finish_incomplete(builder, events, started, error.to_string());
+    }
     let (tool_version, check_limits) =
-        match probe_ruff(request, &workspace_root, ruff_program, started) {
+        match probe_ruff(request, &repository_root, ruff_program, started) {
             Ok(ready) => ready,
             Err(failure) => {
                 if let Some(outcome) = &failure.outcome {
@@ -586,7 +591,7 @@ pub fn run_ruff_session(
     let check_spec = ProcessSpec::new(ruff_program)
         .args(["check", "--output-format", "json", "--"])
         .args(request.targets.iter().map(RepoPath::as_str))
-        .current_dir(&workspace_root);
+        .current_dir(&repository_root);
     let check_outcome = match run_bounded(&check_spec, check_limits) {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -628,10 +633,13 @@ pub fn run_ruff_session(
             .to_string(),
         );
     };
+    if let Err(error) = validate_targets(request, &repository_root, &workspace_root) {
+        return finish_incomplete(builder, events, started, error.to_string());
+    }
     let normalized = match normalize_ruff_json(
         request,
         &tool_version,
-        &workspace_root,
+        &repository_root,
         &check_outcome.stdout.bytes,
         &stdout_evidence_ids,
         &mut builder,
@@ -850,7 +858,10 @@ fn remaining_process_limits(
     .map_err(|error| ProviderError::Process(error.to_string()))
 }
 
-fn resolve_workspace(launch_root: &Path, workspace: &RepoPath) -> Result<PathBuf, ProviderError> {
+fn resolve_workspace(
+    launch_root: &Path,
+    workspace: &RepoPath,
+) -> Result<(PathBuf, PathBuf), ProviderError> {
     let root = fs::canonicalize(launch_root)
         .map_err(|error| ProviderError::Workspace(error.to_string()))?;
     let candidate = if workspace.as_str() == "." {
@@ -863,7 +874,52 @@ fn resolve_workspace(launch_root: &Path, workspace: &RepoPath) -> Result<PathBuf
     if !resolved.starts_with(&root) || !resolved.is_dir() {
         return Err(ProviderError::Workspace(workspace.to_string()));
     }
-    Ok(resolved)
+    Ok((root, resolved))
+}
+
+fn validate_targets(
+    request: &RequestEnvelope,
+    repository_root: &Path,
+    workspace_root: &Path,
+) -> Result<(), ProviderError> {
+    for target in &request.targets {
+        let target_text = target.as_str();
+        if request.workspace.as_str() != "."
+            && target_text != request.workspace.as_str()
+            && !target_text
+                .strip_prefix(request.workspace.as_str())
+                .is_some_and(|suffix| suffix.starts_with('/'))
+        {
+            return Err(ProviderError::PathEscape(target.to_string()));
+        }
+        let candidate = repository_root.join(target_text);
+        let resolved = canonical_existing_ancestor(&candidate, target)?;
+        if !resolved.starts_with(workspace_root) {
+            return Err(ProviderError::PathEscape(target.to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn canonical_existing_ancestor(
+    candidate: &Path,
+    target: &RepoPath,
+) -> Result<PathBuf, ProviderError> {
+    let mut current = candidate;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(_) => {
+                return fs::canonicalize(current)
+                    .map_err(|_| ProviderError::PathEscape(target.to_string()));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                current = current
+                    .parent()
+                    .ok_or_else(|| ProviderError::PathEscape(target.to_string()))?;
+            }
+            Err(_) => return Err(ProviderError::PathEscape(target.to_string())),
+        }
+    }
 }
 
 fn elapsed_ms(started: Instant, timeout_ms: u64) -> u64 {
