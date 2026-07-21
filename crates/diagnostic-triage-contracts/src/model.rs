@@ -9,7 +9,6 @@ use std::collections::HashSet;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
-use sha2::{Digest, Sha256};
 
 use crate::{
     AdapterId, ContractError, Fingerprint, Language, Nullable, ObjectId, RepoPath, Sha256Digest,
@@ -1205,10 +1204,6 @@ impl Decision {
     }
 }
 
-fn sha256(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
 impl Evidence {
     pub fn validate(&self) -> Result<(), ContractError> {
         check_string(&self.media_type, "media_type", 128, true)?;
@@ -1236,7 +1231,7 @@ impl Evidence {
                         "retained byte count mismatches evidence content",
                     ));
                 }
-                if sha256(content.as_bytes()) != self.sha256.as_str() {
+                if Sha256Digest::compute(content.as_bytes()) != self.sha256 {
                     return Err(model_error("evidence digest mismatch"));
                 }
                 Ok(())
