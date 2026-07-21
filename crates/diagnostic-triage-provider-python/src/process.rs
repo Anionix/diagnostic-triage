@@ -26,6 +26,7 @@ use std::os::fd::AsFd;
 const IO_CHUNK_BYTES: usize = 8 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
+const PROCESS_GROUP_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProcessLimits {
@@ -714,10 +715,25 @@ fn terminate_child(
     group_signal: fn(u32) -> io::Result<()>,
 ) -> Result<(), ProcessError> {
     let deadline = Instant::now()
-        .checked_add(TERMINATION_GRACE)
+        .checked_add(PROCESS_GROUP_GRACE)
         .unwrap_or_else(Instant::now);
     let mut errors = Vec::new();
-    let group_signal_error = group_signal(process_group).err();
+    let leader_exited_before_signal = if exit_status.is_some() {
+        true
+    } else {
+        match child_exited_without_reaping(child) {
+            Ok(exited) => exited,
+            Err(source) => {
+                errors.push(ProcessError::Wait(source));
+                false
+            }
+        }
+    };
+    let group_signal_error = if exit_status.is_some() {
+        None
+    } else {
+        group_signal(process_group).err()
+    };
     let group_signal_failed = group_signal_error.is_some();
     if exit_status.is_none() {
         match child.try_wait() {
@@ -743,7 +759,9 @@ fn terminate_child(
     let zombie_only_permission_race = matches!(
         (&group_signal_error, &group_wait),
         (Some(source), Ok(true))
-            if source.kind() == io::ErrorKind::PermissionDenied && exit_status.is_some()
+            if source.kind() == io::ErrorKind::PermissionDenied
+                && leader_exited_before_signal
+                && exit_status.is_some()
     );
     if let Some(source) = group_signal_error {
         if !zombie_only_permission_race {
@@ -788,10 +806,7 @@ fn signal_process_group(_: u32) -> io::Result<()> {
 
 #[cfg(unix)]
 fn process_group_exists(process_group: u32) -> io::Result<bool> {
-    use rustix::{
-        io::Errno,
-        process::{Pid, test_kill_process_group},
-    };
+    use rustix::process::{Pid, test_kill_process_group};
 
     let process_group = i32::try_from(process_group)
         .ok()
@@ -799,11 +814,17 @@ fn process_group_exists(process_group: u32) -> io::Result<bool> {
         .ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "process group must be nonzero")
         })?;
-    match test_kill_process_group(process_group) {
+    map_process_group_probe(test_kill_process_group(process_group))
+}
+
+#[cfg(unix)]
+fn map_process_group_probe(result: Result<(), rustix::io::Errno>) -> io::Result<bool> {
+    use rustix::io::Errno;
+
+    match result {
         Err(Errno::SRCH) => Ok(false),
-        // EPERM means the group is still present but the probe cannot signal
-        // it. Treat it as live and retry until the bounded cleanup deadline.
-        Ok(()) | Err(Errno::PERM) => Ok(true),
+        Ok(()) => Ok(true),
+        Err(Errno::PERM) => Err(io::Error::from(Errno::PERM)),
         Err(error) => Err(io::Error::from(error)),
     }
 }
@@ -1083,6 +1104,12 @@ mod tests {
             .expect_err("a persistent group-probe EPERM must propagate");
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let production_error =
+            super::map_process_group_probe(Err(rustix::io::Errno::PERM)).unwrap_err();
+        assert_eq!(
+            production_error.kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
     }
 
     #[cfg(unix)]

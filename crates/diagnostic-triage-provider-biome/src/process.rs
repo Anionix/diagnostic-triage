@@ -29,6 +29,7 @@ use std::os::fd::AsFd;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
+const PROCESS_GROUP_GRACE: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProcessLimits {
@@ -222,6 +223,7 @@ fn run_direct_with_reader_probe(
         }
     }
 
+    let duration = started.elapsed().min(limits.timeout);
     let (status, stdout, stderr) =
         finish_execution(&mut child, &mut readers, exit_status, errors, group_signal)?;
     let reason = forced_reason
@@ -245,7 +247,7 @@ fn run_direct_with_reader_probe(
             .flatten(),
         stdout,
         stderr,
-        duration: started.elapsed().min(limits.timeout),
+        duration,
     })
 }
 
@@ -620,10 +622,25 @@ fn terminate_child(
     group_signal: fn(u32) -> io::Result<()>,
 ) -> Result<(), ProcessError> {
     let deadline = Instant::now()
-        .checked_add(TERMINATION_GRACE)
+        .checked_add(PROCESS_GROUP_GRACE)
         .unwrap_or_else(Instant::now);
     let mut errors = Vec::new();
-    let group_signal_error = group_signal(process_group).err();
+    let leader_exited_before_signal = if exit_status.is_some() {
+        true
+    } else {
+        match child_exited_without_reaping(child) {
+            Ok(exited) => exited,
+            Err(source) => {
+                errors.push(ProcessError::Wait(source));
+                false
+            }
+        }
+    };
+    let group_signal_error = if exit_status.is_some() {
+        None
+    } else {
+        group_signal(process_group).err()
+    };
     let group_signal_failed = group_signal_error.is_some();
     if exit_status.is_none() {
         match child.try_wait() {
@@ -649,7 +666,9 @@ fn terminate_child(
     let zombie_only_permission_race = matches!(
         (&group_signal_error, &group_wait),
         (Some(source), Ok(true))
-            if source.kind() == io::ErrorKind::PermissionDenied && exit_status.is_some()
+            if source.kind() == io::ErrorKind::PermissionDenied
+                && leader_exited_before_signal
+                && exit_status.is_some()
     );
     if let Some(source) = group_signal_error {
         if !zombie_only_permission_race {
@@ -688,11 +707,15 @@ fn signal_process_group(_: u32) -> io::Result<()> {
 #[cfg(unix)]
 fn process_group_exists(process_group: u32) -> io::Result<bool> {
     let pid = process_group_pid(process_group)?;
-    match test_kill_process_group(pid) {
+    map_process_group_probe(test_kill_process_group(pid))
+}
+
+#[cfg(unix)]
+fn map_process_group_probe(result: Result<(), Errno>) -> io::Result<bool> {
+    match result {
         Err(Errno::SRCH) => Ok(false),
-        // EPERM means the group is still present but the probe cannot signal
-        // it. Treat it as live and retry until the bounded cleanup deadline.
-        Ok(()) | Err(Errno::PERM) => Ok(true),
+        Ok(()) => Ok(true),
+        Err(Errno::PERM) => Err(io::Error::from(Errno::PERM)),
         Err(error) => Err(error.into()),
     }
 }
@@ -994,6 +1017,36 @@ mod tests {
             .expect_err("a persistent group-probe EPERM must propagate");
 
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let production_error =
+            super::map_process_group_probe(Err(rustix::io::Errno::PERM)).unwrap_err();
+        assert_eq!(
+            production_error.kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn cleanup_time_is_excluded_from_tool_duration() {
+        fn delayed_signal(process_group: u32) -> std::io::Result<()> {
+            thread::sleep(Duration::from_millis(100));
+            signal_process_group(process_group)
+        }
+
+        let started = Instant::now();
+        let outcome = run_direct_with_group_signal(
+            OsStr::new("/usr/bin/true"),
+            &[],
+            Path::new("."),
+            limits(64, 64),
+            delayed_signal,
+        )
+        .expect("delayed cleanup remains a complete process outcome");
+
+        assert!(
+            started.elapsed().saturating_sub(outcome.duration) >= Duration::from_millis(80),
+            "cleanup delay leaked into tool duration"
+        );
     }
 
     #[test]
