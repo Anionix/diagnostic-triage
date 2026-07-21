@@ -1965,8 +1965,7 @@ mod tests {
             Err(std::io::Error::from(rustix::io::Errno::PERM))
         }
 
-        let (mut child, mut pipes) =
-            super::spawn_piped_child(&ProcessSpec::new("/usr/bin/true")).unwrap();
+        let (mut child, mut pipes) = super::spawn_piped_child(&ProcessSpec::new("true")).unwrap();
         while !super::child_exited_without_reaping(&child).unwrap() {
             std::thread::sleep(Duration::from_millis(1));
         }

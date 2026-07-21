@@ -1103,7 +1103,7 @@ mod tests {
         let _guard = process_test_guard();
         SIGNAL_CALLS.store(0, Ordering::SeqCst);
         let error = run_bounded_with_group_signal(
-            &ProcessSpec::new("/usr/bin/true"),
+            &ProcessSpec::new("true"),
             ProcessLimits {
                 timeout: Duration::from_secs(2),
                 max_stdout_bytes: 64,
