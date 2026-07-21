@@ -1,0 +1,5 @@
+[
+  {"code":"F401","filename":"/repo/src/a.py","location":{"row":1,"column":8},"end_location":{"row":1,"column":10},"message":"os imported but unused","severity":"error","fix":{"applicability":"safe","edits":[{"content":"","location":{"row":1,"column":1},"end_location":{"row":1,"column":10},"future_edit_field":"preserved"}],"message":"Remove unused import: os","future_fix_field":{"mode":"strict"}}},
+  {"code":"RUF027","filename":"src/b.py","location":{"row":2,"column":3},"end_location":{"row":2,"column":12},"message":"possible f-string","severity":"warning","fix":{"applicability":"unsafe","edits":[{"content":"f\"value={value}\"","location":{"row":2,"column":3},"end_location":{"row":2,"column":12}}],"message":"Convert to an f-string"}},
+  {"code":"E501","filename":"src/c.py","location":{"row":4,"column":89},"end_location":{"row":4,"column":90},"message":"line too long","severity":"warning","fix":{"applicability":"display","edits":[{"content":"\n","location":{"row":4,"column":89},"end_location":{"row":4,"column":90}}],"message":"Wrap the line"}}
+]

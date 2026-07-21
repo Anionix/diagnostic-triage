@@ -1,0 +1,1 @@
+[{"code":"F401","filename":"../secret.py","location":{"row":1,"column":1},"end_location":{"row":1,"column":2},"message":"escape","severity":"error","fix":null}]
