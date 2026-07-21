@@ -150,13 +150,11 @@ fn recognize_secret_key(value: &str, index: usize) -> Option<SecretKeyMatch> {
     if cursor - key_start > MAX_SPAN || needs_alphanumeric {
         return None;
     }
-    let suffix_allowed = value.get(cursor..).is_some_and(|suffix| {
-        suffix.is_empty()
-            || suffix
-                .as_bytes()
-                .first()
-                .is_some_and(|byte| matches!(byte, b' ' | b'=' | b':'))
-    });
+    let suffix_allowed = cursor == value.len()
+        || bytes
+            .get(cursor)
+            .is_some_and(|byte| matches!(byte, b'=' | b':'))
+        || skip_assignment_whitespace(value, cursor) > cursor;
     if !suffix_allowed || !is_secret_key(&normalized) {
         return None;
     }
@@ -193,6 +191,120 @@ fn is_secret_key(value: &str) -> bool {
             | "refreshtoken"
             | "privatekey"
     )
+}
+
+fn unquoted_secret_at(value: &str, index: usize) -> Option<(usize, usize)> {
+    let matched = recognize_secret_key(value, index)?;
+    let bytes = value.as_bytes();
+    let mut cursor = matched.end;
+    if matched.cli_dashes > 0 {
+        if bytes.get(cursor) == Some(&b'=') {
+            let value_start = cursor + 1;
+            cursor = skip_assignment_whitespace(value, value_start);
+            if cursor > value_start && looks_like_assignment(value, cursor) {
+                return None;
+            }
+        } else if skip_assignment_whitespace(value, cursor) > cursor {
+            cursor = skip_assignment_whitespace(value, cursor);
+            if matches!(bytes.get(cursor), Some(b'=' | b':')) {
+                return None;
+            }
+            if looks_like_assignment(value, cursor) {
+                return None;
+            }
+        } else {
+            return None;
+        }
+    } else {
+        cursor = skip_assignment_whitespace(value, cursor);
+        if !matches!(bytes.get(cursor), Some(b'=' | b':')) {
+            return None;
+        }
+        let value_start = cursor + 1;
+        cursor = skip_assignment_whitespace(value, value_start);
+        if matches!(bytes.get(cursor), Some(b'=' | b':'))
+            || (cursor > value_start && looks_like_assignment(value, cursor))
+        {
+            return None;
+        }
+    }
+    if cursor >= bytes.len()
+        || bytes.get(cursor).is_some_and(|byte| is_quote(*byte))
+        || (bytes.get(cursor) == Some(&b'\\')
+            && bytes.get(cursor + 1).is_some_and(|byte| is_quote(*byte)))
+    {
+        return None;
+    }
+    let end = unquoted_value_end(value, cursor);
+    (end > cursor).then_some((cursor, end))
+}
+
+fn unquoted_value_end(value: &str, start: usize) -> usize {
+    let bytes = value.as_bytes();
+    let mut cursor = start;
+    while cursor < value.len() {
+        let character = value[cursor..].chars().next().expect("UTF-8 boundary");
+        let ascii_delimiter = matches!(character, ' ' | ',' | ';' | '&');
+        if (character.is_whitespace() || ascii_delimiter)
+            && !(ascii_delimiter && is_escaped(bytes, start, cursor))
+        {
+            break;
+        }
+        cursor += character.len_utf8();
+    }
+    cursor
+}
+
+fn is_escaped(bytes: &[u8], start: usize, cursor: usize) -> bool {
+    let mut boundary = cursor;
+    while boundary > start && bytes[boundary - 1] == b'\\' {
+        boundary -= 1;
+    }
+    (cursor - boundary) % 2 == 1
+}
+
+fn skip_assignment_whitespace(value: &str, mut cursor: usize) -> usize {
+    const MARKERS: [&str; 5] = [
+        "[CONTROL-U+0009]",
+        "[CONTROL-U+000A]",
+        "[CONTROL-U+000B]",
+        "[CONTROL-U+000C]",
+        "[CONTROL-U+000D]",
+    ];
+    while cursor < value.len() {
+        if let Some(marker) = MARKERS
+            .iter()
+            .find(|marker| value[cursor..].starts_with(**marker))
+        {
+            cursor += marker.len();
+        } else {
+            let character = value[cursor..].chars().next().expect("UTF-8 boundary");
+            if !character.is_whitespace() {
+                break;
+            }
+            cursor += character.len_utf8();
+        }
+    }
+    cursor
+}
+
+fn looks_like_assignment(value: &str, start: usize) -> bool {
+    let mut cursor = start;
+    while let Some(character) = value[cursor..].chars().next() {
+        if !(character.is_alphanumeric() || matches!(character, '_' | '-')) {
+            break;
+        }
+        cursor += character.len_utf8();
+    }
+    cursor > start
+        && value
+            .as_bytes()
+            .get(skip_assignment_whitespace(value, cursor))
+            .is_some_and(|byte| matches!(byte, b'=' | b':'))
+}
+
+fn is_quote(byte: u8) -> bool {
+    matches!(byte, b'\'' | b'"')
 }
 
 fn is_bidi_control(character: char) -> bool {
@@ -235,7 +347,7 @@ fn is_pinned_format_character(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SanitizeError, recognize_secret_key, sanitize_external_text};
+    use super::{SanitizeError, recognize_secret_key, sanitize_external_text, unquoted_secret_at};
 
     #[test]
     fn neutralizes_pinned_unsafe_characters_without_changing_safe_unicode() {
@@ -346,5 +458,72 @@ mod tests {
         for index in (0..input.len()).step_by(prefix.len()) {
             assert_eq!(recognize_secret_key(&input, index), None);
         }
+    }
+
+    #[test]
+    fn parses_only_present_unquoted_secret_value_spans() {
+        let cases = [
+            ("token=secret next=ok", "secret"),
+            ("--client-secret tiny rest", "tiny"),
+            ("-API_KEY=value;next", "value"),
+            ("token=foo\\ bar tail", "foo\\ bar"),
+            ("token=trailing\\", "trailing\\"),
+            ("token[CONTROL-U+0009]=secret", "secret"),
+            ("token\u{2003}=secret", "secret"),
+            ("--token[CONTROL-U+0009]secret", "secret"),
+            ("token=secret\u{2003}next", "secret"),
+            (
+                "token=secret[CONTROL-U+000A]next=ok",
+                "secret[CONTROL-U+000A]next=ok",
+            ),
+        ];
+        for (input, expected_value) in cases {
+            let (start, end) = unquoted_secret_at(input, 0).unwrap();
+            assert_eq!(&input[start..end], expected_value, "input {input:?}");
+        }
+
+        for input in [
+            "token",
+            "token=",
+            "token=;",
+            "token=,next",
+            "token= next=ok",
+            "token=: next=ok",
+            "--token",
+            "--token=",
+            "--token= next=ok",
+            "--token:value",
+            "--token =value",
+            "token='secret'",
+            "token=\"secret\"",
+            r#"token=\"secret\""#,
+            "token secret",
+        ] {
+            assert_eq!(unquoted_secret_at(input, 0), None, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn escaped_ascii_delimiters_use_backslash_parity() {
+        for delimiter in [' ', ',', ';', '&'] {
+            for slash_count in 0..=4 {
+                let slashes = "\\".repeat(slash_count);
+                let input = format!("token=value{slashes}{delimiter}tail");
+                let (_, end) = unquoted_secret_at(&input, 0).unwrap();
+                let expected_end = if slash_count % 2 == 0 {
+                    input.find(delimiter).unwrap()
+                } else {
+                    input.len()
+                };
+                assert_eq!(end, expected_end, "input {input:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn repeated_nonsecret_assignments_are_preserved() {
+        let input = "name=value;".repeat(10_000);
+        let actual = sanitize_external_text(&input, input.len()).unwrap();
+        assert_eq!(actual.as_str(), input);
     }
 }
