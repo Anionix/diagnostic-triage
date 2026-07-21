@@ -127,9 +127,17 @@ pub(crate) fn run_direct(
     current_dir: &Path,
     limits: ProcessLimits,
 ) -> Result<ProcessOutcome, ProcessError> {
-    run_direct_with_group_signal(program, argv, current_dir, limits, signal_process_group)
+    run_direct_with_reader_probe(
+        program,
+        argv,
+        current_dir,
+        limits,
+        GroupSignal::Production,
+        None,
+    )
 }
 
+#[cfg(test)]
 fn run_direct_with_group_signal(
     program: &OsStr,
     argv: &[String],
@@ -137,16 +145,22 @@ fn run_direct_with_group_signal(
     limits: ProcessLimits,
     group_signal: fn(u32) -> io::Result<()>,
 ) -> Result<ProcessOutcome, ProcessError> {
-    run_direct_with_reader_probe(program, argv, current_dir, limits, group_signal, None)
+    run_direct_with_reader_probe(
+        program,
+        argv,
+        current_dir,
+        limits,
+        GroupSignal::Injected(group_signal),
+        None,
+    )
 }
 
 #[cfg(test)]
-fn run_direct_with_group_signal_and_reader_probe(
+fn run_direct_with_production_signal_and_reader_probe(
     program: &OsStr,
     argv: &[String],
     current_dir: &Path,
     limits: ProcessLimits,
-    group_signal: fn(u32) -> io::Result<()>,
     reader_join_probe: Arc<AtomicUsize>,
 ) -> Result<ProcessOutcome, ProcessError> {
     run_direct_with_reader_probe(
@@ -154,9 +168,30 @@ fn run_direct_with_group_signal_and_reader_probe(
         argv,
         current_dir,
         limits,
-        group_signal,
+        GroupSignal::Production,
         Some(reader_join_probe),
     )
+}
+
+#[derive(Clone, Copy)]
+enum GroupSignal {
+    Production,
+    #[cfg(test)]
+    Injected(fn(u32) -> io::Result<()>),
+}
+
+impl GroupSignal {
+    fn send(self, process_group: u32) -> io::Result<()> {
+        match self {
+            Self::Production => signal_process_group(process_group),
+            #[cfg(test)]
+            Self::Injected(callback) => callback(process_group),
+        }
+    }
+
+    fn is_trusted_production(self) -> bool {
+        matches!(self, Self::Production)
+    }
 }
 
 fn run_direct_with_reader_probe(
@@ -164,7 +199,7 @@ fn run_direct_with_reader_probe(
     argv: &[String],
     current_dir: &Path,
     limits: ProcessLimits,
-    group_signal: fn(u32) -> io::Result<()>,
+    group_signal: GroupSignal,
     reader_join_probe: Option<Arc<AtomicUsize>>,
 ) -> Result<ProcessOutcome, ProcessError> {
     if cfg!(not(unix)) {
@@ -307,7 +342,7 @@ fn spawn_capture_readers(
 fn cleanup_setup_failure(
     child: &mut ChildGuard,
     error: ProcessError,
-    group_signal: fn(u32) -> io::Result<()>,
+    group_signal: GroupSignal,
 ) -> ProcessError {
     let mut errors = vec![error];
     let mut exit_status = None;
@@ -326,7 +361,7 @@ fn finish_execution(
     readers: &mut CaptureReaders,
     mut exit_status: Option<ExitStatus>,
     mut errors: Vec<ProcessError>,
-    group_signal: fn(u32) -> io::Result<()>,
+    group_signal: GroupSignal,
 ) -> Result<(ExitStatus, CapturedOutput, CapturedOutput), ProcessError> {
     let termination = terminate_and_reap(child, &mut exit_status, group_signal);
     if let Err(error) = termination {
@@ -600,7 +635,7 @@ impl Drop for ChildGuard {
                 &mut self.child,
                 self.process_group,
                 &mut exit_status,
-                signal_process_group,
+                GroupSignal::Production,
             );
         }
     }
@@ -609,7 +644,7 @@ impl Drop for ChildGuard {
 fn terminate_and_reap(
     child: &mut ChildGuard,
     exit_status: &mut Option<ExitStatus>,
-    group_signal: fn(u32) -> io::Result<()>,
+    group_signal: GroupSignal,
 ) -> Result<(), ProcessError> {
     terminate_child(
         &mut child.child,
@@ -623,44 +658,16 @@ fn terminate_child(
     child: &mut Child,
     process_group: u32,
     exit_status: &mut Option<ExitStatus>,
-    group_signal: fn(u32) -> io::Result<()>,
+    group_signal: GroupSignal,
 ) -> Result<(), ProcessError> {
     let deadline = Instant::now()
         .checked_add(PROCESS_GROUP_GRACE)
         .unwrap_or_else(Instant::now);
     let mut errors = Vec::new();
-    let leader_exited_before_signal = if exit_status.is_some() {
-        true
-    } else {
-        match child_exited_without_reaping(child) {
-            Ok(exited) => exited,
-            Err(source) => {
-                errors.push(ProcessError::Wait(source));
-                false
-            }
-        }
-    };
     let group_signal_error = if exit_status.is_some() {
         None
     } else {
-        group_signal(process_group).err()
-    };
-    // LLM cleanup contract: SIGNALING -> REAPING only suppresses a native
-    // zombie-race EPERM after a non-reaping exit observation; injected signal
-    // failures remain typed cleanup evidence.
-    let leader_exited_during_native_permission_race = match group_signal_error.as_ref() {
-        Some(source)
-            if !leader_exited_before_signal && is_native_group_permission_error(source) =>
-        {
-            match child_exited_without_reaping(child) {
-                Ok(exited) => exited,
-                Err(source) => {
-                    errors.push(ProcessError::Wait(source));
-                    false
-                }
-            }
-        }
-        _ => false,
+        group_signal.send(process_group).err()
     };
     let group_signal_failed = group_signal_error.is_some();
     if exit_status.is_none() {
@@ -684,17 +691,18 @@ fn terminate_child(
         errors.push(ProcessError::Unreaped);
     }
     let group_wait = wait_for_process_group(process_group, deadline);
-    let zombie_only_permission_race = matches!(
-        (&group_signal_error, &group_wait),
-        (Some(source), Ok(true))
-            if source.kind() == io::ErrorKind::PermissionDenied
-                && is_native_group_permission_error(source)
-                && (leader_exited_before_signal
-                    || leader_exited_during_native_permission_race)
-                && exit_status.is_some()
-    );
+    // LLM cleanup contract: SIGNALING -> REAPING -> GROUP_ABSENT suppresses
+    // only native EPERM from the trusted production callback; injected signal
+    // failures remain typed cleanup evidence.
+    let vanished_after_native_permission_race = group_signal.is_trusted_production()
+        && exit_status.is_some()
+        && matches!(
+            (&group_signal_error, &group_wait),
+            (Some(source), Ok(true))
+                if is_native_group_permission_error(source)
+        );
     if let Some(source) = group_signal_error {
-        if !zombie_only_permission_race {
+        if !vanished_after_native_permission_race {
             errors.push(ProcessError::GroupSignal(source));
         }
     }
@@ -819,7 +827,7 @@ fn combine_errors(mut errors: Vec<ProcessError>) -> ProcessError {
 mod tests {
     use super::{
         IncompleteReason, ProcessError, ProcessLimits, ProcessState, run_direct,
-        run_direct_with_group_signal, run_direct_with_group_signal_and_reader_probe,
+        run_direct_with_group_signal, run_direct_with_production_signal_and_reader_probe,
         signal_process_group,
     };
     use std::{
@@ -1018,6 +1026,66 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn injected_raw_native_permission_error_remains_typed_after_group_disappears() {
+        fn raw_permission_error(_: u32) -> std::io::Result<()> {
+            Err(std::io::Error::from(rustix::io::Errno::PERM))
+        }
+
+        let error = run_direct_with_group_signal(
+            OsStr::new("/usr/bin/true"),
+            &[],
+            Path::new("."),
+            limits(64, 64),
+            raw_permission_error,
+        )
+        .expect_err("an injected raw native EPERM must not complete");
+
+        assert!(contains_group_signal(&error), "error: {error:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn reaped_leader_is_not_signalled_again() {
+        use std::{
+            os::unix::process::CommandExt,
+            sync::atomic::{AtomicUsize, Ordering},
+        };
+
+        static SIGNAL_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn count_signal(process_group: u32) -> std::io::Result<()> {
+            SIGNAL_CALLS.fetch_add(1, Ordering::SeqCst);
+            if process_group == 0 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "process group must be positive",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        let mut command = Command::new("/usr/bin/true");
+        command.process_group(0);
+        let mut child = command
+            .spawn()
+            .expect("true starts in a fresh process group");
+        let process_group = child.id();
+        let mut exit_status = Some(child.wait().expect("leader is reaped"));
+        SIGNAL_CALLS.store(0, Ordering::SeqCst);
+
+        super::terminate_child(
+            &mut child,
+            process_group,
+            &mut exit_status,
+            super::GroupSignal::Injected(count_signal),
+        )
+        .expect("an already-reaped empty process group needs no signal");
+
+        assert_eq!(SIGNAL_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn transient_group_probe_permission_error_is_retried() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1068,15 +1136,17 @@ mod tests {
             signal_process_group(process_group)
         }
 
+        let mut process_limits = limits(64, 64);
+        process_limits.timeout = Duration::from_millis(30);
         let started = Instant::now();
         let outcome = run_direct_with_group_signal(
-            OsStr::new("/usr/bin/true"),
-            &[],
+            OsStr::new("sleep"),
+            &["1".to_owned()],
             Path::new("."),
-            limits(64, 64),
+            process_limits,
             delayed_signal,
         )
-        .expect("delayed cleanup remains a complete process outcome");
+        .expect("delayed successful cleanup remains a typed process outcome");
 
         assert!(
             started.elapsed().saturating_sub(outcome.duration) >= Duration::from_millis(80),
@@ -1137,7 +1207,7 @@ mod tests {
         ));
         let started = Instant::now();
         let reader_join_probe = Arc::new(AtomicUsize::new(0));
-        let result = run_direct_with_group_signal_and_reader_probe(
+        let result = run_direct_with_production_signal_and_reader_probe(
             OsStr::new("python3"),
             &[
                 "-c".to_owned(),
@@ -1156,7 +1226,6 @@ os._exit(0)"#
             ],
             Path::new("."),
             limits(64, 64),
-            signal_process_group,
             Arc::clone(&reader_join_probe),
         );
         let escaped = fs::read_to_string(&marker).expect("escaped process records its pid");

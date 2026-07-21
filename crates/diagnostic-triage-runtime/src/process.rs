@@ -31,6 +31,52 @@ const TERMINATION_GRACE: Duration = Duration::from_millis(250);
 // them; the probe still returns immediately once the group is absent.
 const PROCESS_GROUP_GRACE: Duration = Duration::from_secs(2);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GroupSignalOrigin {
+    Native,
+    #[cfg(test)]
+    Injected,
+}
+
+#[derive(Clone, Copy)]
+struct GroupSignal {
+    callback: fn(u32) -> io::Result<()>,
+    origin: GroupSignalOrigin,
+}
+
+impl GroupSignal {
+    fn native() -> Self {
+        Self {
+            callback: signal_process_group,
+            origin: GroupSignalOrigin::Native,
+        }
+    }
+
+    #[cfg(test)]
+    const fn injected(callback: fn(u32) -> io::Result<()>) -> Self {
+        Self {
+            callback,
+            origin: GroupSignalOrigin::Injected,
+        }
+    }
+
+    fn send(self, process_group: u32) -> io::Result<()> {
+        (self.callback)(process_group)
+    }
+
+    fn may_suppress_permission_error(
+        self,
+        source: &io::Error,
+        leader_reaped: bool,
+        group_absent: bool,
+    ) -> bool {
+        self.origin == GroupSignalOrigin::Native
+            && is_native_group_permission_error(source)
+            && leader_reaped
+            && group_absent
+    }
+}
+
 /// Resource limits for one direct child invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessLimits {
@@ -684,16 +730,17 @@ fn cleanup_execution(
     limits: &ProcessLimits,
     exit_status: &mut Option<ExitStatus>,
 ) -> Result<(), ProcessError> {
-    cleanup_execution_with_group_signal(
+    cleanup_execution_inner(
         child,
         pipes,
         capture,
         limits,
         exit_status,
-        signal_process_group,
+        GroupSignal::native(),
     )
 }
 
+#[cfg(test)]
 fn cleanup_execution_with_group_signal(
     child: &mut ChildCleanupGuard,
     pipes: &mut PipeHandles,
@@ -702,8 +749,26 @@ fn cleanup_execution_with_group_signal(
     exit_status: &mut Option<ExitStatus>,
     group_signal: fn(u32) -> io::Result<()>,
 ) -> Result<(), ProcessError> {
+    cleanup_execution_inner(
+        child,
+        pipes,
+        capture,
+        limits,
+        exit_status,
+        GroupSignal::injected(group_signal),
+    )
+}
+
+fn cleanup_execution_inner(
+    child: &mut ChildCleanupGuard,
+    pipes: &mut PipeHandles,
+    capture: &mut CaptureState,
+    limits: &ProcessLimits,
+    exit_status: &mut Option<ExitStatus>,
+    group_signal: GroupSignal,
+) -> Result<(), ProcessError> {
     let mut errors = Vec::new();
-    if let Err(error) = terminate_and_reap_with_group_signal(child, exit_status, group_signal) {
+    if let Err(error) = terminate_and_reap_inner(child, exit_status, group_signal) {
         push_error(&mut errors, error);
     }
     if let Err(error) = drain_after_termination(pipes, capture, limits) {
@@ -729,17 +794,18 @@ fn cleanup_after_process_error(
     exit_status: &mut Option<ExitStatus>,
     primary: ProcessError,
 ) -> ProcessError {
-    cleanup_after_process_error_with_group_signal(
+    cleanup_after_process_error_inner(
         child,
         pipes,
         capture,
         limits,
         exit_status,
         primary,
-        signal_process_group,
+        GroupSignal::native(),
     )
 }
 
+#[cfg(test)]
 fn cleanup_after_process_error_with_group_signal(
     child: &mut ChildCleanupGuard,
     pipes: &mut PipeHandles,
@@ -749,15 +815,30 @@ fn cleanup_after_process_error_with_group_signal(
     primary: ProcessError,
     group_signal: fn(u32) -> io::Result<()>,
 ) -> ProcessError {
-    let mut errors = vec![primary];
-    if let Err(error) = cleanup_execution_with_group_signal(
+    cleanup_after_process_error_inner(
         child,
         pipes,
         capture,
         limits,
         exit_status,
-        group_signal,
-    ) {
+        primary,
+        GroupSignal::injected(group_signal),
+    )
+}
+
+fn cleanup_after_process_error_inner(
+    child: &mut ChildCleanupGuard,
+    pipes: &mut PipeHandles,
+    capture: &mut CaptureState,
+    limits: &ProcessLimits,
+    exit_status: &mut Option<ExitStatus>,
+    primary: ProcessError,
+    group_signal: GroupSignal,
+) -> ProcessError {
+    let mut errors = vec![primary];
+    if let Err(error) =
+        cleanup_execution_inner(child, pipes, capture, limits, exit_status, group_signal)
+    {
         push_error(&mut errors, error);
     }
     combine_errors(errors)
@@ -875,13 +956,6 @@ fn validate_manifest_first_spec(
 }
 
 fn spawn_piped_child(spec: &ProcessSpec) -> Result<(ChildCleanupGuard, PipeHandles), ProcessError> {
-    spawn_piped_child_with_group_signal(spec, signal_process_group)
-}
-
-fn spawn_piped_child_with_group_signal(
-    spec: &ProcessSpec,
-    group_signal: fn(u32) -> io::Result<()>,
-) -> Result<(ChildCleanupGuard, PipeHandles), ProcessError> {
     let mut child = ChildCleanupGuard::new(spawn_child(spec)?);
     let pipes = (|| {
         let stdin = child
@@ -902,19 +976,22 @@ fn spawn_piped_child_with_group_signal(
     })();
     match pipes {
         Ok(pipes) => Ok((child, pipes)),
-        Err(primary) => Err(cleanup_spawn_failure(&mut child, primary, group_signal)),
+        Err(primary) => Err(cleanup_spawn_failure(
+            &mut child,
+            primary,
+            GroupSignal::native(),
+        )),
     }
 }
 
 fn cleanup_spawn_failure(
     child: &mut ChildCleanupGuard,
     primary: ProcessError,
-    group_signal: fn(u32) -> io::Result<()>,
+    group_signal: GroupSignal,
 ) -> ProcessError {
     let mut errors = vec![primary];
     let mut exit_status = None;
-    if let Err(error) = terminate_and_reap_with_group_signal(child, &mut exit_status, group_signal)
-    {
+    if let Err(error) = terminate_and_reap_inner(child, &mut exit_status, group_signal) {
         push_error(&mut errors, error);
     }
     if exit_status.is_some() {
@@ -1228,51 +1305,23 @@ fn terminate_and_reap(
     child: &mut Child,
     exit_status: &mut Option<ExitStatus>,
 ) -> Result<(), ProcessError> {
-    terminate_and_reap_with_group_signal(child, exit_status, signal_process_group)
+    terminate_and_reap_inner(child, exit_status, GroupSignal::native())
 }
 
-fn terminate_and_reap_with_group_signal(
+fn terminate_and_reap_inner(
     child: &mut Child,
     exit_status: &mut Option<ExitStatus>,
-    group_signal: fn(u32) -> io::Result<()>,
+    group_signal: GroupSignal,
 ) -> Result<(), ProcessError> {
     let process_group = child.id();
     let deadline = Instant::now()
         .checked_add(PROCESS_GROUP_GRACE)
         .unwrap_or_else(Instant::now);
     let mut errors = Vec::new();
-    let leader_exited_before_signal = if exit_status.is_some() {
-        true
-    } else {
-        match child_exited_without_reaping(child) {
-            Ok(exited) => exited,
-            Err(source) => {
-                errors.push(ProcessError::Wait(source));
-                false
-            }
-        }
-    };
     let group_signal_error = if exit_status.is_some() {
         None
     } else {
-        group_signal(process_group).err()
-    };
-    // LLM cleanup contract: SIGNALING -> REAPING only suppresses a native
-    // zombie-race EPERM after a non-reaping exit observation; injected signal
-    // failures remain typed cleanup evidence.
-    let leader_exited_during_native_permission_race = match group_signal_error.as_ref() {
-        Some(source)
-            if !leader_exited_before_signal && is_native_group_permission_error(source) =>
-        {
-            match child_exited_without_reaping(child) {
-                Ok(exited) => exited,
-                Err(source) => {
-                    errors.push(ProcessError::Wait(source));
-                    false
-                }
-            }
-        }
-        _ => false,
+        group_signal.send(process_group).err()
     };
     let group_signal_failed = group_signal_error.is_some();
     if exit_status.is_none() {
@@ -1296,15 +1345,16 @@ fn terminate_and_reap_with_group_signal(
         errors.push(ProcessError::Unreaped);
     }
     let group_wait = wait_for_process_group(process_group, deadline);
-    let zombie_only_permission_race = matches!(
-        (&group_signal_error, &group_wait),
-        (Some(source), Ok(true))
-            if source.kind() == io::ErrorKind::PermissionDenied
-                && is_native_group_permission_error(source)
-                && (leader_exited_before_signal
-                    || leader_exited_during_native_permission_race)
-                && exit_status.is_some()
-    );
+    // LLM cleanup contract: SIGNALING -> REAPED -> GROUP_ABSENT may suppress
+    // only an OS-native zombie-race EPERM. Injected callbacks are a distinct
+    // origin and always remain typed cleanup evidence.
+    let zombie_only_permission_race = group_signal_error.as_ref().is_some_and(|source| {
+        group_signal.may_suppress_permission_error(
+            source,
+            exit_status.is_some(),
+            matches!(group_wait, Ok(true)),
+        )
+    });
     if let Some(source) = group_signal_error {
         if !zombie_only_permission_race {
             errors.push(ProcessError::GroupSignal(source));
@@ -1912,7 +1962,7 @@ mod tests {
         static SIGNAL_CALLS: AtomicUsize = AtomicUsize::new(0);
         fn deny_and_count(_: u32) -> std::io::Result<()> {
             SIGNAL_CALLS.fetch_add(1, Ordering::SeqCst);
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            Err(std::io::Error::from(rustix::io::Errno::PERM))
         }
 
         let (mut child, mut pipes) =
@@ -1938,6 +1988,19 @@ mod tests {
         assert!(contains_group_signal(&error), "error: {error:?}");
         assert!(exit_status.is_some());
         assert!(!child.armed, "reaped PGID must not remain armed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_permission_suppression_requires_every_proven_gate() {
+        let native_eperm = std::io::Error::from(rustix::io::Errno::PERM);
+        let native = super::GroupSignal::native();
+        let injected = super::GroupSignal::injected(super::signal_process_group);
+
+        assert!(native.may_suppress_permission_error(&native_eperm, true, true));
+        assert!(!injected.may_suppress_permission_error(&native_eperm, true, true));
+        assert!(!native.may_suppress_permission_error(&native_eperm, false, true));
+        assert!(!native.may_suppress_permission_error(&native_eperm, true, false));
     }
 
     #[cfg(unix)]
