@@ -11,6 +11,44 @@ impl SanitizedText {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MarkerKind {
+    Bidi,
+    Format,
+    Control,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GeneratedMarker {
+    start: usize,
+    end: usize,
+    kind: MarkerKind,
+    code_point: u32,
+}
+
+impl GeneratedMarker {
+    const fn new(start: usize, end: usize, kind: MarkerKind, code_point: u32) -> Self {
+        Self {
+            start,
+            end,
+            kind,
+            code_point,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NeutralizedText {
+    text: SanitizedText,
+    markers: Vec<GeneratedMarker>,
+}
+
+impl NeutralizedText {
+    fn as_str(&self) -> &str {
+        self.text.as_str()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub(crate) enum SanitizeError {
     #[error("sanitized text exceeds the {max_bytes}-byte output limit")]
@@ -50,6 +88,10 @@ impl BoundedText {
         Ok(())
     }
 
+    fn len(&self) -> usize {
+        self.value.len()
+    }
+
     fn finish(self) -> SanitizedText {
         SanitizedText(self.value)
     }
@@ -59,29 +101,47 @@ pub(crate) fn sanitize_external_text(
     value: &str,
     max_bytes: usize,
 ) -> Result<SanitizedText, SanitizeError> {
+    let neutralized = neutralize_external_text(value, max_bytes)?;
+    redact_unquoted_assignments(neutralized.as_str(), max_bytes)
+}
+
+fn neutralize_external_text(
+    value: &str,
+    max_bytes: usize,
+) -> Result<NeutralizedText, SanitizeError> {
     // LLM contract: UNTRUSTED -> NEUTRALIZED -> BOUNDED; overflow -> REJECTED.
     if value.len() > max_bytes {
         return Err(SanitizeError::OutputLimitExceeded { max_bytes });
     }
     let mut output = BoundedText::new(value.len(), max_bytes);
+    let mut markers = Vec::new();
     for character in value.chars() {
-        let kind = if is_bidi_control(character) {
-            Some("BIDI")
+        let marker = if is_bidi_control(character) {
+            Some((MarkerKind::Bidi, "BIDI"))
         } else if is_pinned_format_character(character) {
-            Some("FORMAT")
+            Some((MarkerKind::Format, "FORMAT"))
         } else if character.is_ascii_control() {
-            Some("CONTROL")
+            Some((MarkerKind::Control, "CONTROL"))
         } else {
             None
         };
-        if let Some(kind) = kind {
-            output.push_str(&format!("[{kind}-U+{:04X}]", u32::from(character)))?;
+        if let Some((kind, label)) = marker {
+            let start = output.len();
+            output.push_str(&format!("[{label}-U+{:04X}]", u32::from(character)))?;
+            markers.push(GeneratedMarker::new(
+                start,
+                output.len(),
+                kind,
+                u32::from(character),
+            ));
         } else {
             output.push_char(character)?;
         }
     }
-    let neutralized = output.finish();
-    redact_unquoted_assignments(neutralized.as_str(), max_bytes)
+    Ok(NeutralizedText {
+        text: output.finish(),
+        markers,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -368,7 +428,46 @@ fn is_pinned_format_character(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{SanitizeError, recognize_secret_key, sanitize_external_text, unquoted_secret_at};
+    use super::{
+        GeneratedMarker, MarkerKind, SanitizeError, neutralize_external_text, recognize_secret_key,
+        sanitize_external_text, unquoted_secret_at,
+    };
+
+    #[test]
+    fn records_only_generated_marker_provenance_in_output_order() {
+        let control = "[CONTROL-U+0009]";
+        let bidi = "[BIDI-U+202E]";
+        let format = "[FORMAT-U+180E]";
+        let expected = format!("{control}{bidi}{format}[CONTROL-U+0009]");
+        let actual =
+            neutralize_external_text("\t\u{202e}\u{180e}[CONTROL-U+0009]", expected.len()).unwrap();
+
+        assert_eq!(actual.as_str(), expected);
+        assert_eq!(
+            actual.markers,
+            [
+                GeneratedMarker::new(0, control.len(), MarkerKind::Control, 0x0009),
+                GeneratedMarker::new(
+                    control.len(),
+                    control.len() + bidi.len(),
+                    MarkerKind::Bidi,
+                    0x202e,
+                ),
+                GeneratedMarker::new(
+                    control.len() + bidi.len(),
+                    control.len() + bidi.len() + format.len(),
+                    MarkerKind::Format,
+                    0x180e,
+                ),
+            ]
+        );
+        assert_eq!(
+            neutralize_external_text("\0", control.len() - 1),
+            Err(SanitizeError::OutputLimitExceeded {
+                max_bytes: control.len() - 1,
+            })
+        );
+    }
 
     #[test]
     fn neutralizes_pinned_unsafe_characters_without_changing_safe_unicode() {
