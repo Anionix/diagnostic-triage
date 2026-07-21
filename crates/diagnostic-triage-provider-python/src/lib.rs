@@ -520,6 +520,8 @@ pub fn normalize_ruff_json(
             message: diagnostic.message,
             location: Some(Location {
                 path: normalized_path,
+                // Ruff JSON reports one-based Unicode scalar-value columns
+                // and an exclusive TextRange end, matching Location v1.
                 start: diagnostic.location.into(),
                 end: diagnostic.end_location.map(Into::into),
             }),

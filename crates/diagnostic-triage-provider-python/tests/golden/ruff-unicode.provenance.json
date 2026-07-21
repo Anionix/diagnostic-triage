@@ -1,0 +1,19 @@
+{
+  "schema_version": "diagnostic-triage.fixture-provenance/v1",
+  "tool": "ruff",
+  "tool_version": "ruff 0.15.14",
+  "nixpkgs_revision": "fca2dbd4c00c3063235e56bb91758e24fc67b7b8",
+  "working_directory": "repository root",
+  "command": "nix develop --command sh -c 'ruff check --no-cache --output-format json --select F821 --stdin-filename /repo/src/unicode.py - < crates/diagnostic-triage-provider-python/tests/golden/ruff-unicode.py | jq .'",
+  "expected_exit_code": 1,
+  "source_path": "crates/diagnostic-triage-provider-python/tests/golden/ruff-unicode.py",
+  "source_sha256": "d5cde7bc05380dd869ac749bfa356baea79656b8f558511fb8e518344affdc7c",
+  "output_path": "crates/diagnostic-triage-provider-python/tests/golden/ruff-unicode.json",
+  "output_sha256": "ba28b1bbab93f12402488f2dd74025a6570e7ed56be4c47e1877d79bc49bfd3e",
+  "coordinate_probe": {
+    "identifier": "y",
+    "unicode_scalar_start_column": 10,
+    "utf16_start_column": 11,
+    "utf8_byte_start_column": 13
+  }
+}

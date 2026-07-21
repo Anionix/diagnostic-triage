@@ -7,9 +7,18 @@ include = ["tests/test_contracts.py"]
 pythonVersion = "3.13"
 typeCheckingMode = "strict"
 
+[tool.ty.src]
+# This source is intentionally invalid Python: it is a pinned Ruff location
+# probe. Keep it out of repository-wide type checking, while direct `ty check`
+# on this path remains available for explicit fixture regeneration/validation.
+exclude = ["crates/diagnostic-triage-provider-python/tests/golden/ruff-unicode.py"]
+
 [tool.ruff]
 line-length = 88
 target-version = "py313"
+# The pinned source deliberately contains diagnostics for the Ruff provider
+# golden. Repository-wide linting excludes only this diagnostic fixture.
+extend-exclude = ["crates/diagnostic-triage-provider-python/tests/golden/ruff-unicode.py"]
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]

@@ -23,6 +23,10 @@ struct FakeCargo {
 #[cfg(unix)]
 impl FakeCargo {
     fn new() -> Self {
+        Self::with_check_output("{\"reason\":\"build-finished\",\"success\":true}\n")
+    }
+
+    fn with_check_output(check_output: &str) -> Self {
         use std::os::unix::fs::PermissionsExt;
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -35,12 +39,8 @@ impl FakeCargo {
         let program = root.join("cargo");
         fs::write(
             &program,
-            concat!(
-                "#!/bin/sh\n",
-                "if [ \"$1\" = \"--version\" ]; then printf 'cargo 1.93.1 (fixture)\\n'; exit 0; fi\n",
-                "if [ \"$1\" = \"clippy\" ] && [ \"$2\" = \"--version\" ]; then printf 'clippy 0.1.93 (fixture)\\n'; exit 0; fi\n",
-                "if [ \"$1\" = \"check\" ] || [ \"$1\" = \"clippy\" ]; then printf '%s\\n' '{\"reason\":\"build-finished\",\"success\":true}'; exit 0; fi\n",
-                "exit 91\n"
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'cargo 1.93.1 (fixture)\\n'; exit 0; fi\nif [ \"$1\" = \"clippy\" ] && [ \"$2\" = \"--version\" ]; then printf 'clippy 0.1.93 (fixture)\\n'; exit 0; fi\nif [ \"$1\" = \"check\" ]; then cat <<'DIAGNOSTIC_TRIAGE_CHECK_OUTPUT'\n{check_output}DIAGNOSTIC_TRIAGE_CHECK_OUTPUT\nexit 0\nfi\nif [ \"$1\" = \"clippy\" ]; then printf '%s\\n' '{{\"reason\":\"build-finished\",\"success\":true}}'; exit 0; fi\nexit 91\n"
             ),
         )
         .unwrap();
@@ -122,5 +122,50 @@ fn malformed_request_gets_exactly_one_incomplete_completion() {
         ProtocolEnvelope::Completion(value)
             if value.status == ExecutionStatus::Incomplete
                 && value.tool_exit_code.0.is_none()
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn malformed_rustc_span_gets_a_bounded_incomplete_completion() {
+    let fake = FakeCargo::with_check_output(include_str!("golden/cargo-invalid-span.jsonl"));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_diagnostic-triage-provider-rust"))
+        .current_dir(&fake.root)
+        .env("DIAGNOSTIC_TRIAGE_CARGO_BIN", &fake.program)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut manifest = String::new();
+    stdout.read_line(&mut manifest).unwrap();
+    let mut request_writer = child.stdin.take().unwrap();
+    request_writer.write_all(REQUEST).unwrap();
+    let status = child.wait_timeout(Duration::from_secs(2)).unwrap();
+    drop(request_writer);
+    let Some(status) = status else {
+        child.kill().unwrap();
+        child.wait().unwrap();
+        panic!("Provider returned no terminal completion for malformed Cargo output");
+    };
+    assert!(status.success());
+
+    let mut tail = String::new();
+    stdout.read_to_string(&mut tail).unwrap();
+    let events = tail
+        .lines()
+        .map(|line| serde_json::from_str::<ProtocolEnvelope>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ProtocolEnvelope::Observation(_)))
+    );
+    assert!(matches!(
+        events.last(),
+        Some(ProtocolEnvelope::Completion(value))
+            if value.status == ExecutionStatus::Incomplete
+                && value.tool_exit_code.0.is_none()
+                && value.message.as_deref().is_some_and(|message| message.len() <= 8_192)
     ));
 }

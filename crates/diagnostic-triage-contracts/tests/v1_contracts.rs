@@ -3,8 +3,9 @@
 use std::{collections::HashSet, fs, path::PathBuf};
 
 use diagnostic_triage_contracts::{
-    COMMON_SCHEMA_V1, MODEL_SCHEMA_V1, PROTOCOL_SCHEMA_V1, SourceRevision, TAXONOMY_SCHEMA_V1,
-    model::{FindingState, PreReportState, SessionReport, Taxonomy},
+    COMMON_SCHEMA_V1, MODEL_SCHEMA_V1, PROTOCOL_SCHEMA_V1, RepoPath, SourceRevision,
+    TAXONOMY_SCHEMA_V1,
+    model::{FindingState, Location, Position, PreReportState, SessionReport, Taxonomy},
     validate_report, validate_report_for_revision, validate_report_json, validate_session_jsonl,
 };
 use serde_json::{Value, json};
@@ -134,6 +135,62 @@ fn canonical_schemas_are_embedded_and_have_unique_ids() {
     identifiers.sort_unstable();
     identifiers.dedup();
     assert_eq!(identifiers.len(), schemas.len());
+}
+
+#[test]
+fn location_v1_accepts_points_insertions_and_half_open_ranges() {
+    let path: RepoPath = "src/unicode.rs".parse().expect("fixture path is valid");
+    let locations = [
+        Location {
+            path: path.clone(),
+            start: Position { line: 1, column: 1 },
+            end: None,
+        },
+        Location {
+            path: path.clone(),
+            start: Position { line: 2, column: 3 },
+            end: Some(Position { line: 2, column: 3 }),
+        },
+        Location {
+            path: path.clone(),
+            start: Position { line: 3, column: 2 },
+            end: Some(Position { line: 3, column: 5 }),
+        },
+        Location {
+            path,
+            start: Position { line: 4, column: 2 },
+            end: Some(Position { line: 5, column: 1 }),
+        },
+    ];
+
+    for location in locations {
+        location.validate().expect("valid v1 Location shape");
+    }
+
+    let reversed = Location {
+        path: "src/unicode.rs".parse().unwrap(),
+        start: Position { line: 2, column: 3 },
+        end: Some(Position { line: 2, column: 2 }),
+    };
+    assert!(reversed.validate().is_err());
+}
+
+#[test]
+fn common_schema_states_location_range_and_column_semantics() {
+    let schema: Value = serde_json::from_str(COMMON_SCHEMA_V1).expect("common schema is JSON");
+    let location = &schema["$defs"]["location"];
+    let column = &schema["$defs"]["position"]["properties"]["column"];
+
+    assert!(
+        location["description"]
+            .as_str()
+            .is_some_and(|value| value.contains("half-open [start, end)"))
+    );
+    assert!(
+        column["description"]
+            .as_str()
+            .is_some_and(|value| value.contains("Unicode code-point"))
+    );
 }
 
 #[test]

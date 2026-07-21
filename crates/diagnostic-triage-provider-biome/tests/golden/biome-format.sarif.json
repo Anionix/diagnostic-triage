@@ -1,1 +1,1 @@
-{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"results":[{"ruleId":"format","level":"error","message":{"text":"Formatter would have printed different content."},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/main.ts"}}}]}]}]}
+{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"columnKind":"unicodeCodePoints","results":[{"ruleId":"format","level":"error","message":{"text":"Formatter would have printed different content."},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/main.ts"}}}]}]}]}
