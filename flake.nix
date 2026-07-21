@@ -48,6 +48,7 @@
             packages = [
               rust
               pkgs.jq
+              pkgs.lean4
               pkgs.nixfmt
               pkgs.pyright
               pkgs.ruff

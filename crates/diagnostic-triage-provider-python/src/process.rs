@@ -246,13 +246,26 @@ pub(crate) fn run_bounded(
     spec: &ProcessSpec,
     limits: ProcessLimits,
 ) -> Result<ProcessOutcome, ProcessError> {
-    run_bounded_with_group_signal(spec, limits, signal_process_group)
+    run_bounded_with_group_signal_source(
+        spec,
+        limits,
+        GroupSignal::TrustedProduction(signal_process_group),
+    )
 }
 
+#[cfg(test)]
 fn run_bounded_with_group_signal(
     spec: &ProcessSpec,
     limits: ProcessLimits,
     group_signal: fn(u32) -> io::Result<()>,
+) -> Result<ProcessOutcome, ProcessError> {
+    run_bounded_with_group_signal_source(spec, limits, GroupSignal::Injected(group_signal))
+}
+
+fn run_bounded_with_group_signal_source(
+    spec: &ProcessSpec,
+    limits: ProcessLimits,
+    group_signal: GroupSignal,
 ) -> Result<ProcessOutcome, ProcessError> {
     if cfg!(not(unix)) {
         return Err(ProcessError::UnsupportedPlatform);
@@ -415,7 +428,7 @@ impl Drop for ChildCleanupGuard {
                 &mut self.child,
                 self.process_group,
                 &mut exit_status,
-                signal_process_group,
+                GroupSignal::TrustedProduction(signal_process_group),
             );
         }
     }
@@ -643,7 +656,7 @@ impl Drop for CaptureReaders {
 fn cleanup_setup_failure(
     child: &mut ChildCleanupGuard,
     error: ProcessError,
-    group_signal: fn(u32) -> io::Result<()>,
+    group_signal: GroupSignal,
 ) -> ProcessError {
     let mut errors = vec![error];
     let mut exit_status = None;
@@ -662,7 +675,7 @@ fn finish_execution(
     readers: &mut CaptureReaders,
     mut exit_status: Option<ExitStatus>,
     mut errors: Vec<ProcessError>,
-    group_signal: fn(u32) -> io::Result<()>,
+    group_signal: GroupSignal,
 ) -> Result<(ExitStatus, CapturedStream, CapturedStream), ProcessError> {
     let termination = terminate_and_reap(child, &mut exit_status, group_signal);
     if let Err(error) = termination {
@@ -700,7 +713,7 @@ fn finish_execution(
 fn terminate_and_reap(
     child: &mut ChildCleanupGuard,
     exit_status: &mut Option<ExitStatus>,
-    group_signal: fn(u32) -> io::Result<()>,
+    group_signal: GroupSignal,
 ) -> Result<(), ProcessError> {
     terminate_child(
         &mut child.child,
@@ -714,44 +727,16 @@ fn terminate_child(
     child: &mut Child,
     process_group: u32,
     exit_status: &mut Option<ExitStatus>,
-    group_signal: fn(u32) -> io::Result<()>,
+    group_signal: GroupSignal,
 ) -> Result<(), ProcessError> {
     let deadline = Instant::now()
         .checked_add(PROCESS_GROUP_GRACE)
         .unwrap_or_else(Instant::now);
     let mut errors = Vec::new();
-    let leader_exited_before_signal = if exit_status.is_some() {
-        true
-    } else {
-        match child_exited_without_reaping(child) {
-            Ok(exited) => exited,
-            Err(source) => {
-                errors.push(ProcessError::Wait(source));
-                false
-            }
-        }
-    };
     let group_signal_error = if exit_status.is_some() {
         None
     } else {
-        group_signal(process_group).err()
-    };
-    // LLM cleanup contract: SIGNALING -> REAPING only suppresses a native
-    // zombie-race EPERM after a non-reaping exit observation; injected signal
-    // failures remain typed cleanup evidence.
-    let leader_exited_during_native_permission_race = match group_signal_error.as_ref() {
-        Some(source)
-            if !leader_exited_before_signal && is_native_group_permission_error(source) =>
-        {
-            match child_exited_without_reaping(child) {
-                Ok(exited) => exited,
-                Err(source) => {
-                    errors.push(ProcessError::Wait(source));
-                    false
-                }
-            }
-        }
-        _ => false,
+        group_signal.invoke(process_group).err()
     };
     let group_signal_failed = group_signal_error.is_some();
     if exit_status.is_none() {
@@ -775,15 +760,13 @@ fn terminate_child(
         errors.push(ProcessError::Unreaped);
     }
     let group_wait = wait_for_process_group(process_group, deadline);
-    let zombie_only_permission_race = matches!(
-        (&group_signal_error, &group_wait),
-        (Some(source), Ok(true))
-            if source.kind() == io::ErrorKind::PermissionDenied
-                && is_native_group_permission_error(source)
-                && (leader_exited_before_signal
-                    || leader_exited_during_native_permission_race)
-                && exit_status.is_some()
-    );
+    // LLM cleanup contract: SIGNALING -> REAPING suppresses native EPERM only
+    // for the explicitly trusted production callback after leader reap and a
+    // bounded probe proves the process group disappeared. Injected failures
+    // remain typed cleanup evidence regardless of their raw OS error.
+    let zombie_only_permission_race = group_signal_error.as_ref().is_some_and(|source| {
+        can_suppress_group_signal_error(group_signal, source, exit_status.is_some(), &group_wait)
+    });
     if let Some(source) = group_signal_error {
         if !zombie_only_permission_race {
             errors.push(ProcessError::GroupSignal(source));
@@ -799,6 +782,39 @@ fn terminate_child(
     } else {
         Err(combine_errors(errors))
     }
+}
+
+#[derive(Clone, Copy)]
+enum GroupSignal {
+    TrustedProduction(fn(u32) -> io::Result<()>),
+    #[cfg(test)]
+    Injected(fn(u32) -> io::Result<()>),
+}
+
+impl GroupSignal {
+    fn invoke(self, process_group: u32) -> io::Result<()> {
+        match self {
+            Self::TrustedProduction(signal) => signal(process_group),
+            #[cfg(test)]
+            Self::Injected(signal) => signal(process_group),
+        }
+    }
+
+    fn is_trusted_production(self) -> bool {
+        matches!(self, Self::TrustedProduction(_))
+    }
+}
+
+fn can_suppress_group_signal_error(
+    group_signal: GroupSignal,
+    source: &io::Error,
+    leader_reaped: bool,
+    group_wait: &io::Result<bool>,
+) -> bool {
+    group_signal.is_trusted_production()
+        && is_native_group_permission_error(source)
+        && leader_reaped
+        && matches!(group_wait, Ok(true))
 }
 
 #[cfg(unix)]
@@ -1075,19 +1091,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn injected_zombie_permission_error_is_typed_without_resignal() {
+    fn injected_raw_eperm_is_typed_without_resignal() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         static SIGNAL_CALLS: AtomicUsize = AtomicUsize::new(0);
         fn deny_and_count(_: u32) -> std::io::Result<()> {
             SIGNAL_CALLS.fetch_add(1, Ordering::SeqCst);
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            Err(std::io::Error::from(rustix::io::Errno::PERM))
         }
 
         let _guard = process_test_guard();
         SIGNAL_CALLS.store(0, Ordering::SeqCst);
         let error = run_bounded_with_group_signal(
-            &ProcessSpec::new("/usr/bin/true"),
+            &ProcessSpec::new("true"),
             ProcessLimits {
                 timeout: Duration::from_secs(2),
                 max_stdout_bytes: 64,
@@ -1099,6 +1115,46 @@ mod tests {
 
         assert!(contains_group_signal(&error), "error: {error:?}");
         assert_eq!(SIGNAL_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_eperm_suppression_requires_every_production_race_gate() {
+        let native_eperm = std::io::Error::from(rustix::io::Errno::PERM);
+        let production = super::GroupSignal::TrustedProduction(signal_process_group);
+        let injected = super::GroupSignal::Injected(signal_process_group);
+        let group_gone = Ok(true);
+
+        assert!(super::can_suppress_group_signal_error(
+            production,
+            &native_eperm,
+            true,
+            &group_gone,
+        ));
+        assert!(!super::can_suppress_group_signal_error(
+            injected,
+            &native_eperm,
+            true,
+            &group_gone,
+        ));
+        assert!(!super::can_suppress_group_signal_error(
+            production,
+            &native_eperm,
+            false,
+            &group_gone,
+        ));
+        assert!(!super::can_suppress_group_signal_error(
+            production,
+            &native_eperm,
+            true,
+            &Ok(false),
+        ));
+        assert!(!super::can_suppress_group_signal_error(
+            production,
+            &native_eperm,
+            true,
+            &Err(std::io::Error::from(rustix::io::Errno::PERM)),
+        ));
     }
 
     #[cfg(unix)]
