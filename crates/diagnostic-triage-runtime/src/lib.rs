@@ -12,10 +12,14 @@ pub use scratch::{
 pub mod config;
 pub mod process;
 pub mod reporters;
+pub mod session;
 
 pub use config::{ConfigError, RuntimeConfig};
 pub use reporters::{
     CanonicalJsonReporter, MAX_REPORT_OUTPUT_BYTES, ReportFormat, Reporter, ReporterError,
     TSV_HEADER, TsvReporter, ValidatedSessionReport, canonical_json_bytes, tsv_bytes,
     write_canonical_json, write_tsv,
+};
+pub use session::{
+    ProviderSessionError, ProviderSessionOutcome, ProviderSessionState, run_provider_session,
 };
