@@ -9,6 +9,9 @@ use diagnostic_triage_runtime::reporters::{
     TsvReporter, ValidatedSessionReport, canonical_json_bytes, tsv_bytes, write_canonical_json,
     write_tsv,
 };
+use diagnostic_triage_runtime::{
+    GitHubAnnotationReporter, github_annotations_bytes, write_github_annotations,
+};
 use sha2::{Digest, Sha256};
 
 // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
@@ -55,6 +58,264 @@ fn report_with_findings_matches_the_tsv_golden() {
     let validated = ValidatedSessionReport::new(report()).unwrap();
 
     assert_eq!(tsv_bytes(&validated).unwrap(), golden("valid-report.tsv"));
+}
+
+#[test]
+fn report_with_findings_matches_the_github_annotations_golden() {
+    let validated = ValidatedSessionReport::new(report()).unwrap();
+
+    assert_eq!(
+        github_annotations_bytes(&validated).unwrap(),
+        golden("valid-report.github-annotations.txt")
+    );
+}
+
+#[test]
+fn github_annotations_escape_metadata_and_messages_by_context() {
+    let mut report = report();
+    report.observations[0].tool.name = "lint%:\r\n,".to_owned();
+    report.observations[0].tool.rule_id = Some("R%:\r\n,1".to_owned());
+    report.findings[0].tool = report.observations[0].tool.clone();
+    report.findings[0].message = "problem %\r\n: comma, stays".to_owned();
+    report.findings[0].location.as_mut().unwrap().path = "src/%weird:,line.rs".parse().unwrap();
+    let validated = ValidatedSessionReport::new(report).unwrap();
+
+    assert_eq!(
+        github_annotations_bytes(&validated).unwrap(),
+        golden("escaped.github-annotations.txt")
+    );
+}
+
+#[test]
+fn github_annotations_omit_unavailable_coordinates() {
+    let mut report = report();
+    report.observations[0].location.as_mut().unwrap().end = None;
+    report.findings[0].location.as_mut().unwrap().end = None;
+    let validated = ValidatedSessionReport::new(report.clone()).unwrap();
+    let output = String::from_utf8(github_annotations_bytes(&validated).unwrap()).unwrap();
+
+    assert_eq!(
+        output,
+        "::error file=src/example.py,line=7,col=12,title=ruff%3A F821::Undefined name `x`\n"
+    );
+    assert!(!output.contains("endLine="));
+    assert!(!output.contains("endColumn="));
+
+    report.observations[0].location = None;
+    report.findings[0].location = None;
+    let validated = ValidatedSessionReport::new(report).unwrap();
+    let output = String::from_utf8(github_annotations_bytes(&validated).unwrap()).unwrap();
+
+    assert_eq!(output, "::error title=ruff%3A F821::Undefined name `x`\n");
+    for unavailable in ["file=", "line=", "endLine=", "col=", "endColumn="] {
+        assert!(!output.contains(unavailable));
+    }
+}
+
+#[test]
+fn github_annotations_omit_columns_for_multiline_locations() {
+    let mut report = report();
+    let end = report.observations[0]
+        .location
+        .as_mut()
+        .unwrap()
+        .end
+        .as_mut()
+        .unwrap();
+    end.line = 8;
+    end.column = 3;
+    report.findings[0].location = report.observations[0].location.clone();
+    let validated = ValidatedSessionReport::new(report).unwrap();
+    let output = String::from_utf8(github_annotations_bytes(&validated).unwrap()).unwrap();
+
+    assert_eq!(
+        output,
+        "::error file=src/example.py,line=7,endLine=8,title=ruff%3A F821::Undefined name `x`\n"
+    );
+    assert!(!output.contains("col="));
+    assert!(!output.contains("endColumn="));
+}
+
+#[test]
+fn github_annotations_convert_exclusive_endpoints_to_inclusive_spans() {
+    let mut report = report();
+    report.observations[0]
+        .location
+        .as_mut()
+        .unwrap()
+        .end
+        .as_mut()
+        .unwrap()
+        .column = 12;
+    report.findings[0].location = report.observations[0].location.clone();
+    let validated = ValidatedSessionReport::new(report.clone()).unwrap();
+    let output = String::from_utf8(github_annotations_bytes(&validated).unwrap()).unwrap();
+    assert_eq!(
+        output,
+        "::error file=src/example.py,line=7,endLine=7,col=12,title=ruff%3A F821::Undefined name `x`\n"
+    );
+
+    let end = report.observations[0]
+        .location
+        .as_mut()
+        .unwrap()
+        .end
+        .as_mut()
+        .unwrap();
+    end.line = 8;
+    end.column = 1;
+    report.findings[0].location = report.observations[0].location.clone();
+    let validated = ValidatedSessionReport::new(report).unwrap();
+    let output = String::from_utf8(github_annotations_bytes(&validated).unwrap()).unwrap();
+
+    assert_eq!(
+        output,
+        "::error file=src/example.py,line=7,endLine=7,title=ruff%3A F821::Undefined name `x`\n"
+    );
+}
+
+#[test]
+fn github_annotations_omit_coordinates_outside_the_runner_integer_range() {
+    let mut report = report();
+    let location = report.observations[0].location.as_mut().unwrap();
+    location.start.line = i32::MAX as u32;
+    location.start.column = i32::MAX as u32;
+    location.end = None;
+    report.findings[0].location = Some(location.clone());
+    let validated = ValidatedSessionReport::new(report.clone()).unwrap();
+    let output = String::from_utf8(github_annotations_bytes(&validated).unwrap()).unwrap();
+
+    assert!(output.contains("line=2147483647,col=2147483647"));
+
+    report.observations[0].location.as_mut().unwrap().start.line += 1;
+    report.findings[0].location = report.observations[0].location.clone();
+    let validated = ValidatedSessionReport::new(report).unwrap();
+    let output = String::from_utf8(github_annotations_bytes(&validated).unwrap()).unwrap();
+
+    assert_eq!(output, "::error title=ruff%3A F821::Undefined name `x`\n");
+}
+
+#[test]
+fn github_annotations_keep_each_supported_coordinate_after_conversion() {
+    const MAX: u32 = i32::MAX as u32;
+
+    let mut report = report();
+    let location = report.observations[0].location.as_mut().unwrap();
+    location.start.line = 1;
+    location.start.column = MAX;
+    location.end.as_mut().unwrap().line = 1;
+    location.end.as_mut().unwrap().column = MAX + 1;
+    report.findings[0].location = Some(location.clone());
+    let validated = ValidatedSessionReport::new(report.clone()).unwrap();
+    let output = String::from_utf8(github_annotations_bytes(&validated).unwrap()).unwrap();
+    assert!(output.contains("line=1,endLine=1,col=2147483647,endColumn=2147483647"));
+
+    let location = report.observations[0].location.as_mut().unwrap();
+    location.start.line = MAX - 1;
+    location.start.column = 1;
+    location.end.as_mut().unwrap().line = MAX + 1;
+    location.end.as_mut().unwrap().column = 1;
+    report.findings[0].location = Some(location.clone());
+    let validated = ValidatedSessionReport::new(report.clone()).unwrap();
+    let output = String::from_utf8(github_annotations_bytes(&validated).unwrap()).unwrap();
+    assert!(output.contains("line=2147483646,endLine=2147483647"));
+    assert!(!output.contains("col="));
+
+    let location = report.observations[0].location.as_mut().unwrap();
+    location.start.line = 7;
+    location.start.column = 12;
+    location.end.as_mut().unwrap().line = 8;
+    location.end.as_mut().unwrap().column = MAX + 1;
+    report.findings[0].location = Some(location.clone());
+    let validated = ValidatedSessionReport::new(report).unwrap();
+    let output = String::from_utf8(github_annotations_bytes(&validated).unwrap()).unwrap();
+    assert!(output.contains("line=7,endLine=8"));
+    assert!(!output.contains("col="));
+}
+
+#[test]
+fn github_annotations_degrade_only_the_unsupported_coordinate_suffix() {
+    const MAX: u32 = i32::MAX as u32;
+
+    let mut report = report();
+    let location = report.observations[0].location.as_mut().unwrap();
+    location.start.column = MAX + 1;
+    location.end = None;
+    report.findings[0].location = Some(location.clone());
+    let validated = ValidatedSessionReport::new(report.clone()).unwrap();
+    let output = String::from_utf8(github_annotations_bytes(&validated).unwrap()).unwrap();
+    assert!(output.contains("file=src/example.py,line=7,title="));
+    assert!(!output.contains("col="));
+
+    let location = report.observations[0].location.as_mut().unwrap();
+    location.start.line = MAX;
+    location.start.column = 1;
+    location.end = Some(diagnostic_triage_contracts::model::Position {
+        line: MAX + 1,
+        column: 2,
+    });
+    report.findings[0].location = Some(location.clone());
+    let validated = ValidatedSessionReport::new(report).unwrap();
+    let output = String::from_utf8(github_annotations_bytes(&validated).unwrap()).unwrap();
+    assert!(output.contains("file=src/example.py,line=2147483647,col=1,title="));
+    assert!(!output.contains("endLine="));
+}
+
+#[test]
+fn github_annotations_preserve_unicode() {
+    let mut report = report();
+    report.findings[0].message = "未定義の名前 `値`".to_owned();
+    report.findings[0].tool.name = "型検査".to_owned();
+    report.findings[0].tool.rule_id = None;
+    report.observations[0].tool = report.findings[0].tool.clone();
+    let validated = ValidatedSessionReport::new(report).unwrap();
+    let output = String::from_utf8(github_annotations_bytes(&validated).unwrap()).unwrap();
+
+    assert!(output.contains("title=型検査::未定義の名前 `値`"));
+}
+
+#[test]
+fn github_annotations_ignore_operational_evidence_without_findings() {
+    let validated = ValidatedSessionReport::from_json(include_bytes!(
+        "../../../tests/fixtures/v1/valid-unsupported-report.json"
+    ))
+    .unwrap();
+
+    assert_eq!(validated.as_report().executions.len(), 1);
+    assert!(github_annotations_bytes(&validated).unwrap().is_empty());
+}
+
+#[test]
+fn github_annotations_are_stable_when_input_order_changes() {
+    let mut report = report();
+    let mut earlier_finding = report.findings[0].clone();
+    earlier_finding.finding_id = "019f7e95-0000-7000-8000-000000000120".parse().unwrap();
+    earlier_finding.fingerprint =
+        "dtfp1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .parse()
+            .unwrap();
+    earlier_finding.message = "Earlier fingerprint".to_owned();
+    let mut earlier_decision = report.decisions[0].clone();
+    earlier_decision.decision_id = "019f7e95-0000-7000-8000-000000000121".parse().unwrap();
+    earlier_decision.finding_id = earlier_finding.finding_id.clone();
+    report.findings.push(earlier_finding);
+    report.decisions.push(earlier_decision);
+
+    let baseline = ValidatedSessionReport::new(report.clone()).unwrap();
+    let expected = github_annotations_bytes(&baseline).unwrap();
+    report.findings.reverse();
+    report.decisions.reverse();
+    let scrambled = ValidatedSessionReport::new(report).unwrap();
+
+    assert_eq!(github_annotations_bytes(&scrambled).unwrap(), expected);
+    assert!(
+        String::from_utf8(expected)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap()
+            .ends_with("::Earlier fingerprint")
+    );
 }
 
 #[test]
@@ -280,6 +541,7 @@ fn writer_helpers_report_io_failure_after_an_accepted_prefix() {
     let validated = ValidatedSessionReport::new(report.clone()).unwrap();
     let json = canonical_json_bytes(&validated).unwrap();
     let tsv = tsv_bytes(&validated).unwrap();
+    let github_annotations = github_annotations_bytes(&validated).unwrap();
 
     assert_prefix_on_io_failure(ReportFormat::Json, &json, |writer| {
         write_canonical_json(&report, writer)
@@ -291,4 +553,14 @@ fn writer_helpers_report_io_failure_after_an_accepted_prefix() {
     assert_prefix_on_io_failure(ReportFormat::Tsv, &tsv, |writer| {
         TsvReporter.write_report(&validated, writer)
     });
+    assert_prefix_on_io_failure(
+        ReportFormat::GitHubAnnotations,
+        &github_annotations,
+        |writer| write_github_annotations(&report, writer),
+    );
+    assert_prefix_on_io_failure(
+        ReportFormat::GitHubAnnotations,
+        &github_annotations,
+        |writer| GitHubAnnotationReporter.write_report(&validated, writer),
+    );
 }

@@ -1,0 +1,1 @@
+::error file=src/%25weird%3A%2Cline.rs,line=7,endLine=7,col=12,endColumn=12,title=lint%25%3A%0D%0A%2C%3A R%25%3A%0D%0A%2C1::problem %25%0D%0A: comma, stays

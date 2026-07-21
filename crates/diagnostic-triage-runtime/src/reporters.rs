@@ -116,6 +116,8 @@ pub enum ReportFormat {
     Json,
     /// A tab-separated finding/decision projection.
     Tsv,
+    /// GitHub workflow-command annotations for policy decisions.
+    GitHubAnnotations,
 }
 
 impl fmt::Display for ReportFormat {
@@ -123,6 +125,7 @@ impl fmt::Display for ReportFormat {
         formatter.write_str(match self {
             Self::Json => "JSON",
             Self::Tsv => "TSV",
+            Self::GitHubAnnotations => "GitHub annotations",
         })
     }
 }
