@@ -479,6 +479,14 @@ def validate_report(
                         "verified finding cites a non-provider execution"
                     )
 
+    referenced_observations = {
+        observation_id
+        for finding in finding_by_id.values()
+        for observation_id in finding["observation_ids"]
+    }
+    if referenced_observations != observation_ids:
+        raise ContractError("observation is not referenced by a finding")
+
     decision_findings: list[str] = []
     evaluation_instant: int | None = None
     for decision in indexed["decisions"].values():
@@ -1046,6 +1054,18 @@ class ContractTest(unittest.TestCase):
         report["fix_candidates"][0]["observation_ids"].append(
             second_observation["observation_id"]
         )
+        second_finding = copy.deepcopy(report["findings"][0])
+        second_finding["finding_id"] = "019f7e95-0000-7000-8000-000000000114"
+        second_finding["fingerprint"] = "dtfp1:" + "e" * 64
+        second_finding["observation_ids"] = [second_observation["observation_id"]]
+        second_finding["tool"]["rule_id"] = "E501"
+        second_finding["state"] = "FIX_PROPOSED"
+        second_finding.pop("verification_execution_ids", None)
+        report["findings"].append(second_finding)
+        second_decision = copy.deepcopy(report["decisions"][0])
+        second_decision["decision_id"] = "019f7e95-0000-7000-8000-000000000115"
+        second_decision["finding_id"] = second_finding["finding_id"]
+        report["decisions"].append(second_decision)
         validate_report(report, self.contracts)
 
     def test_report_rejects_duplicate_finding_fingerprints(self) -> None:
@@ -1486,6 +1506,12 @@ class ContractTest(unittest.TestCase):
         missing_decision = copy.deepcopy(report)
         missing_decision["decisions"] = []
         candidates["missing decision"] = missing_decision
+
+        orphan_observation = copy.deepcopy(report)
+        orphan_observation["findings"] = []
+        orphan_observation["decisions"] = []
+        orphan_observation["verdict"] = "PASS"
+        candidates["orphan observation"] = orphan_observation
 
         for name, candidate in candidates.items():
             with self.subTest(name=name), self.assertRaises(ContractError):

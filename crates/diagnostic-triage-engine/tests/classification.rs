@@ -10,7 +10,8 @@ use diagnostic_triage_contracts::{
 use diagnostic_triage_engine::{
     EngineError, EngineInputError,
     classification::{
-        ClassificationRule, MAX_CLASSIFICATION_RULES, RuleIdSelector, classify_observation,
+        ClassificationAttribution, ClassificationMatch, ClassificationRule,
+        MAX_CLASSIFICATION_RULES, RuleIdSelector, classify_observation,
     },
 };
 
@@ -37,6 +38,21 @@ fn observation(rule_id: Option<&str>) -> Observation {
     }
 }
 
+fn native_observation(
+    tool_name: &str,
+    tool_version: &str,
+    language: &str,
+    rule_id: Option<&str>,
+    message: &str,
+) -> Observation {
+    let mut input = observation(rule_id);
+    tool_name.clone_into(&mut input.tool.name);
+    tool_version.clone_into(&mut input.tool.version);
+    input.language = Language::from_str(language).unwrap();
+    message.clone_into(&mut input.message);
+    input
+}
+
 fn taxonomy(category: Category, micro_category: MicroCategory) -> Taxonomy {
     Taxonomy {
         category,
@@ -56,12 +72,32 @@ fn rule(id: &str, selector: RuleIdSelector, taxonomy: Taxonomy) -> Classificatio
     }
 }
 
+fn assert_catalog_rule(classification: &ClassificationMatch, expected_rule_id: &str) {
+    assert_eq!(
+        classification.attribution,
+        ClassificationAttribution::CatalogRule {
+            rule_id: expected_rule_id.to_owned(),
+        }
+    );
+}
+
+fn assert_builtin_unknown(classification: &ClassificationMatch) {
+    assert_eq!(
+        classification.attribution,
+        ClassificationAttribution::BuiltinUnknown
+    );
+    assert_eq!(
+        classification.taxonomy,
+        taxonomy(Category::Unknown, MicroCategory::Unknown)
+    );
+}
+
 #[test]
 fn most_specific_rule_wins_independent_of_catalog_order() {
     let fallback = rule(
         "ty.fallback",
         RuleIdSelector::Any,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     let exact = rule(
         "ty.invalid-argument",
@@ -74,10 +110,123 @@ fn most_specific_rule_wins_independent_of_catalog_order() {
     let reverse = classify_observation(&input, &[exact, fallback]).unwrap();
 
     assert_eq!(forward, reverse);
-    assert_eq!(forward.rule_id, "ty.invalid-argument");
+    assert_catalog_rule(&forward, "ty.invalid-argument");
     assert_eq!(
         forward.taxonomy.micro_category,
         MicroCategory::IncompatibleType
+    );
+}
+
+#[test]
+fn exact_ruff_f821_mapping_precedes_builtin_unknown() {
+    let mut exact = rule(
+        "ruff.F821",
+        RuleIdSelector::Exact("F821".to_owned()),
+        taxonomy(Category::Type, MicroCategory::UnresolvedSymbol),
+    );
+    exact.tool_name = "ruff".to_owned();
+    exact.language = Some(Language::from_str("python").unwrap());
+    let input = native_observation(
+        "ruff",
+        "0.12.4",
+        "python",
+        Some("F821"),
+        "Undefined name `value`",
+    );
+
+    let selected = classify_observation(&input, &[exact]).unwrap();
+
+    assert_catalog_rule(&selected, "ruff.F821");
+    assert_eq!(
+        selected.taxonomy,
+        taxonomy(Category::Type, MicroCategory::UnresolvedSymbol)
+    );
+}
+
+#[test]
+fn unmapped_native_diagnostics_use_typed_unknown_without_inference() {
+    let mut f821 = rule(
+        "ruff.F821",
+        RuleIdSelector::Exact("F821".to_owned()),
+        taxonomy(Category::Type, MicroCategory::UnresolvedSymbol),
+    );
+    f821.tool_name = "ruff".to_owned();
+    f821.language = Some(Language::from_str("python").unwrap());
+    let catalog = [f821];
+    let observations = [
+        native_observation(
+            "ruff",
+            "0.12.4",
+            "python",
+            Some("F401"),
+            "Undefined name wording must not imply a type classification",
+        ),
+        native_observation(
+            "ruff",
+            "0.12.4",
+            "python",
+            Some("E501"),
+            "syntax error wording must not imply a syntax classification",
+        ),
+        native_observation(
+            "ruff",
+            "0.12.4",
+            "python",
+            Some("B006"),
+            "mutable default wording must not imply correctness",
+        ),
+        native_observation(
+            "ruff",
+            "0.12.4",
+            "python",
+            None,
+            "missing native code remains unknown",
+        ),
+        native_observation(
+            "biome",
+            "2.1.3",
+            "typescript",
+            Some("lint/suspicious/noDoubleEquals"),
+            "generic Biome diagnostic",
+        ),
+        native_observation(
+            "rustc",
+            "1.85.0",
+            "rust",
+            Some("E0308"),
+            "generic rustc diagnostic",
+        ),
+    ];
+
+    for input in observations {
+        assert_builtin_unknown(&classify_observation(&input, &catalog).unwrap());
+    }
+}
+
+#[test]
+fn top_level_unknown_is_reserved_for_builtin_fallback() {
+    let reserved = rule(
+        "ty.configured-unknown",
+        RuleIdSelector::Any,
+        taxonomy(Category::Unknown, MicroCategory::Unknown),
+    );
+    assert!(matches!(
+        classify_observation(&observation(None), &[reserved]),
+        Err(EngineError::Input(
+            EngineInputError::ReservedClassificationTaxonomy { rule_id }
+        )) if rule_id == "ty.configured-unknown"
+    ));
+
+    let category_scoped = rule(
+        "ty.type-unknown",
+        RuleIdSelector::Any,
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    let selected = classify_observation(&observation(None), &[category_scoped]).unwrap();
+    assert_catalog_rule(&selected, "ty.type-unknown");
+    assert_eq!(
+        selected.taxonomy,
+        taxonomy(Category::Type, MicroCategory::Unknown)
     );
 }
 
@@ -86,7 +235,7 @@ fn exact_tool_version_beats_generic_independent_of_catalog_order() {
     let mut generic = rule(
         "ty.generic",
         RuleIdSelector::Any,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     generic.native_rule_id = RuleIdSelector::Exact("invalid-argument-type".into());
     let mut exact = rule(
@@ -101,7 +250,7 @@ fn exact_tool_version_beats_generic_independent_of_catalog_order() {
     let reverse = classify_observation(&input, &[exact, generic]).unwrap();
 
     assert_eq!(forward, reverse);
-    assert_eq!(forward.rule_id, "ty.versioned");
+    assert_catalog_rule(&forward, "ty.versioned");
     assert_eq!(
         forward.taxonomy.micro_category,
         MicroCategory::IncompatibleType
@@ -130,12 +279,12 @@ fn exact_tool_versions_select_their_own_taxonomy_without_ambiguity() {
     second_input.tool.version = "0.0.2".into();
     let second_match = classify_observation(&second_input, &rules).unwrap();
 
-    assert_eq!(first_match.rule_id, "ty.v1");
+    assert_catalog_rule(&first_match, "ty.v1");
     assert_eq!(
         first_match.taxonomy.micro_category,
         MicroCategory::IncompatibleType
     );
-    assert_eq!(second_match.rule_id, "ty.v2");
+    assert_catalog_rule(&second_match, "ty.v2");
     assert_eq!(
         second_match.taxonomy.micro_category,
         MicroCategory::WrongResult
@@ -154,10 +303,7 @@ fn wrong_exact_tool_version_does_not_match() {
     let mut input = observation(None);
     input.tool.version = "0.0.1".into();
 
-    assert!(matches!(
-        classify_observation(&input, &[versioned]),
-        Err(EngineError::Unclassified { .. })
-    ));
+    assert_builtin_unknown(&classify_observation(&input, &[versioned]).unwrap());
 }
 
 #[test]
@@ -165,7 +311,7 @@ fn generic_version_rule_remains_a_fallback_for_other_versions() {
     let generic = rule(
         "ty.generic",
         RuleIdSelector::Exact("invalid-argument-type".into()),
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     let mut versioned = rule(
         "ty.versioned",
@@ -177,7 +323,7 @@ fn generic_version_rule_remains_a_fallback_for_other_versions() {
 
     let selected = classify_observation(&input, &[versioned, generic]).unwrap();
 
-    assert_eq!(selected.rule_id, "ty.generic");
+    assert_catalog_rule(&selected, "ty.generic");
 }
 
 #[test]
@@ -188,19 +334,19 @@ fn tool_version_selector_uses_unicode_character_boundaries() {
     let mut accepted = rule(
         "version-boundary",
         RuleIdSelector::Any,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     accepted.tool_version = Some(boundary);
 
-    assert_eq!(
-        classify_observation(&input, &[accepted]).unwrap().rule_id,
-        "version-boundary"
+    assert_catalog_rule(
+        &classify_observation(&input, &[accepted]).unwrap(),
+        "version-boundary",
     );
 
     let mut rejected = rule(
         "version-overflow",
         RuleIdSelector::Any,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     rejected.tool_version = Some("\u{e9}".repeat(65));
     assert!(matches!(
@@ -216,7 +362,7 @@ fn orthogonal_single_constraints_with_conflicting_taxonomy_are_ambiguous() {
     let mut version_only = rule(
         "ty.version-only",
         RuleIdSelector::Any,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     version_only.tool_version = Some("0.0.1".into());
     let rule_only = rule(
@@ -239,12 +385,12 @@ fn identically_constrained_rules_are_ambiguous_even_with_the_same_taxonomy() {
     let first = rule(
         "same-a",
         RuleIdSelector::Exact("x".into()),
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     let second = rule(
         "same-b",
         RuleIdSelector::Exact("x".into()),
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
 
     assert!(matches!(
@@ -259,7 +405,7 @@ fn tool_versions_are_opaque_and_case_sensitive() {
     let generic = rule(
         "generic",
         RuleIdSelector::Any,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     let mut exact = rule(
         "exact",
@@ -270,7 +416,7 @@ fn tool_versions_are_opaque_and_case_sensitive() {
 
     let selected = classify_observation(&observation(None), &[exact, generic]).unwrap();
 
-    assert_eq!(selected.rule_id, "generic");
+    assert_catalog_rule(&selected, "generic");
 }
 
 #[test]
@@ -278,7 +424,7 @@ fn absent_native_rule_selector_refines_any_for_missing_rule_id() {
     let fallback = rule(
         "fallback",
         RuleIdSelector::Any,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     let absent = rule(
         "absent",
@@ -288,7 +434,7 @@ fn absent_native_rule_selector_refines_any_for_missing_rule_id() {
 
     let selected = classify_observation(&observation(None), &[absent, fallback]).unwrap();
 
-    assert_eq!(selected.rule_id, "absent");
+    assert_catalog_rule(&selected, "absent");
 }
 
 #[test]
@@ -296,7 +442,7 @@ fn unequal_constraint_counts_do_not_break_incomparable_ambiguity() {
     let mut three_constraints = rule(
         "three",
         RuleIdSelector::Exact("x".into()),
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     three_constraints.tool_version = Some("0.0.1".into());
     three_constraints.language = Some(Language::from_str("python").unwrap());
@@ -322,13 +468,13 @@ fn later_combined_refinement_dominates_both_diamond_parents() {
     let mut version_only = rule(
         "version",
         RuleIdSelector::Any,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     version_only.tool_version = Some("0.0.1".into());
     let mut language_only = rule(
         "language",
         RuleIdSelector::Any,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     language_only.language = Some(Language::from_str("python").unwrap());
     let mut combined = rule(
@@ -342,7 +488,7 @@ fn later_combined_refinement_dominates_both_diamond_parents() {
     let selected =
         classify_observation(&observation(None), &[version_only, language_only, combined]).unwrap();
 
-    assert_eq!(selected.rule_id, "combined");
+    assert_catalog_rule(&selected, "combined");
 }
 
 #[test]
@@ -350,12 +496,9 @@ fn absent_selector_does_not_match_present_rule_id() {
     let absent = rule(
         "ty.no-rule",
         RuleIdSelector::Absent,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
-    assert!(matches!(
-        classify_observation(&observation(Some("x")), &[absent]),
-        Err(EngineError::Unclassified { .. })
-    ));
+    assert_builtin_unknown(&classify_observation(&observation(Some("x")), &[absent]).unwrap());
 }
 
 #[test]
@@ -363,12 +506,12 @@ fn equal_specificity_with_different_taxonomy_is_rejected() {
     let first = rule(
         "a",
         RuleIdSelector::Exact("x".into()),
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     let second = rule(
         "b",
         RuleIdSelector::Exact("x".into()),
-        taxonomy(Category::Correctness, MicroCategory::Unknown),
+        taxonomy(Category::Correctness, MicroCategory::WrongResult),
     );
 
     assert!(matches!(
@@ -383,12 +526,12 @@ fn ambiguous_rule_ids_remain_structured_when_ids_contain_commas() {
     let first = rule(
         "a,one",
         RuleIdSelector::Exact("x".into()),
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     let second = rule(
         "b,two",
         RuleIdSelector::Exact("x".into()),
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
 
     assert!(matches!(
@@ -406,9 +549,9 @@ fn ambiguous_classification_error_is_bounded() {
                 &format!("rule-{index}"),
                 RuleIdSelector::Exact("x".to_owned()),
                 if index == 9 {
-                    taxonomy(Category::Correctness, MicroCategory::Unknown)
+                    taxonomy(Category::Correctness, MicroCategory::WrongResult)
                 } else {
-                    taxonomy(Category::Type, MicroCategory::Unknown)
+                    taxonomy(Category::Type, MicroCategory::IncompatibleType)
                 },
             )
         })
@@ -426,7 +569,7 @@ fn ambiguous_classification_error_is_bounded() {
 
 #[test]
 fn maximum_supported_catalog_selects_a_unique_refinement_at_the_end() {
-    let fallback_taxonomy = taxonomy(Category::Type, MicroCategory::Unknown);
+    let fallback_taxonomy = taxonomy(Category::Type, MicroCategory::IncompatibleType);
     let mut rules = (0..MAX_CLASSIFICATION_RULES - 1)
         .map(|index| {
             rule(
@@ -445,7 +588,7 @@ fn maximum_supported_catalog_selects_a_unique_refinement_at_the_end() {
     let selected = classify_observation(&observation(Some("x")), &rules).unwrap();
 
     assert_eq!(rules.len(), MAX_CLASSIFICATION_RULES);
-    assert_eq!(selected.rule_id, "unique-refinement");
+    assert_catalog_rule(&selected, "unique-refinement");
     assert_eq!(
         selected.taxonomy.micro_category,
         MicroCategory::IncompatibleType
@@ -454,7 +597,7 @@ fn maximum_supported_catalog_selects_a_unique_refinement_at_the_end() {
 
 #[test]
 fn maximum_supported_ambiguity_is_bounded_and_deterministic() {
-    let shared_taxonomy = taxonomy(Category::Type, MicroCategory::Unknown);
+    let shared_taxonomy = taxonomy(Category::Type, MicroCategory::IncompatibleType);
     let rules = (0..MAX_CLASSIFICATION_RULES)
         .rev()
         .map(|index| {
@@ -482,11 +625,12 @@ fn maximum_supported_ambiguity_is_bounded_and_deterministic() {
 
 #[test]
 fn invalid_taxonomy_pair_is_rejected_before_matching() {
-    let invalid = rule(
+    let mut invalid = rule(
         "invalid",
         RuleIdSelector::Any,
         taxonomy(Category::Syntax, MicroCategory::WrongResult),
     );
+    invalid.tool_name = "other-tool".to_owned();
     assert!(matches!(
         classify_observation(&observation(None), &[invalid]),
         Err(EngineError::Contract(_))
@@ -498,7 +642,7 @@ fn duplicate_catalog_ids_are_rejected() {
     let first = rule(
         "duplicate",
         RuleIdSelector::Any,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     let second = first.clone();
 
@@ -515,7 +659,7 @@ fn malformed_catalog_identity_returns_typed_errors() {
     let invalid_id = rule(
         "",
         RuleIdSelector::Any,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     assert!(matches!(
         classify_observation(&observation(None), &[invalid_id]),
@@ -527,7 +671,7 @@ fn malformed_catalog_identity_returns_typed_errors() {
     let oversized_id = rule(
         &"x".repeat(129),
         RuleIdSelector::Any,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     assert!(matches!(
         classify_observation(&observation(None), &[oversized_id]),
@@ -539,7 +683,7 @@ fn malformed_catalog_identity_returns_typed_errors() {
     let mut noncanonical_tool = rule(
         "tool",
         RuleIdSelector::Any,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     noncanonical_tool.tool_name = " ty ".to_owned();
     assert!(matches!(
@@ -552,7 +696,7 @@ fn malformed_catalog_identity_returns_typed_errors() {
     let noncanonical_rule = rule(
         "native-rule",
         RuleIdSelector::Exact(" native ".to_owned()),
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     assert!(matches!(
         classify_observation(&observation(Some("native")), &[noncanonical_rule]),
@@ -564,7 +708,7 @@ fn malformed_catalog_identity_returns_typed_errors() {
     let mut empty_tool_version = rule(
         "empty-version",
         RuleIdSelector::Any,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     empty_tool_version.tool_version = Some(String::new());
     assert!(matches!(
@@ -577,7 +721,7 @@ fn malformed_catalog_identity_returns_typed_errors() {
     let mut oversized_tool_version = rule(
         "oversized-version",
         RuleIdSelector::Any,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     oversized_tool_version.tool_version = Some("x".repeat(65));
     assert!(matches!(
@@ -590,7 +734,7 @@ fn malformed_catalog_identity_returns_typed_errors() {
     let mut noncanonical_tool_version = rule(
         "noncanonical-version",
         RuleIdSelector::Any,
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     );
     noncanonical_tool_version.tool_version = Some(" 0.0.1 ".into());
     assert!(matches!(
@@ -608,7 +752,7 @@ fn noncanonical_observation_tool_is_rejected_before_matching() {
     let catalog = vec![rule(
         "native",
         RuleIdSelector::Exact("native".to_owned()),
-        taxonomy(Category::Type, MicroCategory::Unknown),
+        taxonomy(Category::Type, MicroCategory::IncompatibleType),
     )];
 
     assert!(matches!(
@@ -620,8 +764,19 @@ fn noncanonical_observation_tool_is_rejected_before_matching() {
 }
 
 #[test]
+fn invalid_observation_is_rejected_before_builtin_unknown() {
+    let mut input = observation(None);
+    input.message.clear();
+
+    assert!(matches!(
+        classify_observation(&input, &[]),
+        Err(EngineError::Contract(_))
+    ));
+}
+
+#[test]
 fn classification_catalog_is_bounded_before_validation() {
-    let taxonomy = taxonomy(Category::Type, MicroCategory::Unknown);
+    let taxonomy = taxonomy(Category::Type, MicroCategory::IncompatibleType);
     let catalog = (0..=MAX_CLASSIFICATION_RULES)
         .map(|index| {
             rule(

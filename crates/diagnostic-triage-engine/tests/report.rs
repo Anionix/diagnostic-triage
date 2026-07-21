@@ -14,8 +14,9 @@ use diagnostic_triage_contracts::{
     },
 };
 use diagnostic_triage_engine::{
+    classification::ClassificationAttribution,
     deterministic_object_id,
-    finding::build_finding_with_taxonomy,
+    finding::{build_finding, build_finding_with_taxonomy},
     policy::PolicySnapshot,
     report::{
         MAX_REPORT_COLLECTION_ITEMS, ReportAssemblyError, ReportAssemblyInput,
@@ -490,6 +491,68 @@ fn input_and_reference_permutations_are_byte_identical_and_canonical() {
 }
 
 #[test]
+fn builtin_unknown_report_order_and_digests_are_deterministic() {
+    let first_observation = observation("unknown-alpha", Severity::Error);
+    let second_observation = observation("unknown-beta", Severity::Error);
+    let first = build_finding(&first_observation, &[]).unwrap();
+    let second = build_finding(&second_observation, &[]).unwrap();
+    assert_eq!(
+        first.classification_attribution,
+        ClassificationAttribution::BuiltinUnknown
+    );
+    assert_eq!(
+        second.classification_attribution,
+        ClassificationAttribution::BuiltinUnknown
+    );
+
+    let policy = policy();
+    let forward = assemble_session_report(
+        input(
+            vec![first_observation.clone(), second_observation.clone()],
+            vec![first.finding.clone(), second.finding.clone()],
+            Vec::new(),
+            Some(EVALUATION_TIME),
+        ),
+        &policy,
+    )
+    .unwrap();
+    let reverse = assemble_session_report(
+        input(
+            vec![second_observation, first_observation],
+            vec![second.finding, first.finding],
+            Vec::new(),
+            Some(EVALUATION_TIME),
+        ),
+        &policy,
+    )
+    .unwrap();
+
+    assert_eq!(
+        serde_json::to_vec(&forward).unwrap(),
+        serde_json::to_vec(&reverse).unwrap()
+    );
+    assert_eq!(forward.verdict, Verdict::Pass);
+    assert_eq!(&forward.policy_digest, policy.digest());
+    assert!(forward.findings.windows(2).all(|pair| {
+        (&pair[0].fingerprint, &pair[0].finding_id) < (&pair[1].fingerprint, &pair[1].finding_id)
+    }));
+    assert!(forward.findings.iter().all(|finding| {
+        finding.classification
+            == Taxonomy {
+                category: Category::Unknown,
+                micro_category: MicroCategory::Unknown,
+            }
+            && finding.state == FindingState::Reported
+            && finding.pre_report_state == Some(PreReportState::Classified)
+    }));
+    assert!(forward.decisions.iter().all(|decision| {
+        decision.action == diagnostic_triage_contracts::model::DecisionAction::Observe
+            && decision.matched_rule_id == "default.observe"
+            && decision.policy_digest == forward.policy_digest
+    }));
+}
+
+#[test]
 fn evaluation_time_is_required_iff_findings_are_present() {
     let observation = observation("timestamp", Severity::Warning);
     let finding = finding(&observation);
@@ -614,10 +677,26 @@ fn maximum_report_collection_is_accepted() {
     let observations = (0..MAX_REPORT_COLLECTION_ITEMS)
         .map(|index| observation(&format!("maximum-{index}"), Severity::Info))
         .collect::<Vec<_>>();
-    let report =
-        assemble_session_report(input(observations, Vec::new(), Vec::new(), None), &policy())
-            .unwrap();
+    let findings = observations.iter().map(finding).collect::<Vec<_>>();
+    let report = assemble_session_report(
+        input(observations, findings, Vec::new(), Some(EVALUATION_TIME)),
+        &policy(),
+    )
+    .unwrap();
     assert_eq!(report.observations.len(), MAX_REPORT_COLLECTION_ITEMS);
+    assert_eq!(report.findings.len(), MAX_REPORT_COLLECTION_ITEMS);
+}
+
+#[test]
+fn unreferenced_observation_cannot_bypass_policy_as_a_pass_report() {
+    let observation = observation("unreferenced", Severity::Error);
+
+    assert!(matches!(
+        rejected(input(vec![observation], Vec::new(), Vec::new(), None)),
+        ReportAssemblyError::ReferencePreflight {
+            reason: "observation is not referenced by a finding",
+        }
+    ));
 }
 
 #[test]

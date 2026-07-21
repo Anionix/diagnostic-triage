@@ -5,7 +5,7 @@ use diagnostic_triage_contracts::model::{
 };
 use diagnostic_triage_contracts::{Fingerprint, ObjectId};
 
-use crate::classification::{ClassificationRule, classify_observation};
+use crate::classification::{ClassificationAttribution, ClassificationRule, classify_observation};
 use crate::fingerprint::fingerprint_finding;
 use crate::normalize::{
     DiagnosticText, normalize_context, normalize_diagnostic, normalize_message,
@@ -14,14 +14,15 @@ use crate::{EngineError, EngineInputError, deterministic_object_id};
 
 // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
 
-/// A Finding together with the generic taxonomy rule that classified it.
+/// A Finding together with typed provenance for its classification.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClassifiedFinding {
     pub finding: Finding,
-    pub classification_rule_id: String,
+    pub classification_attribution: ClassificationAttribution,
 }
 
-/// Normalize and classify one Provider observation using structured rule identity.
+/// Normalize and classify one Provider observation using a validated catalog,
+/// with typed built-in attribution when no rule matches.
 ///
 /// # Errors
 ///
@@ -35,7 +36,7 @@ pub fn build_finding(
     let finding = build_finding_with_taxonomy(observation, &classification.taxonomy)?;
     Ok(ClassifiedFinding {
         finding,
-        classification_rule_id: classification.rule_id,
+        classification_attribution: classification.attribution,
     })
 }
 

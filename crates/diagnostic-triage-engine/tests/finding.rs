@@ -9,7 +9,7 @@ use diagnostic_triage_contracts::{
 };
 use diagnostic_triage_engine::{
     EngineError, EngineInputError,
-    classification::{ClassificationRule, RuleIdSelector},
+    classification::{ClassificationAttribution, ClassificationRule, RuleIdSelector},
     finding::{build_finding, build_finding_with_taxonomy, validate_finding_integrity},
 };
 
@@ -93,7 +93,12 @@ fn structured_catalog_rule_is_retained_outside_finding_contract() {
     };
     let classified = build_finding(&observation(), &[rule]).unwrap();
 
-    assert_eq!(classified.classification_rule_id, "ty.invalid-argument");
+    assert_eq!(
+        classified.classification_attribution,
+        ClassificationAttribution::CatalogRule {
+            rule_id: "ty.invalid-argument".to_owned(),
+        }
+    );
     assert_eq!(classified.finding.classification, taxonomy());
 }
 
@@ -108,7 +113,7 @@ fn build_finding_uses_version_specific_rule() {
         origin: None,
         taxonomy: Taxonomy {
             category: Category::Type,
-            micro_category: MicroCategory::Unknown,
+            micro_category: MicroCategory::MissingType,
         },
     };
     let versioned = ClassificationRule {
@@ -123,8 +128,55 @@ fn build_finding_uses_version_specific_rule() {
 
     let classified = build_finding(&observation(), &[generic, versioned]).unwrap();
 
-    assert_eq!(classified.classification_rule_id, "ty.0.0.1");
+    assert_eq!(
+        classified.classification_attribution,
+        ClassificationAttribution::CatalogRule {
+            rule_id: "ty.0.0.1".to_owned(),
+        }
+    );
     assert_eq!(classified.finding.classification, taxonomy());
+}
+
+#[test]
+fn builtin_unknown_preserves_native_fields_and_classified_lifecycle() {
+    let mut input = observation();
+    input.tool = Tool {
+        name: "ruff".to_owned(),
+        version: "0.12.4".to_owned(),
+        rule_id: Some("F401".to_owned()),
+    };
+    input.message = "imported but unused".to_owned();
+    input.symbol = Some("module_name".to_owned());
+    input.expected = Some("used import".to_owned());
+    input.observed = Some("unused import".to_owned());
+    let classified = build_finding(&input, &[]).unwrap();
+
+    assert_eq!(
+        classified.classification_attribution,
+        ClassificationAttribution::BuiltinUnknown
+    );
+    assert_eq!(
+        classified.finding.classification,
+        Taxonomy {
+            category: Category::Unknown,
+            micro_category: MicroCategory::Unknown,
+        }
+    );
+    assert_eq!(classified.finding.tool, input.tool);
+    assert_eq!(classified.finding.language, input.language);
+    assert_eq!(classified.finding.severity, input.severity);
+    assert_eq!(classified.finding.message, input.message);
+    assert_eq!(classified.finding.location, input.location);
+    assert_eq!(classified.finding.symbol, input.symbol);
+    assert_eq!(classified.finding.expected, input.expected);
+    assert_eq!(classified.finding.observed, input.observed);
+    assert_eq!(classified.finding.evidence_ids, input.evidence_ids);
+    assert_eq!(
+        classified.finding.state,
+        diagnostic_triage_contracts::model::FindingState::Classified
+    );
+    assert_eq!(classified.finding.pre_report_state, None);
+    validate_finding_integrity(&classified.finding).unwrap();
 }
 
 #[test]
