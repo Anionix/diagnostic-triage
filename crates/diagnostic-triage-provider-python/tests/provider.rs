@@ -7,6 +7,8 @@ use std::{
     thread,
     time::Duration,
 };
+#[cfg(unix)]
+use std::{process::Child, time::Instant};
 
 // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
 
@@ -15,6 +17,8 @@ use diagnostic_triage_contracts::{
     model::{Applicability, EvidenceSource, ExecutionStatus},
     protocol::{Operation, ProtocolEnvelope},
 };
+#[cfg(unix)]
+use diagnostic_triage_provider_python::ProviderSession;
 use diagnostic_triage_provider_python::{
     CompletionBuilder, ProviderError, decode_request, emit_envelope, emit_manifest,
     normalize_ruff_json, run_ruff_session, validate_generated_session, validate_request,
@@ -63,6 +67,56 @@ impl FakeRuff {
 impl Drop for FakeRuff {
     fn drop(&mut self) {
         let _ignored = fs::remove_dir_all(&self.root);
+    }
+}
+
+#[cfg(unix)]
+struct WatchdogChild {
+    child: Child,
+    fake_process_group: PathBuf,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl WatchdogChild {
+    fn new(child: Child, fake_process_group: PathBuf) -> Self {
+        Self {
+            child,
+            fake_process_group,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for WatchdogChild {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ignored = self.child.kill();
+        let _ignored = self.child.wait();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while marked_process_group_exists(&self.fake_process_group) != Some(false)
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[cfg(unix)]
+fn marked_process_group_exists(marker: &Path) -> Option<bool> {
+    let raw_pid = fs::read_to_string(marker).ok()?.parse::<i32>().ok()?;
+    let process_group = rustix::process::Pid::from_raw(raw_pid)?;
+    match rustix::process::test_kill_process_group(process_group) {
+        Ok(()) => Some(true),
+        Err(rustix::io::Errno::SRCH) => Some(false),
+        Err(_) => None,
     }
 }
 
@@ -537,18 +591,91 @@ fn malformed_version_is_text_evidence_not_json() {
 #[cfg(unix)]
 #[test]
 fn timeout_is_incomplete_and_retains_stderr_evidence() {
-    let fake = FakeRuff::new("printf 'started' >&2; while :; do :; done");
+    let fake = FakeRuff::new(
+        "(sleep 12; kill -KILL 0) & printf '%s' \"$$\" > \"$DT_RUFF_PID_MARKER\"; printf 'started' >&2; while :; do sleep 1; done",
+    );
+    let marker = fake.root.join("ruff-pgid");
     let mut request = request();
-    request.limits.timeout_ms = 50;
-    let session = run_ruff_session(&request, &fake.root, &fake.program).unwrap();
+    // Give the spawned fixture a scheduling window before the timeout. The
+    // contract under test is retention after output, not sub-50 ms startup.
+    request.limits.timeout_ms = 500;
+    let mut paths = vec![fake.root.clone()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let child = Command::new(env!("CARGO_BIN_EXE_diagnostic-triage-provider-python"))
+        .current_dir(&fake.root)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("DT_RUFF_PID_MARKER", &marker)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = WatchdogChild::new(child, marker);
+    let mut request_bytes = serde_json::to_vec(&request).unwrap();
+    request_bytes.push(b'\n');
+    child
+        .child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&request_bytes)
+        .unwrap();
 
-    assert_eq!(session.completion.status, ExecutionStatus::Incomplete);
-    assert_eq!(session.completion.tool_exit_code.0, None);
-    assert!(session.completion.tool_duration_ms <= 50);
-    assert!(session.events.iter().any(|event| matches!(
+    let status = child.child.wait_timeout(Duration::from_secs(10)).unwrap();
+    let status = status.expect("provider exceeded the independent 10 s watchdog");
+    assert!(status.success());
+    assert_eq!(
+        marked_process_group_exists(&child.fake_process_group),
+        Some(false),
+        "provider returned before the Fake Ruff process group disappeared"
+    );
+    child.disarm();
+    let mut output = String::new();
+    child
+        .child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    let mut lines = output.lines();
+    let manifest = lines.next().expect("provider emits a manifest first");
+    assert_eq!(
+        format!("{manifest}\n").as_bytes(),
+        include_bytes!("golden/manifest.jsonl")
+    );
+    let events = lines
+        .map(|line| serde_json::from_str::<ProtocolEnvelope>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ProtocolEnvelope::Completion(_)))
+            .count(),
+        1
+    );
+    let completion = events
+        .iter()
+        .find_map(|event| match event {
+            ProtocolEnvelope::Completion(value) => Some(value.clone()),
+            _ => None,
+        })
+        .expect("provider emits one completion");
+
+    assert_eq!(completion.status, ExecutionStatus::Incomplete);
+    assert_eq!(completion.tool_exit_code.0, None);
+    assert!(events.iter().any(|event| matches!(
         event,
         ProtocolEnvelope::Evidence(value) if value.evidence.source == EvidenceSource::Stderr
     )));
+    let session = ProviderSession {
+        events: events
+            .into_iter()
+            .filter(|event| !matches!(event, ProtocolEnvelope::Completion(_)))
+            .collect(),
+        completion,
+    };
     validate_generated_session(&request, &session).unwrap();
 }
 
