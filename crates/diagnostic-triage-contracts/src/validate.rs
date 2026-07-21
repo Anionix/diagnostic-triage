@@ -358,6 +358,14 @@ fn validate_report_references(
         )?;
     }
     let finding_fingerprints_by_execution = validate_finding_references(report, index)?;
+    let referenced_observations = report
+        .findings
+        .iter()
+        .flat_map(|finding| &finding.observation_ids)
+        .collect::<HashSet<_>>();
+    if referenced_observations.len() != index.observations.len() {
+        return Err(model_error("observation is not referenced by a finding"));
+    }
     validate_target_fingerprints(report, &finding_fingerprints_by_execution)
 }
 

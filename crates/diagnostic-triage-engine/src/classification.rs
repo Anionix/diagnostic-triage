@@ -97,6 +97,12 @@ impl ClassificationRule {
             .into());
         }
         self.taxonomy.validate()?;
+        if self.taxonomy.category == Category::Unknown {
+            return Err(EngineInputError::ReservedClassificationTaxonomy {
+                rule_id: self.id.clone(),
+            }
+            .into());
+        }
         Ok(())
     }
 

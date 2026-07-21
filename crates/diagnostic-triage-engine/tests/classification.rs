@@ -204,6 +204,33 @@ fn unmapped_native_diagnostics_use_typed_unknown_without_inference() {
 }
 
 #[test]
+fn top_level_unknown_is_reserved_for_builtin_fallback() {
+    let reserved = rule(
+        "ty.configured-unknown",
+        RuleIdSelector::Any,
+        taxonomy(Category::Unknown, MicroCategory::Unknown),
+    );
+    assert!(matches!(
+        classify_observation(&observation(None), &[reserved]),
+        Err(EngineError::Input(
+            EngineInputError::ReservedClassificationTaxonomy { rule_id }
+        )) if rule_id == "ty.configured-unknown"
+    ));
+
+    let category_scoped = rule(
+        "ty.type-unknown",
+        RuleIdSelector::Any,
+        taxonomy(Category::Type, MicroCategory::Unknown),
+    );
+    let selected = classify_observation(&observation(None), &[category_scoped]).unwrap();
+    assert_catalog_rule(&selected, "ty.type-unknown");
+    assert_eq!(
+        selected.taxonomy,
+        taxonomy(Category::Type, MicroCategory::Unknown)
+    );
+}
+
+#[test]
 fn exact_tool_version_beats_generic_independent_of_catalog_order() {
     let mut generic = rule(
         "ty.generic",

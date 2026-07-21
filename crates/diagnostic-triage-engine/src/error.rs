@@ -33,6 +33,8 @@ pub enum EngineInputError {
     NonCanonicalClassificationNativeRuleId { rule_id: String },
     #[error("classification rule ID is duplicated: {rule_id}")]
     DuplicateClassificationRuleId { rule_id: String },
+    #[error("classification rule {rule_id} targets reserved taxonomy unknown.unknown")]
+    ReservedClassificationTaxonomy { rule_id: String },
     #[error("classification catalog exceeds the v1 limit of {max} rules: {actual}")]
     ClassificationCatalogTooLarge { actual: usize, max: usize },
     #[error("observation {observation_id} has a noncanonical tool identity")]

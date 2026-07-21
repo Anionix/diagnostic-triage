@@ -827,6 +827,12 @@ fn rejects_semantically_inconsistent_reports() {
     missing_decision["decisions"] = json!([]);
     candidates.push(("missing decision", missing_decision));
 
+    let mut orphan_observation = report_fixture();
+    orphan_observation["findings"] = json!([]);
+    orphan_observation["decisions"] = json!([]);
+    orphan_observation["verdict"] = json!("PASS");
+    candidates.push(("orphan observation", orphan_observation));
+
     for (name, candidate) in candidates {
         assert!(rejects_report(&candidate), "accepted {name}");
     }
@@ -1161,6 +1167,29 @@ fn fix_candidate_may_cover_multiple_rules_from_one_tool_version() {
         .push(second_observation);
     report["fix_candidates"][0]["observation_ids"] =
         json!([observation_id(&report), second_observation_id]);
+    let second_finding_id = "019f7e95-0000-7000-8000-000000000112";
+    let mut second_finding = report["findings"][0].clone();
+    second_finding["finding_id"] = json!(second_finding_id);
+    second_finding["fingerprint"] = json!(format!("dtfp1:{}", "e".repeat(64)));
+    second_finding["observation_ids"] = json!([second_observation_id]);
+    second_finding["tool"]["rule_id"] = json!("E501");
+    second_finding["message"] = json!("line too long");
+    second_finding["state"] = json!("FIX_PROPOSED");
+    second_finding
+        .as_object_mut()
+        .expect("finding is an object")
+        .remove("verification_execution_ids");
+    report["findings"]
+        .as_array_mut()
+        .expect("findings is an array")
+        .push(second_finding);
+    let mut second_decision = report["decisions"][0].clone();
+    second_decision["decision_id"] = json!("019f7e95-0000-7000-8000-000000000113");
+    second_decision["finding_id"] = json!(second_finding_id);
+    report["decisions"]
+        .as_array_mut()
+        .expect("decisions is an array")
+        .push(second_decision);
 
     validate_report_json(&serde_json::to_vec(&report).unwrap())
         .expect("one tool version may propose a candidate spanning multiple rules");
