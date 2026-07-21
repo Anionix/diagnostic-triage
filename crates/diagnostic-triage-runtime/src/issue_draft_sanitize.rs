@@ -613,10 +613,11 @@ fn authorization_secret_at(neutralized: &NeutralizedText, index: usize) -> Optio
         if let Some(key_end) = generated_keyword_end(neutralized, index, b"authorization") {
             let separator = skip_provenance_whitespace(neutralized, key_end);
             matches!(bytes.get(separator), Some(b'=' | b':')).then_some(())?;
-            // LLM contract: AUTH_KEY -> PROVENANCE_WHITESPACE -> CREDENTIAL | EMPTY_ASSIGNMENT.
+            // LLM contract: AUTH_KEY -> RECORD_BOUNDARY_EMPTY | SAME_RECORD_CREDENTIAL.
             let value_start = separator + 1;
-            let cursor = skip_provenance_whitespace(neutralized, value_start);
-            if cursor > value_start && looks_like_assignment(value, cursor, Some(neutralized)) {
+            let (cursor, crossed_record_boundary) =
+                skip_authorization_value_whitespace(neutralized, value_start);
+            if crossed_record_boundary && looks_like_assignment(value, cursor, Some(neutralized)) {
                 return None;
             }
             cursor
@@ -689,6 +690,31 @@ fn skip_provenance_whitespace(neutralized: &NeutralizedText, mut cursor: usize) 
         cursor += character.len_utf8();
     }
     cursor
+}
+
+fn skip_authorization_value_whitespace(
+    neutralized: &NeutralizedText,
+    mut cursor: usize,
+) -> (usize, bool) {
+    let mut crossed_record_boundary = false;
+    loop {
+        if let Some(marker) = neutralized
+            .marker_at(cursor)
+            .filter(|marker| is_assignment_whitespace_marker(*marker))
+        {
+            crossed_record_boundary |= matches!(marker.code_point, 0x000a | 0x000d);
+            cursor = marker.end;
+            continue;
+        }
+        let Some(character) = neutralized.as_str()[cursor..].chars().next() else {
+            break;
+        };
+        if !character.is_whitespace() {
+            break;
+        }
+        cursor += character.len_utf8();
+    }
+    (cursor, crossed_record_boundary)
 }
 
 fn is_assignment_whitespace_marker(marker: GeneratedMarker) -> bool {
@@ -1618,16 +1644,62 @@ mod tests {
     }
 
     #[test]
+    fn redacts_assignment_shaped_authorization_credentials_on_the_same_record() {
+        let cases = [
+            (
+                "Authorization: ApiKey=abcdef",
+                "Authorization: [REDACTED_SECRET]",
+            ),
+            (
+                "Authorization: Credential=abcdef",
+                "Authorization: [REDACTED_SECRET]",
+            ),
+            (
+                "authorization:\tcredential=abcdef",
+                "authorization:[CONTROL-U+0009][REDACTED_SECRET]",
+            ),
+            (
+                "Authorization:\nnext=ok",
+                "Authorization:[CONTROL-U+000A]next=ok",
+            ),
+            (
+                "Authorization:\r\nnext=ok",
+                "Authorization:[CONTROL-U+000D][CONTROL-U+000A]next=ok",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                sanitize_external_text(input, expected.len())
+                    .unwrap()
+                    .as_str(),
+                expected,
+                "input {input:?}"
+            );
+            assert_eq!(
+                sanitize_external_text(input, expected.len() - 1),
+                Err(SanitizeError::OutputLimitExceeded {
+                    max_bytes: expected.len() - 1,
+                }),
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
     fn empty_authorization_preserves_only_provenance_backed_following_assignments() {
         let cases = [
             (
                 "Authorization:\nnext=ok",
                 "Authorization:[CONTROL-U+000A]next=ok",
             ),
-            ("Authorization:   next=ok", "Authorization:   next=ok"),
+            (
+                "Authorization:   next=ok",
+                "Authorization:   [REDACTED_SECRET]",
+            ),
             (
                 "Authorization:\tnext=ok",
-                "Authorization:[CONTROL-U+0009]next=ok",
+                "Authorization:[CONTROL-U+0009][REDACTED_SECRET]",
             ),
             ("--token=\nnext=ok", "--token=[CONTROL-U+000A]next=ok"),
             (
