@@ -442,16 +442,19 @@ struct SarifLocation<'a> {
 impl<'a> SarifLocation<'a> {
     fn new(location: Option<&Location>, symbol: Option<&'a str>) -> Self {
         Self {
-            physical_location: location.map(|location| SarifPhysicalLocation {
-                artifact_location: SarifArtifactLocation {
-                    uri: encode_repo_relative_uri(location.path.as_str()),
-                },
-                region: SarifRegion {
-                    start_line: location.start.line,
-                    start_column: location.start.column,
-                    end_line: location.end.as_ref().map(|end| end.line),
-                    end_column: location.end.as_ref().map(|end| end.column),
-                },
+            physical_location: location.map(|location| {
+                let end = location.end.as_ref().unwrap_or(&location.start);
+                SarifPhysicalLocation {
+                    artifact_location: SarifArtifactLocation {
+                        uri: encode_repo_relative_uri(location.path.as_str()),
+                    },
+                    region: SarifRegion {
+                        start_line: location.start.line,
+                        start_column: location.start.column,
+                        end_line: end.line,
+                        end_column: end.column,
+                    },
+                }
             }),
             logical_locations: symbol
                 .map(|name| SarifLogicalLocation { name })
@@ -478,10 +481,8 @@ struct SarifArtifactLocation {
 struct SarifRegion {
     start_line: u32,
     start_column: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    end_line: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    end_column: Option<u32>,
+    end_line: u32,
+    end_column: u32,
 }
 
 #[derive(Serialize)]

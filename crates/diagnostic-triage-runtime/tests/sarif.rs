@@ -142,6 +142,24 @@ fn empty_and_locationless_reports_use_valid_optional_shapes() {
 }
 
 #[test]
+fn point_locations_emit_an_explicit_zero_width_sarif_region() {
+    let mut report = report("valid-report.json");
+    report.observations[0].location.as_mut().unwrap().end = None;
+    report.findings[0].location.as_mut().unwrap().end = None;
+    let value = encoded_value(report);
+
+    assert_eq!(
+        value["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"],
+        json!({
+            "startLine": 7,
+            "startColumn": 12,
+            "endLine": 7,
+            "endColumn": 12
+        })
+    );
+}
+
+#[test]
 fn repository_paths_are_utf8_percent_encoded_without_becoming_file_uris() {
     let mut report = report("valid-report.json");
     let path: RepoPath = "src/空 白:#?%\n\u{1f}.rs".parse().unwrap();
