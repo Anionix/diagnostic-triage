@@ -102,7 +102,7 @@ pub(crate) fn sanitize_external_text(
     max_bytes: usize,
 ) -> Result<SanitizedText, SanitizeError> {
     let neutralized = neutralize_external_text(value, max_bytes)?;
-    redact_unquoted_assignments(neutralized.as_str(), max_bytes)
+    redact_secret_assignments(neutralized.as_str(), max_bytes)
 }
 
 fn neutralize_external_text(
@@ -254,14 +254,16 @@ fn is_secret_key(value: &str) -> bool {
     )
 }
 
-fn redact_unquoted_assignments(
+fn redact_secret_assignments(
     value: &str,
     max_bytes: usize,
 ) -> Result<SanitizedText, SanitizeError> {
     let mut output = BoundedText::new(value.len(), max_bytes);
     let mut index = 0;
     while index < value.len() {
-        if let Some((start, end)) = unquoted_secret_at(value, index) {
+        if let Some((start, end)) =
+            unquoted_secret_at(value, index).or_else(|| quoted_secret_at(value, index))
+        {
             output.push_str(&value[index..start])?;
             output.push_str("[REDACTED_SECRET]")?;
             index = end;
@@ -729,6 +731,52 @@ mod tests {
             let (start, end) = quoted_secret_at(&input, 0).unwrap();
             assert_eq!(&input[start..end], expected, "escaped input {input:?}");
         }
+    }
+
+    #[test]
+    fn redacts_quoted_spans_and_preserves_outer_delimiters() {
+        let cases = [
+            ("token=\"secret\" next", "token=\"[REDACTED_SECRET]\" next"),
+            ("token='秘密' tail", "token='[REDACTED_SECRET]' tail"),
+            (
+                "token=\\\"secret\\\" next",
+                "token=\\\"[REDACTED_SECRET]\\\" next",
+            ),
+            ("token=\"missing", "token=\"[REDACTED_SECRET]"),
+            ("token=\\\"missing", "token=\\\"[REDACTED_SECRET]"),
+            (
+                "token=one password='two' client_secret=\\\"three\\\" end",
+                "token=[REDACTED_SECRET] password='[REDACTED_SECRET]' client_secret=\\\"[REDACTED_SECRET]\\\" end",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                sanitize_external_text(input, 4096).unwrap().as_str(),
+                expected,
+                "input {input:?}"
+            );
+        }
+
+        for input in ["token=\"\"", "token=''", "token=\\\"\\\""] {
+            assert_eq!(sanitize_external_text(input, 4096).unwrap().as_str(), input);
+        }
+    }
+
+    #[test]
+    fn quoted_redaction_obeys_the_exact_output_bound() {
+        let expected = "token=\"[REDACTED_SECRET]\"";
+        assert_eq!(
+            sanitize_external_text("token=\"x\"", expected.len())
+                .unwrap()
+                .as_str(),
+            expected
+        );
+        assert_eq!(
+            sanitize_external_text("token=\"x\"", expected.len() - 1),
+            Err(SanitizeError::OutputLimitExceeded {
+                max_bytes: expected.len() - 1,
+            })
+        );
     }
 
     #[test]
