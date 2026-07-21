@@ -349,9 +349,12 @@ fn redact_secret_assignments(
 
 fn token_shape_at(value: &str, index: usize) -> Option<(usize, usize)> {
     is_word_boundary(value, index, true).then_some(())?;
-    let end = provider_token_end(value, index)
-        .or_else(|| jwt_token_end(value, index))
-        .or_else(|| generic_token_end(value, index))?;
+    if let Some(end) = provider_token_end(value, index).or_else(|| jwt_token_end(value, index)) {
+        return Some((index, end));
+    }
+    let end = generic_token_end(value, index)?;
+    // LLM contract: GENERIC_CANDIDATE -> REPO_RELATIVE_COMPONENT_PRESERVED | SECRET_SHAPE_REDACTED.
+    (!is_repository_relative_path_component(value, index, end)).then_some(())?;
     Some((index, end))
 }
 
@@ -395,6 +398,79 @@ fn generic_token_end(value: &str, index: usize) -> Option<usize> {
         && diverse
         && is_word_boundary(value, end, false))
     .then_some(end)
+}
+
+fn is_repository_relative_path_component(value: &str, start: usize, end: usize) -> bool {
+    const MAX_REPO_PATH_BYTES: usize = 4_096 * 4;
+
+    let bytes = value.as_bytes();
+    let has_separator = start
+        .checked_sub(1)
+        .and_then(|index| bytes.get(index))
+        .is_some_and(|byte| *byte == b'/')
+        || bytes.get(end).is_some_and(|byte| *byte == b'/');
+    if !has_separator {
+        return false;
+    }
+
+    let mut path_start = 0;
+    let mut inspected = 0;
+    for (offset, character) in value[..start].char_indices().rev() {
+        inspected += character.len_utf8();
+        if inspected > MAX_REPO_PATH_BYTES {
+            return false;
+        }
+        if is_path_surface_delimiter(character) {
+            path_start = offset + character.len_utf8();
+            break;
+        }
+    }
+
+    let mut path_end = value.len();
+    inspected = 0;
+    for (offset, character) in value[end..].char_indices() {
+        inspected += character.len_utf8();
+        if inspected > MAX_REPO_PATH_BYTES {
+            return false;
+        }
+        if is_path_surface_delimiter(character) {
+            path_end = end + offset;
+            break;
+        }
+    }
+
+    let candidate = &value[path_start..path_end];
+    candidate.contains('/')
+        && candidate.len() <= MAX_REPO_PATH_BYTES
+        && candidate
+            .parse::<diagnostic_triage_contracts::RepoPath>()
+            .is_ok()
+}
+
+fn is_path_surface_delimiter(character: char) -> bool {
+    character.is_whitespace()
+        || matches!(
+            character,
+            '"' | '\''
+                | '`'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | ','
+                | ';'
+                | '='
+                | ':'
+                | '|'
+                | '&'
+                | '?'
+                | '#'
+                | '!'
+        )
 }
 
 fn bounded_token_end(
@@ -1617,6 +1693,51 @@ mod tests {
         }
         let actual = sanitize_external_text("ghp_A1A1A1A1A1\u{200b}A1A1A1A1A1", 4096).unwrap();
         assert_eq!(actual.as_str(), "ghp_A1A1A1A1A1[FORMAT-U+200B]A1A1A1A1A1");
+    }
+
+    #[test]
+    fn preserves_repository_relative_path_components_without_weakening_token_redaction() {
+        let first = "Ab1_".repeat(8);
+        let second = "Cd2-".repeat(8);
+        for path in [
+            format!("dist/{first}/bundle.js"),
+            format!("資料/{first}/詳細/{second}/mod.rs"),
+            format!("{first}/bundle.js"),
+            format!("dist/{first}"),
+        ] {
+            let actual = sanitize_external_text(&path, path.len()).unwrap();
+            assert_eq!(actual.as_str(), path);
+        }
+
+        let path = format!("dist/{first}/bundle.js");
+        assert_eq!(
+            sanitize_external_text(&path, path.len() - 1),
+            Err(SanitizeError::OutputLimitExceeded {
+                max_bytes: path.len() - 1,
+            })
+        );
+
+        for input in [
+            first.clone(),
+            format!("https://example.test/{first}/bundle.js"),
+            format!("/dist/{first}/bundle.js"),
+            format!("../dist/{first}/bundle.js"),
+        ] {
+            let actual = sanitize_external_text(&input, 4096).unwrap();
+            assert!(actual.as_str().contains("[REDACTED_SECRET]"));
+        }
+
+        let provider = format!("dist/ghp_{}/bundle.js", "A1".repeat(10));
+        assert_eq!(
+            sanitize_external_text(&provider, 4096).unwrap().as_str(),
+            "dist/[REDACTED_SECRET]/bundle.js"
+        );
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.e30.c2lnbmF0dXJlMDEyMzQ1Njc4OTA";
+        let jwt_path = format!("dist/{jwt}/bundle.js");
+        assert_eq!(
+            sanitize_external_text(&jwt_path, 4096).unwrap().as_str(),
+            "dist/[REDACTED_SECRET]/bundle.js"
+        );
     }
 
     #[test]
