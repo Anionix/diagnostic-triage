@@ -475,8 +475,8 @@ fn parse_version(bytes: &[u8], expected_name: &str) -> Result<String, String> {
     Ok(version.unwrap_or_default().to_owned())
 }
 
-// LLM contract: DISCOVERED -> SCOPE_SELECTED -> EXECUTED -> OBSERVED -> REPORTED;
-// invalid or unsupported scope terminates as INCOMPLETE | UNSUPPORTED.
+// Cargo scope state is selected before execution so observations stay within the requested
+// workspace or manifest; invalid or unsupported scope terminates as INCOMPLETE | UNSUPPORTED.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum CargoScope {
     Workspace,
@@ -1431,6 +1431,21 @@ mod tests {
         assert_eq!(value.adapter.id.as_str(), "rust");
         assert_eq!(value.adapter.languages[0].as_str(), "rust");
         assert_eq!(value.adapter.capabilities[0].as_str(), CHECK_CAPABILITY);
+    }
+
+    #[test]
+    fn llm_contract_markers_use_the_canonical_lifecycle() {
+        let marker = ["// LLM", " contract:"].concat();
+        let expected_suffix = "DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.";
+        let suffixes = include_str!("lib.rs")
+            .lines()
+            .filter_map(|line| line.split_once(&marker).map(|(_, suffix)| suffix.trim()))
+            .collect::<Vec<_>>();
+
+        assert!(!suffixes.is_empty(), "lifecycle marker must remain present");
+        for suffix in suffixes {
+            assert_eq!(suffix, expected_suffix, "noncanonical lifecycle marker");
+        }
     }
 
     #[test]
