@@ -29,7 +29,9 @@ use std::os::fd::AsFd;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
-const PROCESS_GROUP_GRACE: Duration = Duration::from_millis(500);
+// Darwin can retain killed orphan zombies until the system reaper collects
+// them; the probe still returns immediately once the group is absent.
+const PROCESS_GROUP_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProcessLimits {
@@ -641,6 +643,23 @@ fn terminate_child(
     } else {
         group_signal(process_group).err()
     };
+    // LLM cleanup contract: SIGNALING -> REAPING only suppresses a native
+    // zombie-race EPERM after a non-reaping exit observation; injected signal
+    // failures remain typed cleanup evidence.
+    let leader_exited_during_native_permission_race = match group_signal_error.as_ref() {
+        Some(source)
+            if !leader_exited_before_signal && is_native_group_permission_error(source) =>
+        {
+            match child_exited_without_reaping(child) {
+                Ok(exited) => exited,
+                Err(source) => {
+                    errors.push(ProcessError::Wait(source));
+                    false
+                }
+            }
+        }
+        _ => false,
+    };
     let group_signal_failed = group_signal_error.is_some();
     if exit_status.is_none() {
         match child.try_wait() {
@@ -667,7 +686,9 @@ fn terminate_child(
         (&group_signal_error, &group_wait),
         (Some(source), Ok(true))
             if source.kind() == io::ErrorKind::PermissionDenied
-                && leader_exited_before_signal
+                && is_native_group_permission_error(source)
+                && (leader_exited_before_signal
+                    || leader_exited_during_native_permission_race)
                 && exit_status.is_some()
     );
     if let Some(source) = group_signal_error {
@@ -685,6 +706,19 @@ fn terminate_child(
     } else {
         Err(combine_errors(errors))
     }
+}
+
+#[cfg(unix)]
+fn is_native_group_permission_error(source: &io::Error) -> bool {
+    let native = io::Error::from(rustix::io::Errno::PERM);
+    source.kind() == io::ErrorKind::PermissionDenied
+        && source.raw_os_error().is_some()
+        && source.raw_os_error() == native.raw_os_error()
+}
+
+#[cfg(not(unix))]
+fn is_native_group_permission_error(_: &io::Error) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -957,7 +991,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn zombie_only_permission_error_is_suppressed_without_resignal() {
+    fn injected_zombie_permission_error_is_typed_without_resignal() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         static SIGNAL_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -967,17 +1001,16 @@ mod tests {
         }
 
         SIGNAL_CALLS.store(0, Ordering::SeqCst);
-        let outcome = run_direct_with_group_signal(
+        let error = run_direct_with_group_signal(
             OsStr::new("/usr/bin/true"),
             &[],
             Path::new("."),
             limits(64, 64),
             deny_and_count,
         )
-        .expect("a zombie-only EPERM is resolved by the post-reap retry");
+        .expect_err("an injected group-signal failure remains typed");
 
-        assert_eq!(outcome.state, ProcessState::Complete);
-        assert_eq!(outcome.exit_code, Some(0));
+        assert!(contains_group_signal(&error), "error: {error:?}");
         assert_eq!(SIGNAL_CALLS.load(Ordering::SeqCst), 1);
     }
 
