@@ -222,9 +222,15 @@ fn execute_with_program(request: &RequestEnvelope, program: &Path) -> ProviderRe
         Ok(roots) => roots,
         Err(error) => return incomplete(request, Vec::new(), Duration::ZERO, error.to_string()),
     };
-    if let Err(error) = validate_targets(request, &repository_root, &workspace_root) {
-        return incomplete(request, Vec::new(), Duration::ZERO, error.to_string());
-    }
+    let scope = match select_cargo_scope(request, &repository_root, &workspace_root) {
+        Ok(scope) => scope,
+        Err(error) => return incomplete(request, Vec::new(), Duration::ZERO, error.to_string()),
+    };
+    let diagnostic_scope = DiagnosticScope {
+        cargo: &scope,
+        repository_root: &repository_root,
+        workspace_root: &workspace_root,
+    };
 
     let started = Instant::now();
     let mut usage = ProcessUsage::default();
@@ -277,7 +283,7 @@ fn execute_with_program(request: &RequestEnvelope, program: &Path) -> ProviderRe
     let check_outcome = match run_step(
         request,
         program,
-        &cargo_argv("check"),
+        &cargo_argv("check", &scope),
         &workspace_root,
         started,
         usage,
@@ -295,7 +301,7 @@ fn execute_with_program(request: &RequestEnvelope, program: &Path) -> ProviderRe
     usage.add(&check_outcome);
     let check_exit = match append_phase(
         request,
-        &workspace_root,
+        &diagnostic_scope,
         CARGO_CHECK_TOOL,
         &cargo_version,
         &check_outcome,
@@ -353,7 +359,7 @@ fn execute_with_program(request: &RequestEnvelope, program: &Path) -> ProviderRe
     let clippy_outcome = match run_step(
         request,
         program,
-        &cargo_argv("clippy"),
+        &cargo_argv("clippy", &scope),
         &workspace_root,
         started,
         usage,
@@ -370,7 +376,7 @@ fn execute_with_program(request: &RequestEnvelope, program: &Path) -> ProviderRe
     };
     let clippy = match append_phase(
         request,
-        &workspace_root,
+        &diagnostic_scope,
         CLIPPY_TOOL,
         &clippy_version,
         &clippy_outcome,
@@ -469,25 +475,43 @@ fn parse_version(bytes: &[u8], expected_name: &str) -> Result<String, String> {
     Ok(version.unwrap_or_default().to_owned())
 }
 
-fn cargo_argv(command: &str) -> Vec<String> {
-    // Cargo owns package/target selection. Request targets constrain the
-    // repository scope but are not converted into unsupported file arguments.
-    [
-        command,
-        "--workspace",
-        "--all-targets",
-        "--locked",
-        "--message-format=json",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect()
+// LLM contract: DISCOVERED -> SCOPE_SELECTED -> EXECUTED -> OBSERVED -> REPORTED;
+// invalid or unsupported scope terminates as INCOMPLETE | UNSUPPORTED.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CargoScope {
+    Workspace,
+    Manifest {
+        manifest: PathBuf,
+        repository_path: RepoPath,
+    },
+}
+
+struct DiagnosticScope<'a> {
+    cargo: &'a CargoScope,
+    repository_root: &'a Path,
+    workspace_root: &'a Path,
+}
+
+fn cargo_argv(command: &str, scope: &CargoScope) -> Vec<String> {
+    let mut argv = vec![command.to_owned()];
+    match scope {
+        CargoScope::Workspace => argv.push("--workspace".to_owned()),
+        CargoScope::Manifest { manifest, .. } => {
+            argv.extend(["--manifest-path".to_owned(), manifest.display().to_string()]);
+        }
+    }
+    argv.extend([
+        "--all-targets".to_owned(),
+        "--locked".to_owned(),
+        "--message-format=json".to_owned(),
+    ]);
+    argv
 }
 
 #[allow(clippy::too_many_arguments)]
 fn append_phase(
     request: &RequestEnvelope,
-    workspace_root: &Path,
+    scope: &DiagnosticScope<'_>,
     tool_name: &str,
     tool_version: &str,
     outcome: &ProcessOutcome,
@@ -513,7 +537,7 @@ fn append_phase(
     validate_phase_result(&report, exit_code)?;
     append_observations(
         request,
-        workspace_root,
+        scope,
         tool_name,
         tool_version,
         &report,
@@ -550,7 +574,7 @@ fn validate_phase_result(report: &CargoReport, exit_code: u8) -> Result<(), Prov
 #[allow(clippy::too_many_arguments)]
 fn append_observations(
     request: &RequestEnvelope,
-    workspace_root: &Path,
+    scope: &DiagnosticScope<'_>,
     tool_name: &str,
     tool_version: &str,
     report: &CargoReport,
@@ -569,8 +593,12 @@ fn append_observations(
             continue;
         }
         let location = primary
-            .map(|span| location(span, &request.workspace, workspace_root))
-            .transpose()?;
+            .map(|span| scoped_location(span, scope))
+            .transpose()?
+            .flatten();
+        if primary.is_some() && location.is_none() {
+            continue;
+        }
         let message = diagnostic_message(diagnostic);
         let rule_id = diagnostic.code.as_ref().map(|code| code.code.clone());
         let key = observation_key(&severity, rule_id.as_deref(), &message, location.as_ref());
@@ -648,14 +676,10 @@ fn truncate_chars(value: &str, maximum: usize) -> String {
         .collect()
 }
 
-fn location(
-    span: &RustcSpan,
-    workspace: &RepoPath,
-    workspace_root: &Path,
-) -> Result<Location, ProviderError> {
+fn location(span: &RustcSpan, scope: &DiagnosticScope<'_>) -> Result<Location, ProviderError> {
     validate_rustc_span(span)?;
     let location = Location {
-        path: normalize_path(&span.file_name, workspace, workspace_root)?,
+        path: normalize_path(&span.file_name, scope)?,
         // rustc JSON exposes one-based character offsets with an exclusive
         // span end, so its Unicode code-point coordinates match Location v1.
         start: Position {
@@ -671,6 +695,22 @@ fn location(
         .validate()
         .map_err(|error| ProviderError::Model(error.to_string()))?;
     Ok(location)
+}
+
+fn scoped_location(
+    span: &RustcSpan,
+    scope: &DiagnosticScope<'_>,
+) -> Result<Option<Location>, ProviderError> {
+    match location(span, scope) {
+        Ok(location) => Ok(Some(location)),
+        Err(error)
+            if matches!(error, ProviderError::Path(_))
+                && is_existing_repository_sibling(&span.file_name, scope)? =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn validate_rustc_span(span: &RustcSpan) -> Result<(), ProviderError> {
@@ -695,50 +735,108 @@ fn validate_rustc_span(span: &RustcSpan) -> Result<(), ProviderError> {
     Ok(())
 }
 
-fn normalize_path(
-    raw: &str,
-    workspace: &RepoPath,
-    workspace_root: &Path,
-) -> Result<RepoPath, ProviderError> {
+fn normalize_path(raw: &str, scope: &DiagnosticScope<'_>) -> Result<RepoPath, ProviderError> {
     if raw.contains(['\\', '\0']) || raw.contains("://") {
         return Err(ProviderError::Path(raw.to_owned()));
     }
+    let scope_root = canonical_scope_root(scope.cargo, scope.repository_root)?;
     let raw_path = Utf8Path::new(raw);
-    let relative = if raw_path.is_absolute() {
+    if raw_path.is_absolute() {
         let canonical =
             std::fs::canonicalize(raw_path).map_err(|_| ProviderError::Path(raw.to_owned()))?;
         let stripped = canonical
-            .strip_prefix(workspace_root)
+            .strip_prefix(scope.repository_root)
             .map_err(|_| ProviderError::Path(raw.to_owned()))?;
-        Utf8PathBuf::from_path_buf(stripped.to_path_buf())
-            .map_err(|_| ProviderError::Path(raw.to_owned()))?
-    } else {
-        let mut normalized = raw;
-        while let Some(stripped) = normalized.strip_prefix("./") {
-            normalized = stripped;
+        if !canonical.starts_with(&scope_root) {
+            return Err(ProviderError::Path(raw.to_owned()));
         }
-        Utf8PathBuf::from(normalized)
-    };
-    let repository_path = if workspace.as_str() == "." {
+        return RepoPath::from_str(
+            Utf8PathBuf::from_path_buf(stripped.to_path_buf())
+                .map_err(|_| ProviderError::Path(raw.to_owned()))?
+                .as_str(),
+        )
+        .map_err(|_| ProviderError::Path(raw.to_owned()));
+    }
+
+    let mut normalized = raw;
+    while let Some(stripped) = normalized.strip_prefix("./") {
+        normalized = stripped;
+    }
+    let relative = Utf8PathBuf::from(normalized);
+    RepoPath::from_str(relative.as_str()).map_err(|_| ProviderError::Path(raw.to_owned()))?;
+
+    let repository_path = if path_is_in_scope(&relative, scope.cargo) {
         relative
     } else {
-        Utf8PathBuf::from(workspace.as_str()).join(relative)
+        let workspace_prefix = scope
+            .workspace_root
+            .strip_prefix(scope.repository_root)
+            .map_err(|_| ProviderError::Path(raw.to_owned()))?;
+        let workspace_prefix = Utf8PathBuf::from_path_buf(workspace_prefix.to_path_buf())
+            .map_err(|_| ProviderError::Path(raw.to_owned()))?;
+        let from_workspace = workspace_prefix.join(&relative);
+        let workspace_candidate = scope.workspace_root.join(relative.as_str());
+        if !path_is_in_scope(&from_workspace, scope.cargo) || !workspace_candidate.exists() {
+            return Err(ProviderError::Path(raw.to_owned()));
+        }
+        from_workspace
     };
-    let parsed = RepoPath::from_str(repository_path.as_str())
-        .map_err(|_| ProviderError::Path(raw.to_owned()))?;
-    let candidate = workspace_root.join(
-        repository_path
-            .strip_prefix(workspace.as_str())
-            .unwrap_or(repository_path.as_path()),
-    );
+    let candidate = scope.repository_root.join(repository_path.as_str());
     if candidate.exists() {
         let canonical =
             std::fs::canonicalize(candidate).map_err(|_| ProviderError::Path(raw.to_owned()))?;
-        if !canonical.starts_with(workspace_root) {
+        if !canonical.starts_with(scope_root) {
             return Err(ProviderError::Path(raw.to_owned()));
         }
     }
-    Ok(parsed)
+    RepoPath::from_str(repository_path.as_str()).map_err(|_| ProviderError::Path(raw.to_owned()))
+}
+
+fn path_is_in_scope(path: &Utf8Path, scope: &CargoScope) -> bool {
+    match scope {
+        CargoScope::Workspace => true,
+        CargoScope::Manifest {
+            repository_path, ..
+        } => path.starts_with(Utf8Path::new(repository_path.as_str())),
+    }
+}
+
+fn canonical_scope_root(
+    scope: &CargoScope,
+    repository_root: &Path,
+) -> Result<PathBuf, ProviderError> {
+    let path = match scope {
+        CargoScope::Workspace => repository_root.to_path_buf(),
+        CargoScope::Manifest {
+            repository_path, ..
+        } => repository_root.join(repository_path.as_str()),
+    };
+    std::fs::canonicalize(path).map_err(ProviderError::Io)
+}
+
+fn is_existing_repository_sibling(
+    raw: &str,
+    scope: &DiagnosticScope<'_>,
+) -> Result<bool, ProviderError> {
+    if raw.contains(['\\', '\0']) || raw.contains("://") {
+        return Ok(false);
+    }
+    let raw_path = Utf8Path::new(raw);
+    let candidate = if raw_path.is_absolute() {
+        raw_path.as_std_path().to_path_buf()
+    } else {
+        let normalized = raw.trim_start_matches("./");
+        if RepoPath::from_str(normalized).is_err() {
+            return Ok(false);
+        }
+        scope.repository_root.join(normalized)
+    };
+    if !candidate.exists() {
+        return Ok(false);
+    }
+    let canonical = std::fs::canonicalize(candidate)?;
+    Ok(canonical.starts_with(scope.repository_root)
+        && !canonical.starts_with(canonical_scope_root(scope.cargo, scope.repository_root)?))
 }
 
 fn observation_key(
@@ -777,30 +875,58 @@ fn resolve_workspace(request: &RequestEnvelope) -> Result<(PathBuf, PathBuf), Pr
     Ok((repository, workspace))
 }
 
-fn validate_targets(
+fn select_cargo_scope(
     request: &RequestEnvelope,
     repository_root: &Path,
     workspace_root: &Path,
-) -> Result<(), ProviderError> {
-    for target in &request.targets {
-        if request.workspace.as_str() != "."
-            && target.as_str() != request.workspace.as_str()
-            && !target
-                .as_str()
-                .strip_prefix(request.workspace.as_str())
-                .is_some_and(|suffix| suffix.starts_with('/'))
-        {
-            return Err(ProviderError::Path(target.to_string()));
-        }
-        let candidate = repository_root.join(target.as_str());
-        if candidate.exists() {
-            let canonical = std::fs::canonicalize(candidate)?;
-            if !canonical.starts_with(workspace_root) {
-                return Err(ProviderError::Path(target.to_string()));
-            }
-        }
+) -> Result<CargoScope, ProviderError> {
+    let [target] = request.targets.as_slice() else {
+        return Err(ProviderError::Request(
+            "Rust Provider requires exactly one target scope".to_owned(),
+        ));
+    };
+    if target.as_str() == "." {
+        return (request.workspace.as_str() == ".")
+            .then_some(CargoScope::Workspace)
+            .ok_or_else(|| ProviderError::Path(target.to_string()));
     }
-    Ok(())
+    if request.workspace.as_str() != "."
+        && !Utf8Path::new(target.as_str()).starts_with(Utf8Path::new(request.workspace.as_str()))
+    {
+        return Err(ProviderError::Path(target.to_string()));
+    }
+    let candidate = repository_root.join(target.as_str());
+    let canonical =
+        std::fs::canonicalize(&candidate).map_err(|_| ProviderError::Path(target.to_string()))?;
+    if !canonical.is_dir() || !canonical.starts_with(workspace_root) {
+        return Err(ProviderError::Path(target.to_string()));
+    }
+    let manifest = canonical.join("Cargo.toml");
+    if !manifest.is_file()
+        || !std::fs::canonicalize(&manifest)
+            .map(|path| path.starts_with(&canonical))
+            .unwrap_or(false)
+    {
+        return Err(ProviderError::Request(format!(
+            "target {target} is not a unique Cargo package directory"
+        )));
+    }
+    let relative_manifest = manifest
+        .strip_prefix(workspace_root)
+        .map_err(|_| ProviderError::Path(target.to_string()))?
+        .to_path_buf();
+    let repository_path = canonical
+        .strip_prefix(repository_root)
+        .map_err(|_| ProviderError::Path(target.to_string()))?;
+    let repository_path = Utf8PathBuf::from_path_buf(repository_path.to_path_buf())
+        .map_err(|_| ProviderError::Path(target.to_string()))?
+        .as_str()
+        .parse()
+        .map_err(|_| ProviderError::Path(target.to_string()))?;
+    Ok(CargoScope::Manifest {
+        manifest: relative_manifest,
+        repository_path,
+    })
 }
 
 fn unsupported_request(request: &RequestEnvelope) -> Option<String> {
@@ -1176,9 +1302,10 @@ impl IdFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHECK_CAPABILITY, MAX_MESSAGE_CHARS, ProviderError, cargo_argv, decode_request,
-        diagnostic_message, execute_with_program, location, manifest, normalize_path, read_request,
-        run_stdio_with, severity, terminal_for_id, validate_response,
+        CHECK_CAPABILITY, CargoScope, DiagnosticScope, MAX_MESSAGE_CHARS, ProviderError,
+        cargo_argv, decode_request, diagnostic_message, execute_with_program, location, manifest,
+        normalize_path, read_request, run_stdio_with, scoped_location, select_cargo_scope,
+        severity, terminal_for_id, validate_response,
     };
     use crate::cargo_json::{RustcChild, RustcDiagnostic, RustcSpan};
     use diagnostic_triage_contracts::{
@@ -1197,6 +1324,8 @@ mod tests {
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
     };
+
+    const MEMBER_SCOPE: &str = "crates/diagnostic-triage-provider-rust";
 
     #[cfg(unix)]
     struct FakeCargo {
@@ -1271,6 +1400,31 @@ mod tests {
         }
     }
 
+    fn scoped_request(workspace: &str, targets: &[&str]) -> RequestEnvelope {
+        let mut request = request();
+        request.workspace = workspace.parse().unwrap();
+        request.targets = targets
+            .iter()
+            .map(|target| target.parse().unwrap())
+            .collect();
+        request
+    }
+
+    fn repository_root() -> PathBuf {
+        std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap()
+    }
+
+    fn root_location(span: &RustcSpan) -> Result<Location, ProviderError> {
+        location(
+            span,
+            &DiagnosticScope {
+                cargo: &CargoScope::Workspace,
+                repository_root: Path::new("."),
+                workspace_root: Path::new("."),
+            },
+        )
+    }
+
     #[test]
     fn manifest_is_a_rust_check_provider() {
         let value = manifest();
@@ -1280,9 +1434,14 @@ mod tests {
     }
 
     #[test]
-    fn direct_argv_is_locked_workspace_wide_and_structured() {
+    fn root_target_selects_workspace_and_check_clippy_share_scope_argv() {
+        let root = repository_root();
+        let scope = select_cargo_scope(&request(), &root, &root).unwrap();
+        assert_eq!(scope, CargoScope::Workspace);
+        let check = cargo_argv("check", &scope);
+        let clippy = cargo_argv("clippy", &scope);
         assert_eq!(
-            cargo_argv("check"),
+            check,
             [
                 "check",
                 "--workspace",
@@ -1291,6 +1450,66 @@ mod tests {
                 "--message-format=json"
             ]
         );
+        assert_eq!(&check[1..], &clippy[1..]);
+    }
+
+    #[test]
+    fn nested_workspace_target_selects_relative_manifest_without_workspace() {
+        let root = repository_root();
+        let workspace = std::fs::canonicalize(root.join(MEMBER_SCOPE)).unwrap();
+        let request = scoped_request(MEMBER_SCOPE, &[MEMBER_SCOPE]);
+        let scope = select_cargo_scope(&request, &root, &workspace).unwrap();
+        assert_eq!(
+            scope,
+            CargoScope::Manifest {
+                manifest: PathBuf::from("Cargo.toml"),
+                repository_path: MEMBER_SCOPE.parse().unwrap(),
+            }
+        );
+        let check = cargo_argv("check", &scope);
+        let clippy = cargo_argv("clippy", &scope);
+        assert!(!check.contains(&"--workspace".to_owned()));
+        assert_eq!(&check[1..], &clippy[1..]);
+    }
+
+    #[test]
+    fn root_workspace_member_target_selects_member_manifest() {
+        let root = repository_root();
+        let request = scoped_request(".", &[MEMBER_SCOPE]);
+        assert_eq!(
+            select_cargo_scope(&request, &root, &root).unwrap(),
+            CargoScope::Manifest {
+                manifest: PathBuf::from(MEMBER_SCOPE).join("Cargo.toml"),
+                repository_path: MEMBER_SCOPE.parse().unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn unsupported_target_shapes_are_typed_before_cargo_execution() {
+        let root = repository_root();
+        let cases = [
+            scoped_request(".", &[MEMBER_SCOPE, "crates/diagnostic-triage-contracts"]),
+            scoped_request(".", &["crates/diagnostic-triage-provider-rust/src/lib.rs"]),
+            scoped_request(".", &["crates/diagnostic-triage-provider-rust/src"]),
+            scoped_request(".", &["crates/diagnostic-triage-provider-rust/missing"]),
+            scoped_request(MEMBER_SCOPE, &["crates/diagnostic-triage-contracts"]),
+        ];
+        let response = execute_with_program(&cases[0], Path::new("cargo-must-not-run"));
+        assert_eq!(response.completion.status, ExecutionStatus::Incomplete);
+        assert_eq!(response.completion.tool_exit_code.0, None);
+        assert!(response.events.is_empty());
+        for request in cases {
+            let workspace = if request.workspace.as_str() == "." {
+                root.clone()
+            } else {
+                std::fs::canonicalize(root.join(request.workspace.as_str())).unwrap()
+            };
+            assert!(matches!(
+                select_cargo_scope(&request, &root, &workspace),
+                Err(ProviderError::Request(_) | ProviderError::Path(_))
+            ));
+        }
     }
 
     #[test]
@@ -1392,15 +1611,81 @@ mod tests {
     }
 
     #[test]
-    fn subworkspace_diagnostic_paths_remain_repository_relative() {
-        let workspace = "crates/member".parse().unwrap();
-        let path = normalize_path("src/lib.rs", &workspace, Path::new("crates/member")).unwrap();
-        assert_eq!(path.as_str(), "crates/member/src/lib.rs");
+    fn nested_scope_paths_are_relative_and_siblings_are_rejected() {
+        let root = repository_root();
+        let workspace_root = std::fs::canonicalize(root.join(MEMBER_SCOPE)).unwrap();
+        let request = scoped_request(MEMBER_SCOPE, &[MEMBER_SCOPE]);
+        let cargo = select_cargo_scope(&request, &root, &workspace_root).unwrap();
+        let scope = DiagnosticScope {
+            cargo: &cargo,
+            repository_root: &root,
+            workspace_root: &workspace_root,
+        };
+        assert_eq!(
+            normalize_path("src/lib.rs", &scope).unwrap().as_str(),
+            format!("{MEMBER_SCOPE}/src/lib.rs")
+        );
+        let repository_relative = format!("{MEMBER_SCOPE}/src/lib.rs");
+        assert_eq!(
+            normalize_path(&repository_relative, &scope)
+                .unwrap()
+                .as_str(),
+            format!("{MEMBER_SCOPE}/src/lib.rs")
+        );
+        assert!(normalize_path("crates/diagnostic-triage-contracts/src/lib.rs", &scope).is_err());
+        assert!(normalize_path("docs/contracts/protocol-v1.md", &scope).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_scope_prefers_cargo_cwd_when_root_has_the_same_relative_file() {
+        let fixture = FakeCargo::from_body("exit 0");
+        let workspace_root = fixture.root.join("member");
+        fs::create_dir_all(fixture.root.join("src")).unwrap();
+        fs::create_dir_all(workspace_root.join("src")).unwrap();
+        fs::write(fixture.root.join("src/lib.rs"), "// repository root").unwrap();
+        fs::write(workspace_root.join("src/lib.rs"), "// selected member").unwrap();
+        let cargo = CargoScope::Manifest {
+            manifest: PathBuf::from("member/Cargo.toml"),
+            repository_path: "member".parse().unwrap(),
+        };
+        let scope = DiagnosticScope {
+            cargo: &cargo,
+            repository_root: &fixture.root,
+            workspace_root: &workspace_root,
+        };
+
+        assert_eq!(
+            normalize_path("src/lib.rs", &scope).unwrap().as_str(),
+            "member/src/lib.rs"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn selected_package_excludes_sibling_diagnostic_locations() {
+        let root = repository_root();
+        let request = scoped_request(".", &[MEMBER_SCOPE]);
+        let cargo = select_cargo_scope(&request, &root, &root).unwrap();
+        let scope = DiagnosticScope {
+            cargo: &cargo,
+            repository_root: &root,
+            workspace_root: &root,
+        };
+        let span = RustcSpan {
+            file_name: "crates/diagnostic-triage-contracts/src/lib.rs".to_owned(),
+            line_start: 1,
+            line_end: 1,
+            column_start: 1,
+            column_end: 2,
+            is_primary: true,
+        };
+
+        assert_eq!(scoped_location(&span, &scope).unwrap(), None);
     }
 
     #[test]
     fn rustc_locations_preserve_insertions_and_half_open_code_point_ranges() {
-        let workspace = ".".parse().unwrap();
         let spans = [
             RustcSpan {
                 file_name: "src/unicode.rs".to_owned(),
@@ -1429,7 +1714,7 @@ mod tests {
         ];
         let locations = spans
             .iter()
-            .map(|span| location(span, &workspace, Path::new(".")))
+            .map(root_location)
             .collect::<Result<Vec<_>, _>>()
             .expect("rustc coordinates match Location v1");
 
@@ -1441,7 +1726,6 @@ mod tests {
 
     #[test]
     fn rustc_location_boundary_rejects_non_positive_and_reversed_spans() {
-        let workspace = ".".parse().unwrap();
         for (line_start, line_end, column_start, column_end) in
             [(0, 1, 1, 1), (1, 1, 0, 1), (2, 1, 1, 1), (1, 1, 3, 2)]
         {
@@ -1453,7 +1737,7 @@ mod tests {
                 column_end,
                 is_primary: true,
             };
-            assert!(location(&span, &workspace, Path::new(".")).is_err());
+            assert!(root_location(&span).is_err());
         }
     }
 
@@ -1495,8 +1779,7 @@ mod tests {
         let diagnostic = serde_json::from_str::<RustcDiagnostic>(first_line)
             .expect("pinned rustc JSON fixture parses");
         let span = diagnostic.spans[0].clone();
-        let location = location(&span, &".".parse().unwrap(), Path::new("."))
-            .expect("rustc fixture span normalizes");
+        let location = root_location(&span).expect("rustc fixture span normalizes");
         assert_eq!(location.start.column, 26);
         assert_eq!(location.end.as_ref().expect("rustc span end").column, 33);
     }
