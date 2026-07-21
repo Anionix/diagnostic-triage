@@ -1,5 +1,10 @@
 //! Runtime configuration, bounded process orchestration, and deterministic output boundaries for Diagnostic Triage.
 
+#[allow(
+    dead_code,
+    reason = "private kernel consumed by follow-up issue-draft reporter slices"
+)]
+mod issue_draft_sanitize;
 mod ruff_fix;
 mod scratch;
 
