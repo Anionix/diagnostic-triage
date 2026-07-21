@@ -5,11 +5,15 @@ from prose alone. Category and micro-category identifiers are stable and never
 renamed or reused. Additive identifiers require compatible schema and fixture
 updates; semantic changes require taxonomy v2.
 
-Every Finding has one primary classification. When structured evidence cannot
-support a specific micro-category, use that category's `unknown` member.
+Every Finding has one primary classification. A catalog rule identifies a
+specific valid pair. Each category also retains its base-v1 `unknown` member
+for evidence that is category-bounded but not more specific. When no catalog
+rule matches at all, use the top-level `unknown.unknown` pair; no other pair
+involving the top-level `unknown` category is valid.
 
 | Category | Stable micro-categories |
 |---|---|
+| `unknown` | `unknown` |
 | `syntax` | `parse-error`, `invalid-token`, `invalid-structure`, `unknown` |
 | `type` | `incompatible-type`, `missing-type`, `nullability`, `unresolved-symbol`, `invalid-call`, `contract-mismatch`, `unknown` |
 | `correctness` | `assertion`, `invariant`, `wrong-result`, `data-loss`, `state-transition`, `nondeterminism`, `unknown` |
@@ -33,11 +37,16 @@ support a specific micro-category, use that category's `unknown` member.
 3. Provider/protocol failure is an Execution status. Use `tooling` only when a
    completed tool diagnostic reports a tooling/configuration defect.
 4. Use `resource` only when a declared bound is reached. An unexplained exit is
-   `runtime.unknown` until evidence improves.
+   `unknown.unknown` until evidence improves.
 5. Use `security` only for a stated security invariant, never as severity.
 6. CI latency and cache state belong to Execution, not this taxonomy.
-7. `unknown` remains publishable and cannot be silently promoted.
+7. Both category-scoped `*.unknown` pairs and top-level `unknown.unknown`
+   remain publishable and cannot be silently promoted.
+8. Classification uses exact structured catalog selectors only. It does not
+   infer from native rule prefixes or diagnostic prose and does not fetch a
+   network catalog.
 
 Initial blocking policy is limited to ERROR Findings in `syntax`, `type`,
 `correctness`, `build`, and `test`. Policy is consumer-owned and is not encoded
-in the Finding contract.
+in the Finding contract. `unknown.unknown` is `OBSERVE` by default; consumers
+may explicitly select it for `WARN` or `BLOCK`.

@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use diagnostic_triage_contracts::{
     Language,
-    model::{Observation, Origin, Taxonomy},
+    model::{Category, MicroCategory, Observation, Origin, Taxonomy},
 };
 
 use crate::{EngineError, EngineInputError, normalize::collapse_whitespace};
@@ -148,19 +148,41 @@ fn maximal_constraint_masks(populated: u16) -> u16 {
     maximal
 }
 
-/// The selected taxonomy and its auditable catalog rule.
+/// Typed provenance for the selected taxonomy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClassificationAttribution {
+    /// A validated repository catalog rule selected the taxonomy.
+    CatalogRule { rule_id: String },
+    /// No catalog rule matched, so the Engine selected `unknown.unknown`.
+    BuiltinUnknown,
+}
+
+/// The selected taxonomy and its auditable attribution.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClassificationMatch {
-    pub rule_id: String,
+    pub attribution: ClassificationAttribution,
     pub taxonomy: Taxonomy,
+}
+
+impl ClassificationMatch {
+    fn builtin_unknown() -> Self {
+        Self {
+            attribution: ClassificationAttribution::BuiltinUnknown,
+            taxonomy: Taxonomy {
+                category: Category::Unknown,
+                micro_category: MicroCategory::Unknown,
+            },
+        }
+    }
 }
 
 /// Select the most-specific matching taxonomy rule without parsing prose.
 ///
 /// # Errors
 ///
-/// Returns an error for invalid observations or catalog rules, no match, or
-/// multiple incomparable or identically constrained maximal matches.
+/// Returns an error for invalid observations or catalog rules, or multiple
+/// incomparable or identically constrained maximal matches. No match is the
+/// typed built-in `unknown.unknown` result.
 pub fn classify_observation(
     observation: &Observation,
     rules: &[ClassificationRule],
@@ -206,9 +228,7 @@ pub fn classify_observation(
         matching_by_mask[mask].push(rule);
     }
     if populated_masks == 0 {
-        return Err(EngineError::Unclassified {
-            observation_id: observation.observation_id.to_string(),
-        });
+        return Ok(ClassificationMatch::builtin_unknown());
     }
 
     let maximal_masks = maximal_constraint_masks(populated_masks);
@@ -245,17 +265,19 @@ pub fn classify_observation(
         });
     }
 
-    let selected = matching_by_mask
+    let Some(selected) = matching_by_mask
         .iter()
         .enumerate()
         .filter(|(mask, _)| maximal_masks & (1_u16 << mask) != 0)
         .flat_map(|(_, rules)| rules)
         .next()
-        .ok_or_else(|| EngineError::Unclassified {
-            observation_id: observation.observation_id.to_string(),
-        })?;
+    else {
+        return Ok(ClassificationMatch::builtin_unknown());
+    };
     Ok(ClassificationMatch {
-        rule_id: selected.id.clone(),
+        attribution: ClassificationAttribution::CatalogRule {
+            rule_id: selected.id.clone(),
+        },
         taxonomy: selected.taxonomy.clone(),
     })
 }

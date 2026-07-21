@@ -106,6 +106,7 @@ pub struct Tool {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Category {
+    Unknown,
     Syntax,
     Type,
     Correctness,
@@ -839,6 +840,7 @@ fn validate_common_texts(
 )]
 fn micro_matches(category: &Category, micro: &MicroCategory) -> bool {
     match category {
+        Category::Unknown => matches!(micro, MicroCategory::Unknown),
         Category::Syntax => matches!(
             micro,
             MicroCategory::ParseError

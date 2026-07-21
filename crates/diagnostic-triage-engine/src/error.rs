@@ -59,8 +59,6 @@ pub enum EngineError {
     Normalization(#[from] NormalizationError),
     #[error(transparent)]
     Input(#[from] EngineInputError),
-    #[error("no taxonomy rule matched observation {observation_id}")]
-    Unclassified { observation_id: String },
     #[error(
         "taxonomy rules are ambiguous for observation {observation_id}: {rule_ids:?} (+{omitted_rule_count} more)"
     )]

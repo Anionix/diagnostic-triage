@@ -5,7 +5,10 @@ use std::{collections::HashSet, fs, path::PathBuf};
 use diagnostic_triage_contracts::{
     COMMON_SCHEMA_V1, MODEL_SCHEMA_V1, PROTOCOL_SCHEMA_V1, RepoPath, SourceRevision,
     TAXONOMY_SCHEMA_V1,
-    model::{FindingState, Location, Position, PreReportState, SessionReport, Taxonomy},
+    model::{
+        Category, FindingState, Location, MicroCategory, Position, PreReportState, SessionReport,
+        Taxonomy,
+    },
     validate_report, validate_report_for_revision, validate_report_json, validate_session_jsonl,
 };
 use serde_json::{Value, json};
@@ -44,6 +47,159 @@ const VALID_REPORTS: &[&str] = &[
     "valid-report.json",
     "valid-unsupported-report.json",
     "valid-verified-report.json",
+];
+
+// The v1 baseline contains 83 category/micro-category pairs. Keep this list
+// explicit so an additive fallback cannot silently remove an established pair.
+const BASE_TAXONOMY_PAIRS: &[(&str, &[&str])] = &[
+    (
+        "syntax",
+        &[
+            "parse-error",
+            "invalid-token",
+            "invalid-structure",
+            "unknown",
+        ],
+    ),
+    (
+        "type",
+        &[
+            "incompatible-type",
+            "missing-type",
+            "nullability",
+            "unresolved-symbol",
+            "invalid-call",
+            "contract-mismatch",
+            "unknown",
+        ],
+    ),
+    (
+        "correctness",
+        &[
+            "assertion",
+            "invariant",
+            "wrong-result",
+            "data-loss",
+            "state-transition",
+            "nondeterminism",
+            "unknown",
+        ],
+    ),
+    (
+        "runtime",
+        &[
+            "exception",
+            "panic",
+            "abort",
+            "signal",
+            "import-failure",
+            "initialization",
+            "unknown",
+        ],
+    ),
+    (
+        "build",
+        &[
+            "compile",
+            "link",
+            "dependency-resolution",
+            "code-generation",
+            "configuration",
+            "unknown",
+        ],
+    ),
+    (
+        "test",
+        &[
+            "collection",
+            "setup",
+            "assertion",
+            "teardown",
+            "flaky",
+            "coverage-gate",
+            "unknown",
+        ],
+    ),
+    (
+        "resource",
+        &[
+            "timeout",
+            "memory-limit",
+            "disk-limit",
+            "output-limit",
+            "file-descriptor-limit",
+            "unknown",
+        ],
+    ),
+    (
+        "concurrency",
+        &[
+            "race",
+            "deadlock",
+            "livelock",
+            "ordering",
+            "atomicity",
+            "unknown",
+        ],
+    ),
+    (
+        "security",
+        &[
+            "input-validation",
+            "path-escape",
+            "injection",
+            "unsafe-deserialization",
+            "permission",
+            "secret-exposure",
+            "unknown",
+        ],
+    ),
+    (
+        "environment",
+        &[
+            "tool-missing",
+            "version-mismatch",
+            "platform",
+            "locale",
+            "timezone",
+            "network",
+            "filesystem",
+            "unknown",
+        ],
+    ),
+    (
+        "tooling",
+        &[
+            "protocol",
+            "malformed-output",
+            "provider-crash",
+            "unsupported-version",
+            "configuration",
+            "unknown",
+        ],
+    ),
+    (
+        "style",
+        &[
+            "format",
+            "lint",
+            "documentation",
+            "complexity",
+            "deprecation",
+            "unknown",
+        ],
+    ),
+    (
+        "robustness",
+        &[
+            "boundary-input",
+            "malformed-input",
+            "crash-resistance",
+            "roundtrip-mismatch",
+            "fuzz-finding",
+            "unknown",
+        ],
+    ),
 ];
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -463,6 +619,35 @@ fn rust_taxonomy_acceptance_matches_every_canonical_pair() {
         }
     }
 
+    let base_pairs: HashSet<_> = BASE_TAXONOMY_PAIRS
+        .iter()
+        .flat_map(|(category, micro_categories)| {
+            micro_categories
+                .iter()
+                .map(move |micro_category| ((*category).to_owned(), (*micro_category).to_owned()))
+        })
+        .collect();
+    assert_eq!(
+        base_pairs.len(),
+        83,
+        "the v1 baseline pair catalog must be exhaustive"
+    );
+
+    let mut expected_with_additive_unknown = base_pairs.clone();
+    expected_with_additive_unknown.insert(("unknown".into(), "unknown".into()));
+    assert_eq!(expected, expected_with_additive_unknown);
+
+    for (category, micro_category) in &base_pairs {
+        let taxonomy = serde_json::from_value::<Taxonomy>(json!({
+            "category": category,
+            "micro_category": micro_category,
+        }))
+        .expect("every v1 baseline pair must deserialize");
+        taxonomy.validate().unwrap_or_else(|error| {
+            panic!("baseline pair {category}/{micro_category} rejected: {error}")
+        });
+    }
+
     for category in &categories {
         for micro_category in &micro_categories {
             let taxonomy = serde_json::from_value::<Taxonomy>(json!({
@@ -476,6 +661,84 @@ fn rust_taxonomy_acceptance_matches_every_canonical_pair() {
                 "taxonomy parity differs for {category}/{micro_category}",
             );
         }
+    }
+}
+
+#[test]
+fn top_level_unknown_accepts_only_unknown_micro_category() {
+    Taxonomy {
+        category: Category::Unknown,
+        micro_category: MicroCategory::Unknown,
+    }
+    .validate()
+    .unwrap();
+
+    for invalid_micro_category in [MicroCategory::Compile, MicroCategory::Lint] {
+        assert!(
+            Taxonomy {
+                category: Category::Unknown,
+                micro_category: invalid_micro_category,
+            }
+            .validate()
+            .is_err()
+        );
+    }
+}
+
+#[test]
+fn category_scoped_unknown_is_preserved_for_every_base_category() {
+    for category in [
+        Category::Syntax,
+        Category::Type,
+        Category::Correctness,
+        Category::Runtime,
+        Category::Build,
+        Category::Test,
+        Category::Resource,
+        Category::Concurrency,
+        Category::Security,
+        Category::Environment,
+        Category::Tooling,
+        Category::Style,
+        Category::Robustness,
+    ] {
+        Taxonomy {
+            category,
+            micro_category: MicroCategory::Unknown,
+        }
+        .validate()
+        .unwrap();
+    }
+}
+
+#[test]
+fn unknown_taxonomy_golden_fixtures_match_runtime_validation() {
+    for (name, expected) in [
+        (
+            "taxonomy-unknown.json",
+            json!({"category": "unknown", "micro_category": "unknown"}),
+        ),
+        (
+            "taxonomy-syntax-unknown.json",
+            json!({"category": "syntax", "micro_category": "unknown"}),
+        ),
+    ] {
+        let valid = serde_json::from_slice::<Taxonomy>(&fixture(name))
+            .expect("valid taxonomy fixture is typed JSON");
+        valid.validate().unwrap();
+        assert_eq!(serde_json::to_value(&valid).unwrap(), expected);
+    }
+
+    for name in [
+        "taxonomy-invalid-syntax-wrong-result.json",
+        "taxonomy-invalid-unknown-lint.json",
+    ] {
+        let invalid = serde_json::from_slice::<Taxonomy>(&fixture(name))
+            .expect("invalid pair still uses known enum members");
+        assert!(
+            invalid.validate().is_err(),
+            "accepted invalid fixture {name}"
+        );
     }
 }
 

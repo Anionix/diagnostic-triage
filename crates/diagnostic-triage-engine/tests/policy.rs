@@ -28,7 +28,13 @@ fn finding(category: Category, severity: Severity) -> Finding {
         Category::Test => MicroCategory::Collection,
         Category::Runtime => MicroCategory::Exception,
         Category::Style => MicroCategory::Format,
-        _ => MicroCategory::Unknown,
+        Category::Unknown => MicroCategory::Unknown,
+        Category::Resource => MicroCategory::Timeout,
+        Category::Concurrency => MicroCategory::Race,
+        Category::Security => MicroCategory::InputValidation,
+        Category::Environment => MicroCategory::Platform,
+        Category::Tooling => MicroCategory::Protocol,
+        Category::Robustness => MicroCategory::BoundaryInput,
     };
     let mut finding = Finding {
         schema_version: FindingSchemaVersion::V1,
@@ -199,6 +205,33 @@ fn default_policy_blocks_only_error_in_initial_blocking_categories() {
     .unwrap();
     assert_eq!(decision.action, DecisionAction::Observe);
     assert_eq!(decision.matched_rule_id, "default.observe");
+}
+
+#[test]
+fn unknown_error_is_observed_by_default_but_explicit_policy_can_escalate() {
+    let finding = finding(Category::Unknown, Severity::Error);
+    let default = evaluate_policy(&finding, &[], &[], EVALUATION_TIME).unwrap();
+    assert_eq!(default.action, DecisionAction::Observe);
+    assert_eq!(default.matched_rule_id, "default.observe");
+
+    for (rule_id, action, expected) in [
+        ("unknown-warn", PolicyAction::Warn, DecisionAction::Warn),
+        ("unknown-block", PolicyAction::Block, DecisionAction::Block),
+    ] {
+        let explicit = PolicyRule::new(
+            rule_id,
+            PolicyMatcher {
+                severity: Some(Severity::Error),
+                category: Some(Category::Unknown),
+                micro_category: Some(MicroCategory::Unknown),
+                ..PolicyMatcher::default()
+            },
+            action,
+        );
+        let decision = evaluate_policy(&finding, &[explicit], &[], EVALUATION_TIME).unwrap();
+        assert_eq!(decision.action, expected);
+        assert_eq!(decision.matched_rule_id, rule_id);
+    }
 }
 
 #[test]

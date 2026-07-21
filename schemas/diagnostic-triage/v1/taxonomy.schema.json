@@ -8,7 +8,7 @@
   "properties": {
     "category": {
       "enum": [
-        "syntax", "type", "correctness", "runtime", "build", "test",
+        "unknown", "syntax", "type", "correctness", "runtime", "build", "test",
         "resource", "concurrency", "security", "environment", "tooling",
         "style", "robustness"
       ]
@@ -16,6 +16,12 @@
     "micro_category": { "type": "string" }
   },
   "oneOf": [
+    {
+      "properties": {
+        "category": { "const": "unknown" },
+        "micro_category": { "enum": ["unknown"] }
+      }
+    },
     {
       "properties": {
         "category": { "const": "syntax" },
