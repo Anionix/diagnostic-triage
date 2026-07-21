@@ -711,12 +711,15 @@ printf '[]'; exit 0"#,
         .lines()
         .map(|line| serde_json::from_str::<ProtocolEnvelope>(line).unwrap())
         .collect::<Vec<_>>();
-    assert!(matches!(
-        events.last(),
-        Some(ProtocolEnvelope::Completion(value))
-            if value.status == ExecutionStatus::Complete
-                && value.tool_exit_code.0 == Some(0)
-    ));
+    assert!(
+        matches!(
+            events.last(),
+            Some(ProtocolEnvelope::Completion(value))
+                if value.status == ExecutionStatus::Complete
+                    && value.tool_exit_code.0 == Some(0)
+        ),
+        "unexpected process cleanup transcript: {events:?}"
+    );
 
     // The child closes all captured streams, exits first, and attempts the
     // delayed write later. Completion is valid only after the dedicated

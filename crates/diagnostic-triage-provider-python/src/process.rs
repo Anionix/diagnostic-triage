@@ -272,7 +272,7 @@ fn run_bounded_with_group_signal(
 
     let deadline = started.checked_add(limits.timeout).unwrap_or(started);
     let mut forced_reason = None;
-    let mut exit_status = None;
+    let exit_status = None;
     let mut errors = Vec::new();
     loop {
         if stdout_overflow.load(Ordering::Acquire) {
@@ -289,12 +289,9 @@ fn run_bounded_with_group_signal(
         let wait = deadline
             .saturating_duration_since(Instant::now())
             .min(POLL_INTERVAL);
-        match child.wait_timeout(wait) {
-            Ok(Some(status)) => {
-                exit_status = Some(status);
-                break;
-            }
-            Ok(None) => {}
+        match child_exited_without_reaping(&child) {
+            Ok(true) => break,
+            Ok(false) => thread::sleep(wait),
             Err(source) => {
                 errors.push(ProcessError::Wait(source));
                 break;
@@ -346,6 +343,30 @@ fn run_bounded_with_group_signal(
         duration,
         cleanup_duration,
     })
+}
+
+#[cfg(unix)]
+fn child_exited_without_reaping(child: &Child) -> io::Result<bool> {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+
+    let pid = i32::try_from(child.id())
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "child pid must be nonzero"))?;
+    waitid(
+        WaitId::Pid(pid),
+        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+    )
+    .map(|status| status.is_some())
+    .map_err(io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn child_exited_without_reaping(_: &Child) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process groups are unsupported",
+    ))
 }
 
 struct ChildCleanupGuard {
@@ -691,13 +712,8 @@ fn terminate_child(
         .checked_add(TERMINATION_GRACE)
         .unwrap_or_else(Instant::now);
     let mut errors = Vec::new();
-    let group_signal_failed = match group_signal(process_group) {
-        Ok(()) => false,
-        Err(source) => {
-            errors.push(ProcessError::GroupSignal(source));
-            true
-        }
-    };
+    let group_signal_error = group_signal(process_group).err();
+    let group_signal_failed = group_signal_error.is_some();
     if exit_status.is_none() {
         match child.try_wait() {
             Ok(status) => *exit_status = status,
@@ -717,6 +733,19 @@ fn terminate_child(
     }
     if exit_status.is_none() {
         errors.push(ProcessError::Unreaped);
+    }
+    if let Some(source) = group_signal_error {
+        // On macOS, signalling a group containing only an unreaped zombie
+        // leader may report EPERM. Keep the leader PID/PGID anchored until
+        // this point, reap it, then retry: ESRCH/success proves there was no
+        // unkillable descendant, while a second EPERM remains a hard error.
+        if source.kind() == io::ErrorKind::PermissionDenied && exit_status.is_some() {
+            if let Err(retry) = group_signal(process_group) {
+                errors.push(ProcessError::GroupSignal(retry));
+            }
+        } else {
+            errors.push(ProcessError::GroupSignal(source));
+        }
     }
     match wait_for_process_group(process_group, deadline) {
         Ok(true) => {}
@@ -768,8 +797,10 @@ fn process_group_exists(process_group: u32) -> io::Result<bool> {
             io::Error::new(io::ErrorKind::InvalidInput, "process group must be nonzero")
         })?;
     match test_kill_process_group(process_group) {
-        Ok(()) => Ok(true),
         Err(Errno::SRCH) => Ok(false),
+        // EPERM means the group is still present but the probe cannot signal
+        // it. Treat it as live and retry until the bounded cleanup deadline.
+        Ok(()) | Err(Errno::PERM) => Ok(true),
         Err(error) => Err(io::Error::from(error)),
     }
 }
@@ -783,13 +814,24 @@ fn process_group_exists(_: u32) -> io::Result<bool> {
 }
 
 fn wait_for_process_group(process_group: u32, deadline: Instant) -> io::Result<bool> {
+    wait_for_process_group_with_probe(process_group, deadline, process_group_exists)
+}
+
+fn wait_for_process_group_with_probe(
+    process_group: u32,
+    deadline: Instant,
+    probe: fn(u32) -> io::Result<bool>,
+) -> io::Result<bool> {
     loop {
-        if !process_group_exists(process_group)? {
-            return Ok(true);
-        }
+        let permission_denied = match probe(process_group) {
+            Ok(false) => return Ok(true),
+            Ok(true) => None,
+            Err(source) if source.kind() == io::ErrorKind::PermissionDenied => Some(source),
+            Err(source) => return Err(source),
+        };
         let wait = deadline.saturating_duration_since(Instant::now());
         if wait.is_zero() {
-            return Ok(false);
+            return permission_denied.map_or(Ok(false), Err);
         }
         thread::sleep(wait.min(POLL_INTERVAL));
     }
@@ -971,6 +1013,37 @@ mod tests {
                 let _ignored = signal_process_group(process_group);
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zombie_only_permission_error_is_retried_after_reap() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static SIGNAL_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn deny_once_then_signal(process_group: u32) -> std::io::Result<()> {
+            if SIGNAL_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            signal_process_group(process_group)
+        }
+
+        let _guard = process_test_guard();
+        SIGNAL_CALLS.store(0, Ordering::SeqCst);
+        let outcome = run_bounded_with_group_signal(
+            &ProcessSpec::new("/usr/bin/true"),
+            ProcessLimits {
+                timeout: Duration::from_secs(2),
+                max_stdout_bytes: 64,
+                max_stderr_bytes: 64,
+            },
+            deny_once_then_signal,
+        )
+        .expect("a zombie-only EPERM is resolved by the post-reap retry");
+
+        assert_eq!(outcome.state, ProcessState::Complete);
+        assert_eq!(outcome.exit_code, Some(0));
+        assert_eq!(SIGNAL_CALLS.load(Ordering::SeqCst), 2);
     }
 
     #[cfg(unix)]
