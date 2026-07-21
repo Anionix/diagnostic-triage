@@ -617,8 +617,17 @@ fn authorization_secret_at(neutralized: &NeutralizedText, index: usize) -> Optio
             let value_start = separator + 1;
             let (cursor, crossed_record_boundary) =
                 skip_authorization_value_whitespace(neutralized, value_start);
-            if crossed_record_boundary && looks_like_assignment(value, cursor, Some(neutralized)) {
-                return None;
+            if let Some(assignment_separator) =
+                assignment_separator_at(value, cursor, Some(neutralized))
+            {
+                if crossed_record_boundary {
+                    return None;
+                }
+                return authorization_assignment_credential_at(
+                    neutralized,
+                    cursor,
+                    assignment_separator,
+                );
             }
             cursor
         } else {
@@ -734,6 +743,50 @@ fn credential_value_at(neutralized: &NeutralizedText, cursor: usize) -> Option<(
         end = quote_start;
     }
     (end > cursor).then_some((cursor, end))
+}
+
+fn authorization_assignment_credential_at(
+    neutralized: &NeutralizedText,
+    start: usize,
+    separator: usize,
+) -> Option<(usize, usize)> {
+    let value = neutralized.as_str();
+    let bytes = value.as_bytes();
+    let (mut cursor, crossed_record_boundary) =
+        skip_authorization_value_whitespace(neutralized, separator + 1);
+    if crossed_record_boundary && looks_like_assignment(value, cursor, Some(neutralized)) {
+        return None;
+    }
+    if let Some(scheme_end) = authorization_scheme_end(neutralized, cursor) {
+        let credential_start = skip_provenance_whitespace(neutralized, scheme_end);
+        (credential_start > scheme_end).then_some(())?;
+        cursor = credential_start;
+    }
+    let (content_start, content_end, redaction_end) =
+        if let Some(quote) = bytes.get(cursor).copied().filter(|byte| is_quote(*byte)) {
+            let content_start = cursor + 1;
+            let content_end = raw_quoted_value_end(bytes, content_start, quote);
+            let redaction_end = content_end
+                + usize::from(bytes.get(content_end).is_some_and(|byte| *byte == quote));
+            (content_start, content_end, redaction_end)
+        } else if bytes.get(cursor) == Some(&b'\\')
+            && bytes.get(cursor + 1).is_some_and(|byte| is_quote(*byte))
+        {
+            let quote = bytes
+                .get(cursor + 1)
+                .copied()
+                .expect("escaped quote checked above");
+            let content_start = cursor + 2;
+            let content_end = escaped_quoted_value_end(bytes, content_start, quote);
+            let has_closing_quote = bytes.get(content_end) == Some(&b'\\')
+                && bytes.get(content_end + 1) == Some(&quote);
+            let redaction_end = content_end + usize::from(has_closing_quote) * 2;
+            (content_start, content_end, redaction_end)
+        } else {
+            let content_end = unquoted_value_end(value, cursor, Some(neutralized));
+            (cursor, content_end, content_end)
+        };
+    (content_end > content_start).then_some((start, redaction_end))
 }
 
 // LLM contract: SCHEME_MATCHED -> RAW_OR_ESCAPED_QUOTE_BOUNDARY -> CREDENTIAL_BOUNDED.
@@ -921,6 +974,14 @@ fn skip_assignment_whitespace_with_provenance(
 }
 
 fn looks_like_assignment(value: &str, start: usize, neutralized: Option<&NeutralizedText>) -> bool {
+    assignment_separator_at(value, start, neutralized).is_some()
+}
+
+fn assignment_separator_at(
+    value: &str,
+    start: usize,
+    neutralized: Option<&NeutralizedText>,
+) -> Option<usize> {
     const MAX_MARKERS: u8 = 8;
     const MAX_MARKER_SPAN: usize = 256;
 
@@ -937,7 +998,7 @@ fn looks_like_assignment(value: &str, start: usize, neutralized: Option<&Neutral
             {
                 marker_count += 1;
                 if marker_count > MAX_MARKERS || marker.end - start > MAX_MARKER_SPAN {
-                    return false;
+                    return None;
                 }
                 cursor = marker.end;
                 needs_key_character = true;
@@ -951,16 +1012,15 @@ fn looks_like_assignment(value: &str, start: usize, neutralized: Option<&Neutral
         saw_key_character = true;
         needs_key_character = false;
     }
-    saw_key_character
-        && !needs_key_character
-        && value
-            .as_bytes()
-            .get(skip_assignment_whitespace_with_provenance(
-                value,
-                cursor,
-                neutralized,
-            ))
-            .is_some_and(|byte| matches!(byte, b'=' | b':'))
+    if !saw_key_character || needs_key_character {
+        return None;
+    }
+    let separator = skip_assignment_whitespace_with_provenance(value, cursor, neutralized);
+    value
+        .as_bytes()
+        .get(separator)
+        .is_some_and(|byte| matches!(byte, b'=' | b':'))
+        .then_some(separator)
 }
 
 fn is_quote(byte: u8) -> bool {
@@ -1655,6 +1715,38 @@ mod tests {
                 "Authorization: [REDACTED_SECRET]",
             ),
             (
+                "Authorization: token = abcdef",
+                "Authorization: [REDACTED_SECRET]",
+            ),
+            (
+                "Authorization: token = abcdef next=ok",
+                "Authorization: [REDACTED_SECRET] next=ok",
+            ),
+            (
+                "Authorization: ApiKey= abcdef",
+                "Authorization: [REDACTED_SECRET]",
+            ),
+            (
+                "Authorization: token=Bearer abcdef",
+                "Authorization: [REDACTED_SECRET]",
+            ),
+            (
+                "Authorization: Credential = \"abcdef\"",
+                "Authorization: [REDACTED_SECRET]",
+            ),
+            (
+                "Authorization: Credential = \"abcdef\", next=ok",
+                "Authorization: [REDACTED_SECRET], next=ok",
+            ),
+            (
+                r#"Authorization: token = \"abcdef\""#,
+                "Authorization: [REDACTED_SECRET]",
+            ),
+            (
+                r"Authorization: Credential=\abcdef",
+                "Authorization: [REDACTED_SECRET]",
+            ),
+            (
                 "authorization:\tcredential=abcdef",
                 "authorization:[CONTROL-U+0009][REDACTED_SECRET]",
             ),
@@ -1663,23 +1755,48 @@ mod tests {
                 "Authorization:[CONTROL-U+000A]next=ok",
             ),
             (
+                "Authorization: token=\nnext=ok",
+                "Authorization: token=[CONTROL-U+000A]next=ok",
+            ),
+            (
+                "Authorization: token=\nBearer abcdef",
+                "Authorization: [REDACTED_SECRET]",
+            ),
+            (
+                "Authorization: token = \r\nnext=ok",
+                "Authorization: token = [CONTROL-U+000D][CONTROL-U+000A]next=ok",
+            ),
+            (
+                "Authorization: token=\tnext=ok",
+                "Authorization: [REDACTED_SECRET]",
+            ),
+            (
+                "Authorization: token=[CONTROL-U+000A]next=ok",
+                "Authorization: [REDACTED_SECRET]",
+            ),
+            (
                 "Authorization:\r\nnext=ok",
                 "Authorization:[CONTROL-U+000D][CONTROL-U+000A]next=ok",
             ),
         ];
 
         for (input, expected) in cases {
+            let neutralized_bytes = neutralize_external_text(input, 4096)
+                .unwrap()
+                .as_str()
+                .len();
+            let required_bytes = neutralized_bytes.max(expected.len());
             assert_eq!(
-                sanitize_external_text(input, expected.len())
-                    .unwrap()
+                sanitize_external_text(input, required_bytes)
+                    .unwrap_or_else(|error| panic!("input {input:?}: {error}"))
                     .as_str(),
                 expected,
                 "input {input:?}"
             );
             assert_eq!(
-                sanitize_external_text(input, expected.len() - 1),
+                sanitize_external_text(input, required_bytes - 1),
                 Err(SanitizeError::OutputLimitExceeded {
-                    max_bytes: expected.len() - 1,
+                    max_bytes: required_bytes - 1,
                 }),
                 "input {input:?}"
             );
