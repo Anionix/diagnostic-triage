@@ -1,7 +1,13 @@
 //! Runtime configuration, bounded process orchestration, and deterministic output boundaries for Diagnostic Triage.
 
+mod ruff_fix;
 mod scratch;
 
+pub use ruff_fix::{
+    CanonicalRuffFix, MAX_RUFF_FIX_EDITS, MAX_RUFF_FIX_EVIDENCE_BYTES, MAX_RUFF_FIX_FILE_BYTES,
+    MAX_RUFF_FIX_JSON_DEPTH, MAX_RUFF_FIX_STRING_BYTES, RUFF_FIX_MEDIA_TYPE, RuffFixError,
+    RuffFixEvidenceMapping, RuffFixLimits, canonicalize_ruff_fix,
+};
 pub use scratch::{
     PATCH_MEDIA_TYPE, RESULT_MEDIA_TYPE, SNAPSHOT_MEDIA_TYPE, SafeFixAuthorization, ScratchChange,
     ScratchError, ScratchEvidence, ScratchLimits, ScratchPatch, ScratchWorkspace,

@@ -17,7 +17,7 @@ use diagnostic_triage_engine::verification::{
 };
 #[cfg(unix)]
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat, fstat, open, openat, statat};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
@@ -41,6 +41,8 @@ pub const RESULT_MEDIA_TYPE: &str = "application/vnd.diagnostic-triage.result+js
 /// The media type used for a deterministic scratch patch.
 pub const PATCH_MEDIA_TYPE: &str = "application/vnd.diagnostic-triage.patch+json";
 
+const SNAPSHOT_SCHEMA_VERSION: &str = "diagnostic-triage.scratch-snapshot/v1";
+
 const DEFAULT_MAX_FILES: usize = 4_096;
 const DEFAULT_MAX_ENTRIES: usize = 100_000;
 const DEFAULT_MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -59,6 +61,7 @@ thread_local! {
     static APPLY_CHANGE_FAILURE_ON_CALL: Cell<Option<usize>> = const { Cell::new(None) };
     static LAST_TRANSACTION_CANDIDATE_PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     static OPEN_ENTRY_RACE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static IMMUTABLE_BASE_READ_FAILURE: Cell<bool> = const { Cell::new(false) };
     static PATCH_ENCODE_CALLED: Cell<bool> = const { Cell::new(false) };
     static SNAPSHOT_ENCODE_CALLED: Cell<bool> = const { Cell::new(false) };
     static REPLACED_WORKSPACE_CLEANUP_FAILURE: Cell<bool> = const { Cell::new(false) };
@@ -401,6 +404,158 @@ impl ScratchWorkspace {
         &self.base
     }
 
+    /// Read one regular file through the hardened workspace descriptor boundary and prove that
+    /// the returned bytes are the file recorded in the immutable staged base Evidence.
+    pub(crate) fn read_immutable_base_file(
+        &self,
+        relative: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, ScratchError> {
+        let relative = normalize_change_path(relative)?;
+
+        #[cfg(unix)]
+        {
+            let root = open_root_directory(self.path())?;
+            let mut budget = TraversalBudget {
+                entries: 0,
+                max_entries: self.limits.max_entries,
+                max_files: self.limits.max_files,
+            };
+            let (opened, _) = open_relative_entry(&root.file, self.path(), &relative, &mut budget)?;
+            if opened.file_type != FileType::RegularFile {
+                return Err(ScratchError::UnsupportedEntry {
+                    path: self.path().join(relative_to_path(&relative)),
+                });
+            }
+
+            let expected = self.base_snapshot_file(&relative)?;
+            if expected.bytes > max_bytes {
+                return Err(ScratchError::BoundExceeded {
+                    resource: "base file bytes",
+                    actual: expected.bytes,
+                    max: max_bytes,
+                });
+            }
+
+            let mode = opened.mode;
+            let mut file = opened.file;
+            let mut contents = Vec::with_capacity(
+                usize::try_from(expected.bytes.min(max_bytes)).unwrap_or(usize::MAX),
+            );
+            if inject_immutable_base_read_failure_if_requested() {
+                return Err(ScratchError::Io {
+                    operation: "read immutable scratch base file",
+                    source: io::Error::other("injected immutable-base read failure"),
+                });
+            }
+            Read::by_ref(&mut file)
+                .take(max_bytes)
+                .read_to_end(&mut contents)
+                .map_err(|source| ScratchError::Io {
+                    operation: "read immutable scratch base file",
+                    source,
+                })?;
+            if contents.len() as u64 == max_bytes {
+                let mut extra = [0_u8; 1];
+                let extra_read = file.read(&mut extra).map_err(|source| ScratchError::Io {
+                    operation: "read immutable scratch base file",
+                    source,
+                })?;
+                if extra_read != 0 {
+                    return Err(ScratchError::BoundExceeded {
+                        resource: "base file bytes",
+                        actual: max_bytes.saturating_add(1),
+                        max: max_bytes,
+                    });
+                }
+            }
+            let actual = u64::try_from(contents.len()).unwrap_or(u64::MAX);
+            if actual > max_bytes {
+                return Err(ScratchError::BoundExceeded {
+                    resource: "base file bytes",
+                    actual,
+                    max: max_bytes,
+                });
+            }
+            let final_stat = fstat(&file).map_err(|source| ScratchError::Io {
+                operation: "inspect immutable scratch base file after read",
+                source: io::Error::from_raw_os_error(source.raw_os_error()),
+            })?;
+            let final_type = FileType::from_raw_mode(final_stat.st_mode);
+            if final_type != FileType::RegularFile
+                || final_stat.st_dev != opened.device
+                || final_stat.st_ino != opened.inode
+                || permission_mode(&final_stat) != mode
+                || actual != expected.bytes
+                || mode != expected.mode
+                || digest_bytes(&contents) != expected.sha256
+            {
+                return Err(ScratchError::BaseChanged);
+            }
+            Ok(contents)
+        }
+
+        #[cfg(not(unix))]
+        {
+            Err(ScratchError::NoFollowUnsupported)
+        }
+    }
+
+    /// Preflight the exact canonical Evidence size for one write without allocating its bytes.
+    pub(crate) fn preflight_write_patch_evidence(
+        &self,
+        relative: &str,
+        contents_bytes: u64,
+        max_evidence_bytes: u64,
+    ) -> Result<u64, ScratchError> {
+        let relative = normalize_change_path(relative)?;
+        if contents_bytes > self.limits.max_bytes {
+            return Err(ScratchError::BoundExceeded {
+                resource: "raw patch bytes",
+                actual: contents_bytes,
+                max: self.limits.max_bytes,
+            });
+        }
+        let effective_limit = max_evidence_bytes.min(u64::from(self.limits.max_evidence_bytes));
+        let effective_limit =
+            u32::try_from(effective_limit).map_err(|_| ScratchError::InvalidLimits {
+                details: "patch Evidence preflight limit is not representable",
+            })?;
+        let encoded_len = saturated_len_add(
+            u64::try_from(PATCH_JSON_PREFIX.len()).unwrap_or(u64::MAX),
+            u64::try_from(PATCH_JSON_SUFFIX.len()).unwrap_or(u64::MAX),
+        );
+        let encoded_len = saturated_len_add(
+            encoded_len,
+            patch_encoded_len_for_write(&relative, contents_bytes)?,
+        );
+        ensure_evidence_size(encoded_len, effective_limit)
+    }
+
+    fn base_snapshot_file(&self, relative: &str) -> Result<SnapshotFile, ScratchError> {
+        let content = self
+            .base
+            .content
+            .as_deref()
+            .ok_or(ScratchError::BaseChanged)?;
+        let snapshot = serde_json::from_str::<SnapshotDocument>(content).map_err(|source| {
+            ScratchError::OperationalIncomplete {
+                operation: "decode immutable scratch base Evidence",
+                details: source.to_string(),
+            }
+        })?;
+        if snapshot.schema_version != SNAPSHOT_SCHEMA_VERSION {
+            return Err(ScratchError::BaseChanged);
+        }
+        snapshot
+            .files
+            .into_iter()
+            .find(|file| file.path.as_str() == relative)
+            .ok_or_else(|| ScratchError::MissingPath {
+                path: RepoPath::from_str(relative).expect("normalized scratch file path"),
+            })
+    }
+
     /// Capture base, current result, and patch as separate complete inline Evidence records.
     ///
     /// # Errors
@@ -668,14 +823,14 @@ impl ScratchError {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct SnapshotDocument {
-    schema_version: &'static str,
+    schema_version: String,
     files: Vec<SnapshotFile>,
     total_bytes: u64,
 }
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 struct SnapshotFile {
     path: RepoPath,
     bytes: u64,
@@ -781,31 +936,37 @@ fn patch_encoded_len(
         if index > 0 {
             encoded_len = saturated_len_add(encoded_len, 1);
         }
-        let path_len = serialized_json_len(patch_path(change))?;
         let change_len = match change {
-            ScratchChange::Write { contents, .. } => {
-                let content_hex_len = u64::try_from(contents.len())
-                    .unwrap_or(u64::MAX)
-                    .saturating_mul(2);
-                [
-                    PATCH_WRITE_PREFIX.len(),
-                    PATCH_WRITE_CONTENT_PREFIX.len(),
-                    PATCH_WRITE_SUFFIX.len(),
-                ]
-                .into_iter()
-                .map(|length| u64::try_from(length).unwrap_or(u64::MAX))
-                .fold(path_len, saturated_len_add)
-                .saturating_add(content_hex_len)
+            ScratchChange::Write { contents, .. } => patch_encoded_len_for_write(
+                patch_path(change),
+                u64::try_from(contents.len()).unwrap_or(u64::MAX),
+            )?,
+            ScratchChange::Delete { .. } => {
+                let path_len = serialized_json_len(patch_path(change))?;
+                [PATCH_DELETE_PREFIX.len(), PATCH_DELETE_SUFFIX.len()]
+                    .into_iter()
+                    .map(|length| u64::try_from(length).unwrap_or(u64::MAX))
+                    .fold(path_len, saturated_len_add)
             }
-            ScratchChange::Delete { .. } => [PATCH_DELETE_PREFIX.len(), PATCH_DELETE_SUFFIX.len()]
-                .into_iter()
-                .map(|length| u64::try_from(length).unwrap_or(u64::MAX))
-                .fold(path_len, saturated_len_add),
         };
         encoded_len = saturated_len_add(encoded_len, change_len);
         ensure_evidence_size(encoded_len, max_evidence_bytes)?;
     }
     Ok(encoded_len)
+}
+
+fn patch_encoded_len_for_write(path: &str, contents_bytes: u64) -> Result<u64, ScratchError> {
+    let path_len = serialized_json_len(path)?;
+    let content_hex_len = contents_bytes.saturating_mul(2);
+    Ok([
+        PATCH_WRITE_PREFIX.len(),
+        PATCH_WRITE_CONTENT_PREFIX.len(),
+        PATCH_WRITE_SUFFIX.len(),
+    ]
+    .into_iter()
+    .map(|length| u64::try_from(length).unwrap_or(u64::MAX))
+    .fold(path_len, saturated_len_add)
+    .saturating_add(content_hex_len))
 }
 
 fn snapshot_encoded_len(
@@ -1056,6 +1217,10 @@ struct OpenedEntry {
     file: File,
     file_type: FileType,
     mode: u32,
+    #[cfg(unix)]
+    device: i32,
+    #[cfg(unix)]
+    inode: u64,
 }
 
 #[cfg(unix)]
@@ -1116,6 +1281,8 @@ fn collect_selected_files(
                         })?,
                     file_type: root_entry.file_type,
                     mode: root_entry.mode,
+                    device: root_entry.device,
+                    inode: root_entry.inode,
                 },
                 0,
                 false,
@@ -1174,6 +1341,8 @@ fn open_root_directory(path: &Path) -> Result<OpenedEntry, ScratchError> {
         file,
         file_type,
         mode: permission_mode(&stat),
+        device: stat.st_dev,
+        inode: stat.st_ino,
     })
 }
 
@@ -1295,6 +1464,8 @@ fn open_entry_no_follow(
         file,
         file_type: opened_type,
         mode: permission_mode(&opened),
+        device: opened.st_dev,
+        inode: opened.st_ino,
     })
 }
 
@@ -1610,7 +1781,7 @@ fn scan_workspace(root: &Path, limits: ScratchLimits) -> Result<WorkspaceScan, S
     let expected_len =
         snapshot_encoded_len(encoded_files_len, total_bytes, limits.max_evidence_bytes)?;
     let document = SnapshotDocument {
-        schema_version: "diagnostic-triage.scratch-snapshot/v1",
+        schema_version: SNAPSHOT_SCHEMA_VERSION.to_owned(),
         files: snapshot_files,
         total_bytes,
     };
@@ -1945,10 +2116,25 @@ fn inject_apply_change_failure_on_call(call: usize) {
 }
 
 #[cfg(all(test, unix))]
-fn inject_open_entry_race(hook: impl FnOnce() + 'static) {
+pub(crate) fn inject_open_entry_race(hook: impl FnOnce() + 'static) {
     OPEN_ENTRY_RACE_HOOK.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(hook));
     });
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn inject_immutable_base_read_failure() {
+    IMMUTABLE_BASE_READ_FAILURE.with(|failure| failure.set(true));
+}
+
+#[cfg(all(test, unix))]
+fn inject_immutable_base_read_failure_if_requested() -> bool {
+    IMMUTABLE_BASE_READ_FAILURE.with(|failure| failure.replace(false))
+}
+
+#[cfg(not(all(test, unix)))]
+fn inject_immutable_base_read_failure_if_requested() -> bool {
+    false
 }
 
 #[cfg(all(test, unix))]
