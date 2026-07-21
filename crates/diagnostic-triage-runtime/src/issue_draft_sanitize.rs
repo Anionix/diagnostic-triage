@@ -30,6 +30,7 @@ const PROVIDER_TOKEN_PREFIXES: &[(&str, usize, bool)] = &[
 enum SanitizationMode {
     ExternalText,
     Identifier,
+    RepositoryPath,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,6 +154,14 @@ pub(crate) fn sanitize_identifier_text(
     max_bytes: usize,
 ) -> Result<SanitizedText, SanitizeError> {
     sanitize_text(value, max_bytes, SanitizationMode::Identifier)
+}
+
+pub(crate) fn sanitize_repository_path_text(
+    value: &diagnostic_triage_contracts::RepoPath,
+    max_bytes: usize,
+) -> Result<SanitizedText, SanitizeError> {
+    // LLM contract: VALIDATED_REPO_PATH -> EXPLICIT_TOKEN_REDACTED | GENERIC_COMPONENT_PRESERVED.
+    sanitize_text(value.as_str(), max_bytes, SanitizationMode::RepositoryPath)
 }
 
 fn sanitize_text(
@@ -329,10 +338,10 @@ fn redact_secret_assignments(
             .or_else(|| quoted_secret_at_with_provenance(neutralized, index))
             .or_else(|| json_quoted_secret_at(neutralized, index))
             .or_else(|| authorization_secret_at(neutralized, index))
-            .or_else(|| {
-                (mode == SanitizationMode::ExternalText)
-                    .then(|| token_shape_at(value, index))
-                    .flatten()
+            .or_else(|| match mode {
+                SanitizationMode::ExternalText => token_shape_at(value, index, true),
+                SanitizationMode::RepositoryPath => token_shape_at(value, index, false),
+                SanitizationMode::Identifier => None,
             })
         {
             output.push_str(&value[index..start])?;
@@ -347,14 +356,15 @@ fn redact_secret_assignments(
     Ok(output.finish())
 }
 
-fn token_shape_at(value: &str, index: usize) -> Option<(usize, usize)> {
+fn token_shape_at(value: &str, index: usize, include_generic: bool) -> Option<(usize, usize)> {
     is_word_boundary(value, index, true).then_some(())?;
-    if let Some(end) = provider_token_end(value, index).or_else(|| jwt_token_end(value, index)) {
-        return Some((index, end));
-    }
-    let end = generic_token_end(value, index)?;
-    // LLM contract: GENERIC_CANDIDATE -> REPO_RELATIVE_COMPONENT_PRESERVED | SECRET_SHAPE_REDACTED.
-    (!is_repository_relative_path_component(value, index, end)).then_some(())?;
+    let end = provider_token_end(value, index)
+        .or_else(|| jwt_token_end(value, index))
+        .or_else(|| {
+            include_generic
+                .then(|| generic_token_end(value, index))
+                .flatten()
+        })?;
     Some((index, end))
 }
 
@@ -398,79 +408,6 @@ fn generic_token_end(value: &str, index: usize) -> Option<usize> {
         && diverse
         && is_word_boundary(value, end, false))
     .then_some(end)
-}
-
-fn is_repository_relative_path_component(value: &str, start: usize, end: usize) -> bool {
-    const MAX_REPO_PATH_BYTES: usize = 4_096 * 4;
-
-    let bytes = value.as_bytes();
-    let has_separator = start
-        .checked_sub(1)
-        .and_then(|index| bytes.get(index))
-        .is_some_and(|byte| *byte == b'/')
-        || bytes.get(end).is_some_and(|byte| *byte == b'/');
-    if !has_separator {
-        return false;
-    }
-
-    let mut path_start = 0;
-    let mut inspected = 0;
-    for (offset, character) in value[..start].char_indices().rev() {
-        inspected += character.len_utf8();
-        if inspected > MAX_REPO_PATH_BYTES {
-            return false;
-        }
-        if is_path_surface_delimiter(character) {
-            path_start = offset + character.len_utf8();
-            break;
-        }
-    }
-
-    let mut path_end = value.len();
-    inspected = 0;
-    for (offset, character) in value[end..].char_indices() {
-        inspected += character.len_utf8();
-        if inspected > MAX_REPO_PATH_BYTES {
-            return false;
-        }
-        if is_path_surface_delimiter(character) {
-            path_end = end + offset;
-            break;
-        }
-    }
-
-    let candidate = &value[path_start..path_end];
-    candidate.contains('/')
-        && candidate.len() <= MAX_REPO_PATH_BYTES
-        && candidate
-            .parse::<diagnostic_triage_contracts::RepoPath>()
-            .is_ok()
-}
-
-fn is_path_surface_delimiter(character: char) -> bool {
-    character.is_whitespace()
-        || matches!(
-            character,
-            '"' | '\''
-                | '`'
-                | '<'
-                | '>'
-                | '('
-                | ')'
-                | '['
-                | ']'
-                | '{'
-                | '}'
-                | ','
-                | ';'
-                | '='
-                | ':'
-                | '|'
-                | '&'
-                | '?'
-                | '#'
-                | '!'
-        )
 }
 
 fn bounded_token_end(
@@ -1025,7 +962,7 @@ mod tests {
     use super::{
         GeneratedMarker, MarkerKind, PROVIDER_TOKEN_PREFIXES, SanitizeError,
         neutralize_external_text, quoted_secret_at, recognize_secret_key, sanitize_external_text,
-        sanitize_identifier_text, unquoted_secret_at,
+        sanitize_identifier_text, sanitize_repository_path_text, unquoted_secret_at,
     };
 
     #[test]
@@ -1699,19 +1636,26 @@ mod tests {
     fn preserves_repository_relative_path_components_without_weakening_token_redaction() {
         let first = "Ab1_".repeat(8);
         let second = "Cd2-".repeat(8);
+        let ambiguous = format!("logs/{first}/trace.txt");
+        assert_eq!(
+            sanitize_external_text(&ambiguous, 4096).unwrap().as_str(),
+            "logs/[REDACTED_SECRET]/trace.txt"
+        );
         for path in [
             format!("dist/{first}/bundle.js"),
             format!("資料/{first}/詳細/{second}/mod.rs"),
             format!("{first}/bundle.js"),
             format!("dist/{first}"),
         ] {
-            let actual = sanitize_external_text(&path, path.len()).unwrap();
+            let repo_path = path.parse().unwrap();
+            let actual = sanitize_repository_path_text(&repo_path, path.len()).unwrap();
             assert_eq!(actual.as_str(), path);
         }
 
         let path = format!("dist/{first}/bundle.js");
+        let repo_path = path.parse().unwrap();
         assert_eq!(
-            sanitize_external_text(&path, path.len() - 1),
+            sanitize_repository_path_text(&repo_path, path.len() - 1),
             Err(SanitizeError::OutputLimitExceeded {
                 max_bytes: path.len() - 1,
             })
@@ -1728,15 +1672,34 @@ mod tests {
         }
 
         let provider = format!("dist/ghp_{}/bundle.js", "A1".repeat(10));
+        let provider_path = provider.parse().unwrap();
         assert_eq!(
-            sanitize_external_text(&provider, 4096).unwrap().as_str(),
+            sanitize_repository_path_text(&provider_path, 4096)
+                .unwrap()
+                .as_str(),
             "dist/[REDACTED_SECRET]/bundle.js"
         );
         let jwt = "eyJhbGciOiJIUzI1NiJ9.e30.c2lnbmF0dXJlMDEyMzQ1Njc4OTA";
         let jwt_path = format!("dist/{jwt}/bundle.js");
+        let jwt_repo_path = jwt_path.parse().unwrap();
         assert_eq!(
-            sanitize_external_text(&jwt_path, 4096).unwrap().as_str(),
+            sanitize_repository_path_text(&jwt_repo_path, 4096)
+                .unwrap()
+                .as_str(),
             "dist/[REDACTED_SECRET]/bundle.js"
+        );
+
+        let repeated = std::iter::repeat_n(first.as_str(), 10_000)
+            .collect::<Vec<_>>()
+            .join("/");
+        let redacted = std::iter::repeat_n("[REDACTED_SECRET]", 10_000)
+            .collect::<Vec<_>>()
+            .join("/");
+        assert_eq!(
+            sanitize_external_text(&repeated, repeated.len())
+                .unwrap()
+                .as_str(),
+            redacted
         );
     }
 
