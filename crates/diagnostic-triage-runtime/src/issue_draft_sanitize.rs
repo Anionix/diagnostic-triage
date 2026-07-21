@@ -47,6 +47,20 @@ impl NeutralizedText {
     fn as_str(&self) -> &str {
         self.text.as_str()
     }
+
+    fn marker_at(&self, start: usize) -> Option<GeneratedMarker> {
+        self.markers
+            .binary_search_by_key(&start, |marker| marker.start)
+            .ok()
+            .map(|index| self.markers[index])
+    }
+
+    fn marker_ending_at(&self, end: usize) -> Option<GeneratedMarker> {
+        self.markers
+            .binary_search_by_key(&end, |marker| marker.end)
+            .ok()
+            .map(|index| self.markers[index])
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -102,7 +116,7 @@ pub(crate) fn sanitize_external_text(
     max_bytes: usize,
 ) -> Result<SanitizedText, SanitizeError> {
     let neutralized = neutralize_external_text(value, max_bytes)?;
-    redact_secret_assignments(neutralized.as_str(), max_bytes)
+    redact_secret_assignments(&neutralized, max_bytes)
 }
 
 fn neutralize_external_text(
@@ -255,14 +269,16 @@ fn is_secret_key(value: &str) -> bool {
 }
 
 fn redact_secret_assignments(
-    value: &str,
+    neutralized: &NeutralizedText,
     max_bytes: usize,
 ) -> Result<SanitizedText, SanitizeError> {
+    let value = neutralized.as_str();
     let mut output = BoundedText::new(value.len(), max_bytes);
     let mut index = 0;
     while index < value.len() {
-        if let Some((start, end)) =
-            unquoted_secret_at(value, index).or_else(|| quoted_secret_at(value, index))
+        if let Some((start, end)) = unquoted_secret_at(value, index)
+            .or_else(|| quoted_secret_at(value, index))
+            .or_else(|| json_quoted_secret_at(neutralized, index))
         {
             output.push_str(&value[index..start])?;
             output.push_str("[REDACTED_SECRET]")?;
@@ -314,6 +330,93 @@ fn quoted_secret_at(value: &str, index: usize) -> Option<(usize, usize)> {
         raw_quoted_value_end(bytes, start, quote)
     };
     (end > start).then_some((start, end))
+}
+
+fn json_quoted_secret_at(neutralized: &NeutralizedText, index: usize) -> Option<(usize, usize)> {
+    let value = neutralized.as_str();
+    let bytes = value.as_bytes();
+    if bytes.get(index) != Some(&b'"') || !is_json_key_boundary(neutralized, index) {
+        return None;
+    }
+
+    let mut cursor = index + 1;
+    let mut normalized = String::with_capacity(16);
+    let mut needs_alphanumeric = false;
+    while let Some(byte) = bytes.get(cursor).copied() {
+        if byte.is_ascii_alphanumeric() {
+            if normalized.len() == 32 {
+                return None;
+            }
+            normalized.push(char::from(byte.to_ascii_lowercase()));
+            cursor += 1;
+            needs_alphanumeric = false;
+        } else if matches!(byte, b'_' | b'-') {
+            if normalized.is_empty() || needs_alphanumeric {
+                return None;
+            }
+            cursor += 1;
+            needs_alphanumeric = true;
+        } else {
+            break;
+        }
+    }
+    if needs_alphanumeric || bytes.get(cursor) != Some(&b'"') || !is_secret_key(&normalized) {
+        return None;
+    }
+
+    cursor = skip_json_whitespace(neutralized, cursor + 1);
+    if bytes.get(cursor) != Some(&b':') {
+        return None;
+    }
+    cursor = skip_json_whitespace(neutralized, cursor + 1);
+    if bytes.get(cursor) != Some(&b'"') {
+        return None;
+    }
+    let start = cursor + 1;
+    if start >= bytes.len() {
+        return None;
+    }
+    let end = raw_quoted_value_end(bytes, start, b'"');
+    (end > start).then_some((start, end))
+}
+
+fn skip_json_whitespace(neutralized: &NeutralizedText, mut cursor: usize) -> usize {
+    loop {
+        if neutralized.as_str().as_bytes().get(cursor) == Some(&b' ') {
+            cursor += 1;
+        } else if let Some(marker) = neutralized
+            .marker_at(cursor)
+            .filter(|marker| is_json_whitespace_marker(*marker))
+        {
+            cursor = marker.end;
+        } else {
+            break;
+        }
+    }
+    cursor
+}
+
+fn is_json_key_boundary(neutralized: &NeutralizedText, index: usize) -> bool {
+    let bytes = neutralized.as_str().as_bytes();
+    let mut cursor = index;
+    loop {
+        while cursor > 0 && bytes[cursor - 1] == b' ' {
+            cursor -= 1;
+        }
+        if let Some(marker) = neutralized
+            .marker_ending_at(cursor)
+            .filter(|marker| is_json_whitespace_marker(*marker))
+        {
+            cursor = marker.start;
+        } else {
+            break;
+        }
+    }
+    cursor > 0 && matches!(bytes[cursor - 1], b'{' | b',')
+}
+
+fn is_json_whitespace_marker(marker: GeneratedMarker) -> bool {
+    marker.kind == MarkerKind::Control && matches!(marker.code_point, 0x0009 | 0x000a | 0x000d)
 }
 
 fn secret_value_start(value: &str, index: usize) -> Option<usize> {
@@ -773,6 +876,83 @@ mod tests {
         );
         assert_eq!(
             sanitize_external_text("token=\"x\"", expected.len() - 1),
+            Err(SanitizeError::OutputLimitExceeded {
+                max_bytes: expected.len() - 1,
+            })
+        );
+    }
+
+    #[test]
+    fn redacts_compact_and_provenance_aware_json_secrets() {
+        let cases = [
+            (
+                r#"{"token":"secret","name":"ok"}"#,
+                r#"{"token":"[REDACTED_SECRET]","name":"ok"}"#,
+            ),
+            (
+                r#"{"API_KEY":"秘密"}"#,
+                r#"{"API_KEY":"[REDACTED_SECRET]"}"#,
+            ),
+            (
+                "{\n  \"token\"\t:\r \"secret\"\n}",
+                "{[CONTROL-U+000A]  \"token\"[CONTROL-U+0009]:[CONTROL-U+000D] \"[REDACTED_SECRET]\"[CONTROL-U+000A]}",
+            ),
+            (
+                "{\"token\"\u{000b}:\"PUBLIC\"}",
+                "{\"token\"[CONTROL-U+000B]:\"PUBLIC\"}",
+            ),
+            (
+                "{\"token\"\u{000c}:\"PUBLIC\"}",
+                "{\"token\"[CONTROL-U+000C]:\"PUBLIC\"}",
+            ),
+            (
+                r#"{"token":"a\"b","password":"two"}"#,
+                r#"{"token":"[REDACTED_SECRET]","password":"[REDACTED_SECRET]"}"#,
+            ),
+            ("{\"token\":\"missing", "{\"token\":\"[REDACTED_SECRET]"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                sanitize_external_text(input, 4096).unwrap().as_str(),
+                expected,
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_json_or_unprovenanced_key_separators() {
+        for input in [
+            r#"{"name":"PUBLIC"}"#,
+            r#"{"token":""}"#,
+            r#"{"token":'PUBLIC'}"#,
+            r#"{"tok\u0065n":"PUBLIC"}"#,
+            r#"{"token-":"PUBLIC"}"#,
+            r#"{"to--ken":"PUBLIC"}"#,
+            r#"{"note":"embedded \"token\":\"PUBLIC\" text"}"#,
+            r#"prefix "token":"PUBLIC""#,
+            r#"{"token"[CONTROL-U+0009]:"PUBLIC"}"#,
+            "{\"token\"\u{2003}:\"PUBLIC\"}",
+        ] {
+            assert_eq!(
+                sanitize_external_text(input, 4096).unwrap().as_str(),
+                input,
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn json_redaction_obeys_the_exact_output_bound() {
+        let expected = r#"{"token":"[REDACTED_SECRET]"}"#;
+        assert_eq!(
+            sanitize_external_text(r#"{"token":"x"}"#, expected.len())
+                .unwrap()
+                .as_str(),
+            expected
+        );
+        assert_eq!(
+            sanitize_external_text(r#"{"token":"x"}"#, expected.len() - 1),
             Err(SanitizeError::OutputLimitExceeded {
                 max_bytes: expected.len() - 1,
             })
