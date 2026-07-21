@@ -634,8 +634,52 @@ fn credential_value_at(neutralized: &NeutralizedText, cursor: usize) -> Option<(
         let end = raw_quoted_value_end(bytes, start, quote);
         return (end > start).then_some((start, end));
     }
-    let end = unquoted_value_end(value, cursor, Some(neutralized));
+    let mut end = unquoted_value_end(value, cursor, Some(neutralized));
+    if let Some(quote_start) = authorization_quote_start(neutralized, cursor, end) {
+        end = quote_start;
+    }
     (end > cursor).then_some((cursor, end))
+}
+
+// LLM contract: SCHEME_MATCHED -> RAW_OR_ESCAPED_QUOTE_BOUNDARY -> CREDENTIAL_BOUNDED.
+fn authorization_quote_start(
+    neutralized: &NeutralizedText,
+    start: usize,
+    end: usize,
+) -> Option<usize> {
+    let bytes = neutralized.as_str().as_bytes();
+    (start..end).find_map(|cursor| {
+        (is_quote(bytes[cursor]) && is_authorization_quote_suffix(neutralized, cursor + 1)).then(
+            || {
+                if is_escaped(bytes, start, cursor) {
+                    cursor - 1
+                } else {
+                    cursor
+                }
+            },
+        )
+    })
+}
+
+fn is_authorization_quote_suffix(neutralized: &NeutralizedText, index: usize) -> bool {
+    if neutralized
+        .marker_at(index)
+        .is_some_and(is_assignment_whitespace_marker)
+    {
+        return true;
+    }
+    let bytes = neutralized.as_str().as_bytes();
+    let Some(suffix) = bytes.get(index..) else {
+        return false;
+    };
+    if suffix.is_empty() {
+        return true;
+    }
+    matches!(suffix[0], b',' | b';' | b'&' | b'}' | b']' | b')')
+        || std::str::from_utf8(suffix)
+            .ok()
+            .and_then(|value| value.chars().next())
+            .is_some_and(char::is_whitespace)
 }
 
 fn is_word_boundary(value: &str, index: usize, before: bool) -> bool {
@@ -1279,6 +1323,7 @@ mod tests {
                 "Bearer \"secret\" tail",
                 "Bearer \"[REDACTED_SECRET]\" tail",
             ),
+            ("Bearer abc'def tail", "Bearer [REDACTED_SECRET] tail"),
             (
                 "Bea\u{200b}rer value tail",
                 "Bea[FORMAT-U+200B]rer [REDACTED_SECRET] tail",
@@ -1296,6 +1341,57 @@ mod tests {
         for (input, expected) in cases {
             let actual = sanitize_external_text(input, 4096).unwrap();
             assert_eq!(actual.as_str(), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn quoted_authorization_preserves_enclosing_delimiters_and_following_fields() {
+        let cases = [
+            (
+                r#"{"Authorization":"Bearer TOKEN","name":"ok"}"#,
+                r#"{"Authorization":"Bearer [REDACTED_SECRET]","name":"ok"}"#,
+            ),
+            (
+                r#"{"Authorization":"Basic TOKEN","name":"ok"}"#,
+                r#"{"Authorization":"Basic [REDACTED_SECRET]","name":"ok"}"#,
+            ),
+            (
+                r#"{\"Authorization\":\"Bearer TOKEN\",\"name\":\"ok\"}"#,
+                r#"{\"Authorization\":\"Bearer [REDACTED_SECRET]\",\"name\":\"ok\"}"#,
+            ),
+            (
+                r#"{"Authorization":"  Bearer TOKEN","name":"ok"}"#,
+                r#"{"Authorization":"  Bearer [REDACTED_SECRET]","name":"ok"}"#,
+            ),
+            (
+                r#"{"Authorization":"Bearer TOKEN"#,
+                r#"{"Authorization":"Bearer [REDACTED_SECRET]"#,
+            ),
+            (
+                r#"{\"Authorization\":\"Basic TOKEN"#,
+                r#"{\"Authorization\":\"Basic [REDACTED_SECRET]"#,
+            ),
+            (
+                "\"Bearer TOKEN\"\nnext=ok",
+                "\"Bearer [REDACTED_SECRET]\"[CONTROL-U+000A]next=ok",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                sanitize_external_text(input, expected.len())
+                    .unwrap()
+                    .as_str(),
+                expected,
+                "input {input:?}"
+            );
+            assert_eq!(
+                sanitize_external_text(input, expected.len() - 1),
+                Err(SanitizeError::OutputLimitExceeded {
+                    max_bytes: expected.len() - 1,
+                }),
+                "bound for {input:?}"
+            );
         }
     }
 
