@@ -279,6 +279,7 @@ fn redact_secret_assignments(
         if let Some((start, end)) = unquoted_secret_at(value, index)
             .or_else(|| quoted_secret_at(value, index))
             .or_else(|| json_quoted_secret_at(neutralized, index))
+            .or_else(|| authorization_secret_at(neutralized, index))
         {
             output.push_str(&value[index..start])?;
             output.push_str("[REDACTED_SECRET]")?;
@@ -302,7 +303,7 @@ fn unquoted_secret_at(value: &str, index: usize) -> Option<(usize, usize)> {
     {
         return None;
     }
-    let end = unquoted_value_end(value, cursor);
+    let end = unquoted_value_end(value, cursor, None);
     (end > cursor).then_some((cursor, end))
 }
 
@@ -419,6 +420,111 @@ fn is_json_whitespace_marker(marker: GeneratedMarker) -> bool {
     marker.kind == MarkerKind::Control && matches!(marker.code_point, 0x0009 | 0x000a | 0x000d)
 }
 
+fn authorization_secret_at(neutralized: &NeutralizedText, index: usize) -> Option<(usize, usize)> {
+    let value = neutralized.as_str();
+    let bytes = value.as_bytes();
+    let mut cursor =
+        if let Some(key_end) = generated_keyword_end(neutralized, index, b"authorization") {
+            let separator = skip_provenance_whitespace(neutralized, key_end);
+            matches!(bytes.get(separator), Some(b'=' | b':')).then_some(())?;
+            skip_provenance_whitespace(neutralized, separator + 1)
+        } else {
+            let scheme_end = authorization_scheme_end(neutralized, index)?;
+            let value_start = skip_provenance_whitespace(neutralized, scheme_end);
+            (value_start > scheme_end).then_some(())?;
+            return credential_value_at(neutralized, value_start);
+        };
+
+    if let Some(scheme_end) = authorization_scheme_end(neutralized, cursor) {
+        let value_start = skip_provenance_whitespace(neutralized, scheme_end);
+        (value_start > scheme_end).then_some(())?;
+        cursor = value_start;
+    }
+    credential_value_at(neutralized, cursor)
+}
+
+fn authorization_scheme_end(neutralized: &NeutralizedText, index: usize) -> Option<usize> {
+    generated_keyword_end(neutralized, index, b"basic")
+        .or_else(|| generated_keyword_end(neutralized, index, b"bearer"))
+}
+
+fn generated_keyword_end(
+    neutralized: &NeutralizedText,
+    index: usize,
+    keyword: &[u8],
+) -> Option<usize> {
+    const MAX_MARKERS: u8 = 8;
+    const MAX_SPAN: usize = 256;
+
+    let value = neutralized.as_str();
+    is_word_boundary(value, index, true).then_some(())?;
+    let mut cursor = index;
+    let mut marker_count = 0;
+    for (position, expected) in keyword.iter().enumerate() {
+        if position > 0 {
+            while let Some(marker) = neutralized
+                .marker_at(cursor)
+                .filter(|marker| matches!(marker.kind, MarkerKind::Bidi | MarkerKind::Format))
+            {
+                marker_count += 1;
+                if marker_count > MAX_MARKERS || marker.end - index > MAX_SPAN {
+                    return None;
+                }
+                cursor = marker.end;
+            }
+        }
+        (value.as_bytes().get(cursor)?.to_ascii_lowercase() == *expected).then_some(())?;
+        cursor += 1;
+    }
+    is_word_boundary(value, cursor, false).then_some(cursor)
+}
+
+fn skip_provenance_whitespace(neutralized: &NeutralizedText, mut cursor: usize) -> usize {
+    loop {
+        if let Some(marker) = neutralized
+            .marker_at(cursor)
+            .filter(|marker| is_assignment_whitespace_marker(*marker))
+        {
+            cursor = marker.end;
+            continue;
+        }
+        let Some(character) = neutralized.as_str()[cursor..].chars().next() else {
+            break;
+        };
+        if !character.is_whitespace() {
+            break;
+        }
+        cursor += character.len_utf8();
+    }
+    cursor
+}
+
+fn is_assignment_whitespace_marker(marker: GeneratedMarker) -> bool {
+    marker.kind == MarkerKind::Control && matches!(marker.code_point, 0x0009..=0x000d)
+}
+
+fn credential_value_at(neutralized: &NeutralizedText, cursor: usize) -> Option<(usize, usize)> {
+    let value = neutralized.as_str();
+    let bytes = value.as_bytes();
+    if let Some(quote) = bytes.get(cursor).copied().filter(|byte| is_quote(*byte)) {
+        let start = cursor + 1;
+        let end = raw_quoted_value_end(bytes, start, quote);
+        return (end > start).then_some((start, end));
+    }
+    let end = unquoted_value_end(value, cursor, Some(neutralized));
+    (end > cursor).then_some((cursor, end))
+}
+
+fn is_word_boundary(value: &str, index: usize, before: bool) -> bool {
+    let character = if before {
+        value.get(..index).and_then(|side| side.chars().next_back())
+    } else {
+        value.get(index..).and_then(|side| side.chars().next())
+    };
+    character
+        .is_none_or(|character| !character.is_alphanumeric() && !matches!(character, '_' | '-'))
+}
+
 fn secret_value_start(value: &str, index: usize) -> Option<usize> {
     let matched = recognize_secret_key(value, index)?;
     let bytes = value.as_bytes();
@@ -480,10 +586,16 @@ fn escaped_quoted_value_end(bytes: &[u8], start: usize, quote: u8) -> usize {
     bytes.len()
 }
 
-fn unquoted_value_end(value: &str, start: usize) -> usize {
+fn unquoted_value_end(value: &str, start: usize, neutralized: Option<&NeutralizedText>) -> usize {
     let bytes = value.as_bytes();
     let mut cursor = start;
     while cursor < value.len() {
+        if neutralized
+            .and_then(|text| text.marker_at(cursor))
+            .is_some_and(is_assignment_whitespace_marker)
+        {
+            break;
+        }
         let character = value[cursor..].chars().next().expect("UTF-8 boundary");
         let ascii_delimiter = matches!(character, ' ' | ',' | ';' | '&');
         if (character.is_whitespace() || ascii_delimiter)
@@ -957,6 +1069,86 @@ mod tests {
                 max_bytes: expected.len() - 1,
             })
         );
+    }
+
+    #[test]
+    fn redacts_authorization_and_bare_scheme_credentials() {
+        let cases = [
+            (
+                "Authorization: Basic credential, next=ok",
+                "Authorization: Basic [REDACTED_SECRET], next=ok",
+            ),
+            (
+                "authorization = bearer TOKEN; next=ok",
+                "authorization = bearer [REDACTED_SECRET]; next=ok",
+            ),
+            (
+                "AUTHORIZATION: opaque&next=ok",
+                "AUTHORIZATION: [REDACTED_SECRET]&next=ok",
+            ),
+            ("Basic abc123 tail", "Basic [REDACTED_SECRET] tail"),
+            (
+                "Bearer \"secret\" tail",
+                "Bearer \"[REDACTED_SECRET]\" tail",
+            ),
+            (
+                "Bea\u{200b}rer value tail",
+                "Bea[FORMAT-U+200B]rer [REDACTED_SECRET] tail",
+            ),
+            (
+                "Bearer value\nnext=ok",
+                "Bearer [REDACTED_SECRET][CONTROL-U+000A]next=ok",
+            ),
+            (
+                "Authori\u{202e}zation:\topaque, next=ok",
+                "Authori[BIDI-U+202E]zation:[CONTROL-U+0009][REDACTED_SECRET], next=ok",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let actual = sanitize_external_text(input, 4096).unwrap();
+            assert_eq!(actual.as_str(), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn rejects_missing_ambiguous_or_spoofed_scheme_values() {
+        for input in [
+            "Basic",
+            "Bearer , next=ok",
+            "Authorization: Basic",
+            "Authorization: Bearer, next=ok",
+            "Basic=secret",
+            "xBearer secret",
+            "Bearerish secret",
+            "αBearer secret",
+            "Bearerβ secret",
+            "Bea[FORMAT-U+200B]rer secret",
+        ] {
+            let actual = sanitize_external_text(input, 4096).unwrap();
+            assert_eq!(actual.as_str(), input, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn authorization_redaction_is_bounded_on_repeated_nonmatches() {
+        let expected = "Bearer [REDACTED_SECRET]";
+        assert_eq!(
+            sanitize_external_text("Bearer x", expected.len())
+                .unwrap()
+                .as_str(),
+            expected
+        );
+        assert_eq!(
+            sanitize_external_text("Bearer x", expected.len() - 1),
+            Err(SanitizeError::OutputLimitExceeded {
+                max_bytes: expected.len() - 1,
+            })
+        );
+
+        let input = "basicish bearerish authorizationish ".repeat(10_000);
+        let actual = sanitize_external_text(&input, input.len()).unwrap();
+        assert_eq!(actual.as_str(), input);
     }
 
     #[test]
