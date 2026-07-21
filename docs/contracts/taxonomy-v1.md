@@ -36,8 +36,9 @@ involving the top-level `unknown` category is valid.
    collect the test is `test.collection`.
 3. Provider/protocol failure is an Execution status. Use `tooling` only when a
    completed tool diagnostic reports a tooling/configuration defect.
-4. Use `resource` only when a declared bound is reached. An unexplained exit is
-   `unknown.unknown` until evidence improves.
+4. Use `resource` only when a declared bound is reached. An unexplained exit
+   remains `runtime.unknown`; reserve `unknown.unknown` for a completed
+   diagnostic that has no matching catalog rule at all.
 5. Use `security` only for a stated security invariant, never as severity.
 6. CI latency and cache state belong to Execution, not this taxonomy.
 7. Both category-scoped `*.unknown` pairs and top-level `unknown.unknown`

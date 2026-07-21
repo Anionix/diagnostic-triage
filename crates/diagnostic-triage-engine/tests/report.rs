@@ -677,10 +677,26 @@ fn maximum_report_collection_is_accepted() {
     let observations = (0..MAX_REPORT_COLLECTION_ITEMS)
         .map(|index| observation(&format!("maximum-{index}"), Severity::Info))
         .collect::<Vec<_>>();
-    let report =
-        assemble_session_report(input(observations, Vec::new(), Vec::new(), None), &policy())
-            .unwrap();
+    let findings = observations.iter().map(finding).collect::<Vec<_>>();
+    let report = assemble_session_report(
+        input(observations, findings, Vec::new(), Some(EVALUATION_TIME)),
+        &policy(),
+    )
+    .unwrap();
     assert_eq!(report.observations.len(), MAX_REPORT_COLLECTION_ITEMS);
+    assert_eq!(report.findings.len(), MAX_REPORT_COLLECTION_ITEMS);
+}
+
+#[test]
+fn unreferenced_observation_cannot_bypass_policy_as_a_pass_report() {
+    let observation = observation("unreferenced", Severity::Error);
+
+    assert!(matches!(
+        rejected(input(vec![observation], Vec::new(), Vec::new(), None)),
+        ReportAssemblyError::ReferencePreflight {
+            reason: "observation is not referenced by a finding",
+        }
+    ));
 }
 
 #[test]

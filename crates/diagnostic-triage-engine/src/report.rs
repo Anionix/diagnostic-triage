@@ -495,6 +495,15 @@ fn validate_observation_and_finding_references(
             });
         }
     }
+    let referenced_observations = findings
+        .iter()
+        .flat_map(|finding| finding.observation_ids.iter())
+        .collect::<BTreeSet<_>>();
+    if referenced_observations != index.observation_ids {
+        return Err(ReportAssemblyError::ReferencePreflight {
+            reason: "observation is not referenced by a finding",
+        });
+    }
     Ok(())
 }
 
