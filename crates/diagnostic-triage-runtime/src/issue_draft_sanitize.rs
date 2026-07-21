@@ -738,6 +738,17 @@ fn credential_value_at(neutralized: &NeutralizedText, cursor: usize) -> Option<(
         let end = raw_quoted_value_end(bytes, start, quote);
         return (end > start).then_some((start, end));
     }
+    if bytes.get(cursor) == Some(&b'\\') {
+        if let Some(quote) = bytes
+            .get(cursor + 1)
+            .copied()
+            .filter(|byte| is_quote(*byte))
+        {
+            let start = cursor + 2;
+            let end = escaped_quoted_value_end(bytes, start, quote);
+            return (end > start).then_some((start, end));
+        }
+    }
     let mut end = unquoted_value_end(value, cursor, Some(neutralized));
     if let Some(quote_start) = authorization_quote_start(neutralized, cursor, end) {
         end = quote_start;
@@ -1630,6 +1641,43 @@ mod tests {
         for (input, expected) in cases {
             let actual = sanitize_external_text(input, 4096).unwrap();
             assert_eq!(actual.as_str(), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn escaped_quoted_authorization_preserves_delimiters_and_bounds() {
+        let cases = [
+            (
+                r#"Bearer \"secret\" tail"#,
+                r#"Bearer \"[REDACTED_SECRET]\" tail"#,
+            ),
+            (
+                r"Basic \'secret\' tail",
+                r"Basic \'[REDACTED_SECRET]\' tail",
+            ),
+            (
+                r#"Authorization: Bearer \"secret\"; next=ok"#,
+                r#"Authorization: Bearer \"[REDACTED_SECRET]\"; next=ok"#,
+            ),
+            (r#"Bearer \"missing"#, r#"Bearer \"[REDACTED_SECRET]"#),
+        ];
+
+        for (input, expected) in cases {
+            let required_bytes = input.len().max(expected.len());
+            assert_eq!(
+                sanitize_external_text(input, required_bytes)
+                    .unwrap_or_else(|error| panic!("input {input:?}: {error}"))
+                    .as_str(),
+                expected,
+                "input {input:?}"
+            );
+            assert_eq!(
+                sanitize_external_text(input, required_bytes - 1),
+                Err(SanitizeError::OutputLimitExceeded {
+                    max_bytes: required_bytes - 1,
+                }),
+                "input {input:?}"
+            );
         }
     }
 
