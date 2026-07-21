@@ -27,6 +27,9 @@ use std::os::unix::process::CommandExt;
 const IO_CHUNK_BYTES: usize = 8 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
+// Darwin can retain killed orphan zombies until the system reaper collects
+// them; the probe still returns immediately once the group is absent.
+const PROCESS_GROUP_GRACE: Duration = Duration::from_secs(2);
 
 /// Resource limits for one direct child invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,8 +279,22 @@ pub enum ProcessError {
     },
     #[error("failed while waiting for child: {0}")]
     Wait(#[source] io::Error),
+    #[error("failed to signal the child process group: {0}")]
+    GroupSignal(#[source] io::Error),
+    #[error("failed while waiting for the child process group: {0}")]
+    GroupWait(#[source] io::Error),
+    #[error("child process group remained live after termination")]
+    GroupUnreaped,
+    #[error("failed to terminate the group leader directly: {0}")]
+    LeaderSignal(#[source] io::Error),
+    #[error("failed while reaping the group leader: {0}")]
+    Reap(#[source] io::Error),
     #[error("child could not be reaped after termination")]
     Unreaped,
+    #[error("capture pipes remained open after process termination")]
+    CaptureDrainTimeout,
+    #[error("multiple process failures: {failures:?}")]
+    MultipleFailures { failures: Vec<ProcessError> },
 }
 
 /// Execute one tool-native program directly, bounding time and output streams.
@@ -310,23 +327,8 @@ pub fn run_bounded(
     spec.validate()?;
     let limits = limits.validate()?;
     let started = Instant::now();
-    let mut child = ChildCleanupGuard::new(spawn_child(spec)?);
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or(ProcessError::MissingPipe { stream: "stdin" })?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or(ProcessError::MissingPipe { stream: "stdout" })?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or(ProcessError::MissingPipe { stream: "stderr" })?;
-
+    let (mut child, mut pipes) = spawn_piped_child(spec)?;
     let mut capture = CaptureState::new(&limits);
-    let mut pipes = PipeHandles::new(stdin, stdout, stderr);
-    pipes.configure_nonblocking()?;
     if spec.stdin.is_empty() {
         pipes.stdin.take();
         capture.stdin_done = true;
@@ -334,6 +336,7 @@ pub fn run_bounded(
     let mut stdin_offset = 0;
     let deadline = started.checked_add(limits.timeout).unwrap_or(started);
     let mut exit_status = None;
+    let mut timing = RunTiming::new(started);
 
     // LLM contract: RUNNING -> DRAINING -> COMPLETE | INCOMPLETE; once
     // cleanup grace expires, local pipe handles are explicitly dropped.
@@ -361,19 +364,46 @@ pub fn run_bounded(
             &mut capture,
             &limits,
             &mut exit_status,
+            &mut timing,
         )? {
             break;
         }
 
-        exit_status = child.try_wait().map_err(ProcessError::Wait)?;
+        let leader_exited = match child_exited_without_reaping(&child) {
+            Ok(exited) => exited,
+            Err(source) => {
+                return Err(cleanup_after_process_error(
+                    &mut child,
+                    &mut pipes,
+                    &mut capture,
+                    &limits,
+                    &mut exit_status,
+                    ProcessError::Wait(source),
+                ));
+            }
+        };
         let now = Instant::now();
         if now >= deadline {
             capture.failure = Some(IncompleteReason::Timeout);
-            terminate_and_reap(&mut child, &mut exit_status)?;
-            drain_after_termination(&mut pipes, &mut capture, &limits);
+            timing.mark(limits);
+            cleanup_execution(
+                &mut child,
+                &mut pipes,
+                &mut capture,
+                &limits,
+                &mut exit_status,
+            )?;
             break;
         }
-        if capture.is_finished(exit_status.as_ref()) {
+        if leader_exited {
+            timing.mark(limits);
+            cleanup_execution(
+                &mut child,
+                &mut pipes,
+                &mut capture,
+                &limits,
+                &mut exit_status,
+            )?;
             break;
         }
         if !made_progress {
@@ -381,13 +411,12 @@ pub fn run_bounded(
         }
     }
 
-    if exit_status.is_none() {
-        exit_status = child.try_wait().map_err(ProcessError::Wait)?;
-    }
+    let run_duration = timing.run_duration.ok_or(ProcessError::Unreaped)?;
 
     Ok(finalize_outcome(
         started,
         limits,
+        run_duration,
         &mut child,
         exit_status,
         capture,
@@ -421,6 +450,7 @@ pub(crate) fn run_bounded_manifest_first(
     let mut stream_offset = 0;
     let mut request_bytes_written = 0;
     let mut exit_status = None;
+    let mut timing = RunTiming::new(started);
 
     // LLM contract: MANIFEST_PENDING -> REQUEST_WRITING -> STREAMING -> COMPLETE | INCOMPLETE; request bytes are forbidden in MANIFEST_PENDING.
     while !capture.is_finished(exit_status.as_ref()) {
@@ -432,6 +462,7 @@ pub(crate) fn run_bounded_manifest_first(
             &mut capture,
             &limits,
             &mut exit_status,
+            &mut timing,
         )? {
             break;
         }
@@ -482,6 +513,7 @@ pub(crate) fn run_bounded_manifest_first(
             &mut capture,
             &limits,
             &mut exit_status,
+            &mut timing,
         )? {
             break;
         }
@@ -492,6 +524,7 @@ pub(crate) fn run_bounded_manifest_first(
             &mut capture,
             &limits,
             &mut exit_status,
+            &mut timing,
             IterationPhase {
                 deadlines,
                 handshake_accepted,
@@ -502,15 +535,31 @@ pub(crate) fn run_bounded_manifest_first(
         }
     }
 
-    if exit_status.is_none() {
-        exit_status = child.try_wait().map_err(ProcessError::Wait)?;
-    }
-    let process = finalize_outcome(started, limits, &mut child, exit_status, capture);
+    let process = finish_manifest(started, limits, &timing, &mut child, exit_status, capture)?;
     Ok(ManifestFirstOutcome {
         process,
         handshake_accepted,
         request_bytes_written,
     })
+}
+
+fn finish_manifest(
+    started: Instant,
+    limits: ProcessLimits,
+    timing: &RunTiming,
+    child: &mut ChildCleanupGuard,
+    exit_status: Option<ExitStatus>,
+    capture: CaptureState,
+) -> Result<ProcessOutcome, ProcessError> {
+    let run_duration = timing.run_duration.ok_or(ProcessError::Unreaped)?;
+    Ok(finalize_outcome(
+        started,
+        limits,
+        run_duration,
+        child,
+        exit_status,
+        capture,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -524,6 +573,25 @@ struct IterationPhase {
     deadlines: PhaseDeadlines,
     handshake_accepted: bool,
     made_progress: bool,
+}
+
+struct RunTiming {
+    started: Instant,
+    run_duration: Option<Duration>,
+}
+
+impl RunTiming {
+    fn new(started: Instant) -> Self {
+        Self {
+            started,
+            run_duration: None,
+        }
+    }
+
+    fn mark(&mut self, limits: ProcessLimits) {
+        self.run_duration
+            .get_or_insert_with(|| self.started.elapsed().min(limits.timeout));
+    }
 }
 
 fn enforce_phase_deadline(
@@ -545,21 +613,37 @@ fn finish_phase_iteration(
     capture: &mut CaptureState,
     limits: &ProcessLimits,
     exit_status: &mut Option<ExitStatus>,
+    timing: &mut RunTiming,
     phase: IterationPhase,
 ) -> Result<bool, ProcessError> {
-    *exit_status = child.try_wait().map_err(ProcessError::Wait)?;
+    let leader_exited = match child_exited_without_reaping(child) {
+        Ok(exited) => exited,
+        Err(source) => {
+            return Err(cleanup_after_process_error(
+                child,
+                pipes,
+                capture,
+                limits,
+                exit_status,
+                ProcessError::Wait(source),
+            ));
+        }
+    };
     let now = Instant::now();
     if now >= phase.deadlines.total {
         capture.failure = Some(IncompleteReason::Timeout);
     } else if !phase.handshake_accepted
-        && (capture.stdout_done || exit_status.is_some())
+        && (capture.stdout_done || leader_exited)
         && !capture.stdout.bytes.contains(&b'\n')
     {
         capture.failure = Some(IncompleteReason::ManifestMissing);
     }
-    if stop_failed(child, pipes, capture, limits, exit_status)?
-        || capture.is_finished(exit_status.as_ref())
-    {
+    if stop_failed(child, pipes, capture, limits, exit_status, timing)? {
+        return Ok(true);
+    }
+    if leader_exited {
+        timing.mark(*limits);
+        cleanup_execution(child, pipes, capture, limits, exit_status)?;
         return Ok(true);
     }
     if !phase.made_progress {
@@ -583,13 +667,100 @@ fn stop_failed(
     capture: &mut CaptureState,
     limits: &ProcessLimits,
     exit_status: &mut Option<ExitStatus>,
+    timing: &mut RunTiming,
 ) -> Result<bool, ProcessError> {
     if capture.failure.is_none() {
         return Ok(false);
     }
-    terminate_and_reap(child, exit_status)?;
-    drain_after_termination(pipes, capture, limits);
+    timing.mark(*limits);
+    cleanup_execution(child, pipes, capture, limits, exit_status)?;
     Ok(true)
+}
+
+fn cleanup_execution(
+    child: &mut ChildCleanupGuard,
+    pipes: &mut PipeHandles,
+    capture: &mut CaptureState,
+    limits: &ProcessLimits,
+    exit_status: &mut Option<ExitStatus>,
+) -> Result<(), ProcessError> {
+    cleanup_execution_with_group_signal(
+        child,
+        pipes,
+        capture,
+        limits,
+        exit_status,
+        signal_process_group,
+    )
+}
+
+fn cleanup_execution_with_group_signal(
+    child: &mut ChildCleanupGuard,
+    pipes: &mut PipeHandles,
+    capture: &mut CaptureState,
+    limits: &ProcessLimits,
+    exit_status: &mut Option<ExitStatus>,
+    group_signal: fn(u32) -> io::Result<()>,
+) -> Result<(), ProcessError> {
+    let mut errors = Vec::new();
+    if let Err(error) = terminate_and_reap_with_group_signal(child, exit_status, group_signal) {
+        push_error(&mut errors, error);
+    }
+    if let Err(error) = drain_after_termination(pipes, capture, limits) {
+        push_error(&mut errors, error);
+    }
+    // Once the leader has been reaped, never let Drop signal the numeric PGID
+    // again: the kernel may already have reused it for an unrelated group.
+    if exit_status.is_some() {
+        child.disarm();
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(combine_errors(errors))
+    }
+}
+
+fn cleanup_after_process_error(
+    child: &mut ChildCleanupGuard,
+    pipes: &mut PipeHandles,
+    capture: &mut CaptureState,
+    limits: &ProcessLimits,
+    exit_status: &mut Option<ExitStatus>,
+    primary: ProcessError,
+) -> ProcessError {
+    cleanup_after_process_error_with_group_signal(
+        child,
+        pipes,
+        capture,
+        limits,
+        exit_status,
+        primary,
+        signal_process_group,
+    )
+}
+
+fn cleanup_after_process_error_with_group_signal(
+    child: &mut ChildCleanupGuard,
+    pipes: &mut PipeHandles,
+    capture: &mut CaptureState,
+    limits: &ProcessLimits,
+    exit_status: &mut Option<ExitStatus>,
+    primary: ProcessError,
+    group_signal: fn(u32) -> io::Result<()>,
+) -> ProcessError {
+    let mut errors = vec![primary];
+    if let Err(error) = cleanup_execution_with_group_signal(
+        child,
+        pipes,
+        capture,
+        limits,
+        exit_status,
+        group_signal,
+    ) {
+        push_error(&mut errors, error);
+    }
+    combine_errors(errors)
 }
 
 fn validate_available_manifest<F>(
@@ -704,27 +875,58 @@ fn validate_manifest_first_spec(
 }
 
 fn spawn_piped_child(spec: &ProcessSpec) -> Result<(ChildCleanupGuard, PipeHandles), ProcessError> {
+    spawn_piped_child_with_group_signal(spec, signal_process_group)
+}
+
+fn spawn_piped_child_with_group_signal(
+    spec: &ProcessSpec,
+    group_signal: fn(u32) -> io::Result<()>,
+) -> Result<(ChildCleanupGuard, PipeHandles), ProcessError> {
     let mut child = ChildCleanupGuard::new(spawn_child(spec)?);
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or(ProcessError::MissingPipe { stream: "stdin" })?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or(ProcessError::MissingPipe { stream: "stdout" })?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or(ProcessError::MissingPipe { stream: "stderr" })?;
-    let pipes = PipeHandles::new(stdin, stdout, stderr);
-    pipes.configure_nonblocking()?;
-    Ok((child, pipes))
+    let pipes = (|| {
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or(ProcessError::MissingPipe { stream: "stdin" })?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(ProcessError::MissingPipe { stream: "stdout" })?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or(ProcessError::MissingPipe { stream: "stderr" })?;
+        let pipes = PipeHandles::new(stdin, stdout, stderr);
+        pipes.configure_nonblocking()?;
+        Ok(pipes)
+    })();
+    match pipes {
+        Ok(pipes) => Ok((child, pipes)),
+        Err(primary) => Err(cleanup_spawn_failure(&mut child, primary, group_signal)),
+    }
+}
+
+fn cleanup_spawn_failure(
+    child: &mut ChildCleanupGuard,
+    primary: ProcessError,
+    group_signal: fn(u32) -> io::Result<()>,
+) -> ProcessError {
+    let mut errors = vec![primary];
+    let mut exit_status = None;
+    if let Err(error) = terminate_and_reap_with_group_signal(child, &mut exit_status, group_signal)
+    {
+        push_error(&mut errors, error);
+    }
+    if exit_status.is_some() {
+        child.disarm();
+    }
+    combine_errors(errors)
 }
 
 fn finalize_outcome(
     started: Instant,
     limits: ProcessLimits,
+    duration: Duration,
     child: &mut ChildCleanupGuard,
     exit_status: Option<ExitStatus>,
     capture: CaptureState,
@@ -742,8 +944,7 @@ fn finalize_outcome(
     let exit_code = (state == ProcessState::Complete)
         .then_some(exit_code)
         .flatten();
-    let wall_duration = started.elapsed();
-    let duration = wall_duration.min(limits.timeout);
+    let duration = duration.min(limits.timeout);
     child.disarm();
     ProcessOutcome {
         state,
@@ -751,8 +952,32 @@ fn finalize_outcome(
         stdout: capture.stdout,
         stderr: capture.stderr,
         duration,
-        cleanup_duration: wall_duration.saturating_sub(duration),
+        cleanup_duration: started.elapsed().saturating_sub(duration),
     }
+}
+
+#[cfg(unix)]
+fn child_exited_without_reaping(child: &Child) -> io::Result<bool> {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+
+    let pid = i32::try_from(child.id())
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "child pid must be nonzero"))?;
+    waitid(
+        WaitId::Pid(pid),
+        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+    )
+    .map(|status| status.is_some())
+    .map_err(io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn child_exited_without_reaping(_: &Child) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process groups are unsupported",
+    ))
 }
 
 /// Ensures every post-spawn error path terminates the process group and reaps
@@ -1003,67 +1228,212 @@ fn terminate_and_reap(
     child: &mut Child,
     exit_status: &mut Option<ExitStatus>,
 ) -> Result<(), ProcessError> {
-    // The group must be signalled even when its leader has already exited:
-    // descendants can keep inherited pipes open after the leader is reaped.
-    let kill_error = kill_child_tree(child).err();
+    terminate_and_reap_with_group_signal(child, exit_status, signal_process_group)
+}
+
+fn terminate_and_reap_with_group_signal(
+    child: &mut Child,
+    exit_status: &mut Option<ExitStatus>,
+    group_signal: fn(u32) -> io::Result<()>,
+) -> Result<(), ProcessError> {
+    let process_group = child.id();
+    let deadline = Instant::now()
+        .checked_add(PROCESS_GROUP_GRACE)
+        .unwrap_or_else(Instant::now);
+    let mut errors = Vec::new();
+    let leader_exited_before_signal = if exit_status.is_some() {
+        true
+    } else {
+        match child_exited_without_reaping(child) {
+            Ok(exited) => exited,
+            Err(source) => {
+                errors.push(ProcessError::Wait(source));
+                false
+            }
+        }
+    };
+    let group_signal_error = if exit_status.is_some() {
+        None
+    } else {
+        group_signal(process_group).err()
+    };
+    // LLM cleanup contract: SIGNALING -> REAPING only suppresses a native
+    // zombie-race EPERM after a non-reaping exit observation; injected signal
+    // failures remain typed cleanup evidence.
+    let leader_exited_during_native_permission_race = match group_signal_error.as_ref() {
+        Some(source)
+            if !leader_exited_before_signal && is_native_group_permission_error(source) =>
+        {
+            match child_exited_without_reaping(child) {
+                Ok(exited) => exited,
+                Err(source) => {
+                    errors.push(ProcessError::Wait(source));
+                    false
+                }
+            }
+        }
+        _ => false,
+    };
+    let group_signal_failed = group_signal_error.is_some();
     if exit_status.is_none() {
-        *exit_status = child.try_wait().map_err(ProcessError::Wait)?;
-    }
-    if exit_status.is_none() {
-        *exit_status = child
-            .wait_timeout(TERMINATION_GRACE)
-            .map_err(ProcessError::Wait)?;
-        if exit_status.is_none() {
-            return Err(ProcessError::Unreaped);
+        match child.try_wait() {
+            Ok(status) => *exit_status = status,
+            Err(source) => errors.push(ProcessError::Reap(source)),
         }
     }
-    if let Some(kill_error) = kill_error {
-        return Err(ProcessError::Wait(kill_error));
+    if exit_status.is_none() && group_signal_failed {
+        if let Err(source) = child.kill() {
+            errors.push(ProcessError::LeaderSignal(source));
+        }
     }
-    Ok(())
+    if exit_status.is_none() {
+        match child.wait_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(status) => *exit_status = status,
+            Err(source) => errors.push(ProcessError::Reap(source)),
+        }
+    }
+    if exit_status.is_none() {
+        errors.push(ProcessError::Unreaped);
+    }
+    let group_wait = wait_for_process_group(process_group, deadline);
+    let zombie_only_permission_race = matches!(
+        (&group_signal_error, &group_wait),
+        (Some(source), Ok(true))
+            if source.kind() == io::ErrorKind::PermissionDenied
+                && is_native_group_permission_error(source)
+                && (leader_exited_before_signal
+                    || leader_exited_during_native_permission_race)
+                && exit_status.is_some()
+    );
+    if let Some(source) = group_signal_error {
+        if !zombie_only_permission_race {
+            errors.push(ProcessError::GroupSignal(source));
+        }
+    }
+    match group_wait {
+        Ok(true) => {}
+        Ok(false) => errors.push(ProcessError::GroupUnreaped),
+        Err(source) => errors.push(ProcessError::GroupWait(source)),
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(combine_errors(errors))
+    }
 }
 
 #[cfg(unix)]
-fn kill_child_tree(child: &mut Child) -> io::Result<()> {
-    let group = Pid::from_child(child);
-    match kill_process_group(group, Signal::KILL) {
-        Ok(()) => Ok(()),
-        Err(error) if error == rustix::io::Errno::SRCH => {
-            if child.try_wait()?.is_some() {
-                Ok(())
-            } else {
-                child.kill()
-            }
-        }
-        Err(first_error) => {
-            // A very short program can become a zombie between `try_wait`
-            // and `killpg` (EPERM on macOS). Reap it, then retry the group so
-            // live descendants are still terminated rather than ignored.
-            if child.wait_timeout(POLL_INTERVAL)?.is_none() {
-                let _ignored = child.kill();
-                // `terminate_and_reap` bounded-waits and reaps the leader
-                // before it propagates this process-group failure.
-                return Err(first_error.into());
-            }
-            match kill_process_group(group, Signal::KILL) {
-                Ok(()) => Ok(()),
-                Err(error) if error == rustix::io::Errno::SRCH => Ok(()),
-                Err(error) => Err(error.into()),
-            }
-        }
+fn is_native_group_permission_error(source: &io::Error) -> bool {
+    let native = io::Error::from(rustix::io::Errno::PERM);
+    source.kind() == io::ErrorKind::PermissionDenied
+        && source.raw_os_error().is_some()
+        && source.raw_os_error() == native.raw_os_error()
+}
+
+#[cfg(not(unix))]
+fn is_native_group_permission_error(_: &io::Error) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn signal_process_group(process_group: u32) -> io::Result<()> {
+    let process_group = i32::try_from(process_group)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "process group must be nonzero")
+        })?;
+    match kill_process_group(process_group, Signal::KILL) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(error) => Err(io::Error::from(error)),
     }
 }
 
 #[cfg(not(unix))]
-fn kill_child_tree(child: &mut Child) -> io::Result<()> {
-    child.kill()
+fn signal_process_group(_: u32) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process groups are unsupported",
+    ))
+}
+
+#[cfg(unix)]
+fn process_group_exists(process_group: u32) -> io::Result<bool> {
+    use rustix::process::test_kill_process_group;
+
+    let process_group = i32::try_from(process_group)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "process group must be nonzero")
+        })?;
+    map_process_group_probe(test_kill_process_group(process_group))
+}
+
+#[cfg(unix)]
+fn map_process_group_probe(result: Result<(), rustix::io::Errno>) -> io::Result<bool> {
+    use rustix::io::Errno;
+
+    match result {
+        Err(Errno::SRCH) => Ok(false),
+        Ok(()) => Ok(true),
+        Err(Errno::PERM) => Err(io::Error::from(Errno::PERM)),
+        Err(error) => Err(io::Error::from(error)),
+    }
+}
+
+#[cfg(not(unix))]
+fn process_group_exists(_: u32) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process groups are unsupported",
+    ))
+}
+
+fn wait_for_process_group(process_group: u32, deadline: Instant) -> io::Result<bool> {
+    wait_for_process_group_with_probe(process_group, deadline, process_group_exists)
+}
+
+fn wait_for_process_group_with_probe(
+    process_group: u32,
+    deadline: Instant,
+    probe: fn(u32) -> io::Result<bool>,
+) -> io::Result<bool> {
+    loop {
+        let permission_denied = match probe(process_group) {
+            Ok(false) => return Ok(true),
+            Ok(true) => None,
+            Err(source) if source.kind() == io::ErrorKind::PermissionDenied => Some(source),
+            Err(source) => return Err(source),
+        };
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            return permission_denied.map_or(Ok(false), Err);
+        }
+        std::thread::sleep(wait.min(POLL_INTERVAL));
+    }
+}
+
+fn push_error(errors: &mut Vec<ProcessError>, error: ProcessError) {
+    match error {
+        ProcessError::MultipleFailures { failures } => errors.extend(failures),
+        error => errors.push(error),
+    }
+}
+
+fn combine_errors(mut errors: Vec<ProcessError>) -> ProcessError {
+    if errors.len() == 1 {
+        errors.pop().expect("one process error is present")
+    } else {
+        ProcessError::MultipleFailures { failures: errors }
+    }
 }
 
 fn drain_after_termination(
     pipes: &mut PipeHandles,
     capture: &mut CaptureState,
     limits: &ProcessLimits,
-) {
+) -> Result<(), ProcessError> {
     pipes.stdin.take();
     capture.stdin_done = true;
     let deadline = Instant::now()
@@ -1089,9 +1459,15 @@ fn drain_after_termination(
             std::thread::sleep(wait.min(POLL_INTERVAL));
         }
     }
+    let drained = capture.stdout_done && capture.stderr_done;
     // A descendant may have escaped the process group and retained a write
     // end. Never let that inherited handle extend the caller's lifetime.
     pipes.drop_all();
+    if drained {
+        Ok(())
+    } else {
+        Err(ProcessError::CaptureDrainTimeout)
+    }
 }
 
 fn reject_nul(value: &OsStr, field: &'static str) -> Result<(), ProcessError> {
@@ -1161,6 +1537,45 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn manifest_first_leader_exit_kills_closed_stdio_delayed_writer() {
+        let directory = tempdir().unwrap();
+        let marker = directory.path().join("late-write");
+        let spec = ProcessSpec::new("/bin/sh")
+            .args([
+                "-c",
+                r#"printf 'manifest\n'; IFS= read -r request; (sleep 0.2; printf late > "$1") </dev/null >/dev/null 2>&1 & printf 'done\n'; exit 0"#,
+                "sh",
+                marker.to_str().unwrap(),
+            ])
+            .stdin(b"request\n".to_vec());
+
+        let outcome = run_bounded_manifest_first(
+            &spec,
+            limits(1024, 64),
+            Duration::from_secs(1),
+            |line| line == b"manifest\n",
+            |line| {
+                if line == b"done\n" {
+                    StreamLineDecision::Complete
+                } else {
+                    StreamLineDecision::Reject
+                }
+            },
+        )
+        .expect("manifest-first cleanup succeeds");
+
+        assert!(outcome.handshake_accepted);
+        assert_eq!(outcome.process.state, ProcessState::Complete);
+        assert_eq!(outcome.process.exit_code, Some(0));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !marker.exists(),
+            "completion published while a delayed same-group writer survived"
+        );
+    }
+
+    #[cfg(unix)]
     fn assert_process_disappears(raw_pid: i32) {
         use rustix::process::{Pid, test_kill_process};
 
@@ -1172,6 +1587,26 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("descendant process {raw_pid} survived process-group termination");
+    }
+
+    fn contains_group_signal(error: &ProcessError) -> bool {
+        match error {
+            ProcessError::GroupSignal(_) => true,
+            ProcessError::MultipleFailures { failures } => {
+                failures.iter().any(contains_group_signal)
+            }
+            _ => false,
+        }
+    }
+
+    fn contains_capture_drain_timeout(error: &ProcessError) -> bool {
+        match error {
+            ProcessError::CaptureDrainTimeout => true,
+            ProcessError::MultipleFailures { failures } => {
+                failures.iter().any(contains_capture_drain_timeout)
+            }
+            _ => false,
+        }
     }
 
     #[test]
@@ -1368,7 +1803,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn timeout_kills_descendants_after_the_group_leader_exits() {
+    fn leader_exit_kills_inherited_pipe_descendant_and_preserves_status() {
         let outcome = run_bounded(
             &shell("while :; do :; done & descendant=$!; printf '%s\\n' \"$descendant\"; exit 0"),
             ProcessLimits {
@@ -1377,17 +1812,246 @@ mod tests {
                 max_stderr_bytes: 64,
             },
         )
-        .expect("orphaned pipe holder is terminated");
-        assert_eq!(
-            outcome.state,
-            ProcessState::Incomplete(IncompleteReason::Timeout)
-        );
+        .expect("orphaned pipe holder is terminated after leader exit");
+        assert_eq!(outcome.state, ProcessState::Complete);
+        assert_eq!(outcome.exit_code, Some(0));
+        assert!(outcome.duration < Duration::from_secs(1));
+        assert!(outcome.cleanup_duration > Duration::ZERO);
         let raw_pid = String::from_utf8(outcome.stdout.bytes)
             .expect("pid is utf8")
             .trim()
             .parse::<i32>()
             .expect("pid is numeric");
         assert_process_disappears(raw_pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn zero_exit_kills_closed_stdio_descendant_and_preserves_status() {
+        assert_closed_stdio_descendant_is_killed(0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonzero_exit_kills_closed_stdio_descendant_and_preserves_status() {
+        assert_closed_stdio_descendant_is_killed(7);
+    }
+
+    #[cfg(unix)]
+    fn assert_closed_stdio_descendant_is_killed(exit_code: u8) {
+        let started = std::time::Instant::now();
+        let outcome = run_bounded(
+            &shell(&format!(
+                "sleep 5 </dev/null >/dev/null 2>&1 & descendant=$!; printf '%s\\n' \"$descendant\"; exit {exit_code}"
+            )),
+            limits(64, 64),
+        )
+        .expect("leader status and descendant cleanup are both preserved");
+
+        assert_eq!(outcome.state, ProcessState::Complete);
+        assert_eq!(outcome.exit_code, Some(exit_code));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let raw_pid = String::from_utf8(outcome.stdout.bytes)
+            .expect("pid is utf8")
+            .trim()
+            .parse::<i32>()
+            .expect("pid is numeric");
+        assert_process_disappears(raw_pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_group_probe_permission_error_is_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn deny_once_then_absent(_: u32) -> std::io::Result<bool> {
+            if PROBE_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            Ok(false)
+        }
+
+        PROBE_CALLS.store(0, Ordering::SeqCst);
+        let reaped = super::wait_for_process_group_with_probe(
+            1,
+            std::time::Instant::now() + Duration::from_millis(100),
+            deny_once_then_absent,
+        )
+        .expect("a transient group-probe EPERM is retried");
+
+        assert!(reaped);
+        assert_eq!(PROBE_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_group_probe_permission_error_is_typed() {
+        fn always_deny(_: u32) -> std::io::Result<bool> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+
+        let error =
+            super::wait_for_process_group_with_probe(1, std::time::Instant::now(), always_deny)
+                .expect_err("a persistent group-probe EPERM must propagate");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let production_error =
+            super::map_process_group_probe(Err(rustix::io::Errno::PERM)).unwrap_err();
+        assert_eq!(
+            production_error.kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn injected_zombie_permission_error_is_typed_without_resignal() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static SIGNAL_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn deny_and_count(_: u32) -> std::io::Result<()> {
+            SIGNAL_CALLS.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+
+        let (mut child, mut pipes) =
+            super::spawn_piped_child(&ProcessSpec::new("/usr/bin/true")).unwrap();
+        while !super::child_exited_without_reaping(&child).unwrap() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut capture = super::CaptureState::new(&limits(64, 64));
+        let mut exit_status = None;
+        SIGNAL_CALLS.store(0, Ordering::SeqCst);
+
+        let error = super::cleanup_execution_with_group_signal(
+            &mut child,
+            &mut pipes,
+            &mut capture,
+            &limits(64, 64),
+            &mut exit_status,
+            deny_and_count,
+        )
+        .expect_err("an injected group-signal failure remains typed");
+
+        assert_eq!(SIGNAL_CALLS.load(Ordering::SeqCst), 1);
+        assert!(contains_group_signal(&error), "error: {error:?}");
+        assert!(exit_status.is_some());
+        assert!(!child.armed, "reaped PGID must not remain armed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaped_session_pipe_holder_is_a_bounded_typed_failure() {
+        let directory = tempdir().unwrap();
+        let marker = directory.path().join("escaped-pid");
+        let started = std::time::Instant::now();
+        let result = run_bounded(&escaped_pipe_holder(&marker), limits(64, 64));
+        let escaped_pid = std::fs::read_to_string(&marker)
+            .expect("escaped process records its pid")
+            .trim()
+            .parse::<u32>()
+            .expect("pid is numeric");
+        super::signal_process_group(escaped_pid)
+            .expect("test cleanup terminates escaped process group");
+
+        let error = result.expect_err("an escaped pipe holder is incomplete");
+        assert!(contains_capture_drain_timeout(&error), "error: {error:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_preserves_multiple_failures_and_disarms_reaped_pgid() {
+        fn always_fail(_: u32) -> std::io::Result<()> {
+            Err(std::io::Error::other("injected group-signal failure"))
+        }
+
+        let directory = tempdir().unwrap();
+        let marker = directory.path().join("escaped-pid");
+        let limits = limits(64, 64);
+        let (mut child, mut pipes) =
+            super::spawn_piped_child(&escaped_pipe_holder(&marker)).unwrap();
+        while !marker.exists() || !super::child_exited_without_reaping(&child).unwrap() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut capture = super::CaptureState::new(&limits);
+        let mut exit_status = None;
+        let error = super::cleanup_execution_with_group_signal(
+            &mut child,
+            &mut pipes,
+            &mut capture,
+            &limits,
+            &mut exit_status,
+            always_fail,
+        )
+        .expect_err("both injected signal and escaped-pipe failures propagate");
+        let escaped_pid = std::fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        super::signal_process_group(escaped_pid)
+            .expect("test cleanup terminates escaped process group");
+
+        assert!(contains_group_signal(&error), "error: {error:?}");
+        assert!(contains_capture_drain_timeout(&error), "error: {error:?}");
+        assert!(exit_status.is_some());
+        assert!(!child.armed, "cleanup error must not re-arm a reaped PGID");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_failure_and_cleanup_failure_are_both_retained() {
+        fn signal_then_fail(process_group: u32) -> std::io::Result<()> {
+            super::signal_process_group(process_group)?;
+            Err(std::io::Error::other("injected group-signal failure"))
+        }
+
+        let limits = limits(64, 64);
+        let (mut child, mut pipes) =
+            super::spawn_piped_child(&shell("while :; do :; done")).unwrap();
+        let mut capture = super::CaptureState::new(&limits);
+        let mut exit_status = None;
+        let error = super::cleanup_after_process_error_with_group_signal(
+            &mut child,
+            &mut pipes,
+            &mut capture,
+            &limits,
+            &mut exit_status,
+            ProcessError::Wait(std::io::Error::other("injected wait failure")),
+            signal_then_fail,
+        );
+
+        let ProcessError::MultipleFailures { failures } = error else {
+            panic!("primary and cleanup failures must be aggregated");
+        };
+        assert!(
+            failures
+                .iter()
+                .any(|error| matches!(error, ProcessError::Wait(_)))
+        );
+        assert!(failures.iter().any(contains_group_signal));
+        assert!(exit_status.is_some());
+        assert!(!child.armed, "reaped PGID must not remain armed");
+    }
+
+    #[cfg(unix)]
+    fn escaped_pipe_holder(marker: &std::path::Path) -> ProcessSpec {
+        ProcessSpec::new("python3").args([
+            "-c",
+            r#"import os, sys, time
+child = os.fork()
+if child == 0:
+    os.setsid()
+    with open(sys.argv[1], "w", encoding="ascii") as marker:
+        marker.write(str(os.getpid()))
+    time.sleep(60)
+while not os.path.exists(sys.argv[1]) or os.path.getsize(sys.argv[1]) == 0:
+    time.sleep(0.01)
+os._exit(0)"#,
+            marker.to_str().expect("marker path is UTF-8"),
+        ])
     }
 
     #[test]

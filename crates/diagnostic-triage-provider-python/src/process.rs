@@ -7,8 +7,11 @@ use std::{
     io::{self, Read},
     ops::{Deref, DerefMut},
     path::PathBuf,
-    process::{Child, Command, ExitStatus, Stdio},
-    sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
+    process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -17,10 +20,15 @@ use diagnostic_triage_contracts::protocol::RequestLimits;
 use thiserror::Error;
 use wait_timeout::ChildExt;
 
+#[cfg(unix)]
+use std::os::fd::AsFd;
+
 const IO_CHUNK_BYTES: usize = 8 * 1024;
-const CAPTURE_QUEUE_DEPTH: usize = 4;
-const POLL_INTERVAL: Duration = Duration::from_millis(10);
+const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
+// Darwin can retain killed orphan zombies until the system reaper collects
+// them; the probe still returns immediately once the group is absent.
+const PROCESS_GROUP_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ProcessLimits {
@@ -184,6 +192,8 @@ pub(crate) struct ProcessOutcome {
 
 #[derive(Debug, Error)]
 pub(crate) enum ProcessError {
+    #[error("bounded provider process-group execution is unsupported on this platform")]
+    UnsupportedPlatform,
     #[error("invalid process specification: {0}")]
     InvalidSpec(&'static str),
     #[error("invalid process limits: {0}")]
@@ -204,73 +214,117 @@ pub(crate) enum ProcessError {
         #[source]
         source: io::Error,
     },
+    #[error("failed to configure the {stream} capture pipe: {source}")]
+    CaptureConfiguration {
+        stream: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("{0} capture thread panicked")]
+    CapturePanic(&'static str),
     #[error("failed while waiting for child: {0}")]
     Wait(#[source] io::Error),
-    #[cfg(unix)]
-    #[error("failed to terminate the child process group: {0}")]
-    ProcessGroup(#[source] io::Error),
+    #[error("failed to signal the child process group: {0}")]
+    GroupSignal(#[source] io::Error),
+    #[error("failed while waiting for the child process group: {0}")]
+    GroupWait(#[source] io::Error),
+    #[error("child process group remained live after termination")]
+    GroupUnreaped,
+    #[error("failed to terminate the group leader directly: {0}")]
+    LeaderSignal(#[source] io::Error),
+    #[error("failed while reaping the group leader: {0}")]
+    Reap(#[source] io::Error),
     #[error("child could not be reaped after termination")]
     Unreaped,
     #[error("capture pipes remained open after process termination")]
     CaptureDrainTimeout,
+    #[error("multiple process failures: {failures:?}")]
+    MultipleFailures { failures: Vec<ProcessError> },
 }
 
 pub(crate) fn run_bounded(
     spec: &ProcessSpec,
     limits: ProcessLimits,
 ) -> Result<ProcessOutcome, ProcessError> {
+    run_bounded_with_group_signal(spec, limits, signal_process_group)
+}
+
+fn run_bounded_with_group_signal(
+    spec: &ProcessSpec,
+    limits: ProcessLimits,
+    group_signal: fn(u32) -> io::Result<()>,
+) -> Result<ProcessOutcome, ProcessError> {
+    if cfg!(not(unix)) {
+        return Err(ProcessError::UnsupportedPlatform);
+    }
     spec.validate()?;
     let limits = limits.validate()?;
     let started = Instant::now();
     let mut child = ChildCleanupGuard::new(spawn_child(spec)?);
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or(ProcessError::MissingPipe { stream: "stdout" })?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or(ProcessError::MissingPipe { stream: "stderr" })?;
-    let (capture_sender, capture_receiver) = mpsc::sync_channel(CAPTURE_QUEUE_DEPTH);
-    spawn_capture(stdout, Stream::Stdout, capture_sender.clone())?;
-    spawn_capture(stderr, Stream::Stderr, capture_sender.clone())?;
-    drop(capture_sender);
-
-    let deadline = started.checked_add(limits.timeout).unwrap_or(started);
-    let mut capture = CaptureState::new(&limits);
-    let mut exit_status = None;
-    let (failure, duration) = loop {
-        drain_capture_events(&capture_receiver, &mut capture, &limits);
-        if let Some(reason) = capture.failure {
-            break (Some(reason), started.elapsed().min(limits.timeout));
-        }
-        if exit_status.is_some() && capture.is_done() {
-            break (None, started.elapsed().min(limits.timeout));
-        }
-
-        let now = Instant::now();
-        if now >= deadline {
-            break (Some(IncompleteReason::Timeout), limits.timeout);
-        }
-        let wait = deadline.saturating_duration_since(now).min(POLL_INTERVAL);
-        if exit_status.is_none() {
-            exit_status = child.wait_timeout(wait).map_err(ProcessError::Wait)?;
-        } else {
-            receive_capture_event(&capture_receiver, &mut capture, &limits, wait);
-        }
+    let stdout_overflow = Arc::new(AtomicBool::new(false));
+    let stderr_overflow = Arc::new(AtomicBool::new(false));
+    let mut readers = match CaptureReaders::spawn(
+        &mut child,
+        limits,
+        Arc::clone(&stdout_overflow),
+        Arc::clone(&stderr_overflow),
+    ) {
+        Ok(readers) => readers,
+        Err(error) => return Err(cleanup_setup_failure(&mut child, error, group_signal)),
     };
 
-    let cleanup_started = Instant::now();
-    if failure.is_some() {
-        terminate_group_and_reap(&mut child, &mut exit_status)?;
-        drain_after_termination(&capture_receiver, &mut capture, &limits);
-        if !capture.is_done() {
-            return Err(ProcessError::CaptureDrainTimeout);
+    let deadline = started.checked_add(limits.timeout).unwrap_or(started);
+    let mut forced_reason = None;
+    let exit_status = None;
+    let mut errors = Vec::new();
+    loop {
+        if stdout_overflow.load(Ordering::Acquire) {
+            forced_reason = Some(IncompleteReason::StdoutLimitExceeded);
+        } else if stderr_overflow.load(Ordering::Acquire) {
+            forced_reason = Some(IncompleteReason::StderrLimitExceeded);
+        } else if Instant::now() >= deadline {
+            forced_reason = Some(IncompleteReason::Timeout);
+        }
+        if forced_reason.is_some() {
+            break;
+        }
+
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(POLL_INTERVAL);
+        match child_exited_without_reaping(&child) {
+            Ok(true) => break,
+            Ok(false) => thread::sleep(wait),
+            Err(source) => {
+                errors.push(ProcessError::Wait(source));
+                break;
+            }
         }
     }
-    child.disarm();
 
-    let native_exit_code = exit_status.as_ref().and_then(ExitStatus::code);
+    let duration = started.elapsed().min(limits.timeout);
+    let cleanup_started = Instant::now();
+    let (status, stdout, stderr) =
+        finish_execution(&mut child, &mut readers, exit_status, errors, group_signal)?;
+    let cleanup_duration = cleanup_started.elapsed();
+
+    let failure = forced_reason
+        .or_else(|| stdout.failed.then_some(IncompleteReason::StdoutFailure))
+        .or_else(|| stderr.failed.then_some(IncompleteReason::StderrFailure))
+        .or_else(|| {
+            stdout
+                .output
+                .truncated
+                .then_some(IncompleteReason::StdoutLimitExceeded)
+        })
+        .or_else(|| {
+            stderr
+                .output
+                .truncated
+                .then_some(IncompleteReason::StderrLimitExceeded)
+        });
+
+    let native_exit_code = status.code();
     let representable_exit_code = native_exit_code.and_then(|code| u8::try_from(code).ok());
     let state = match failure {
         Some(reason) => ProcessState::Incomplete(reason),
@@ -287,11 +341,35 @@ pub(crate) fn run_bounded(
     Ok(ProcessOutcome {
         state,
         exit_code,
-        stdout: capture.stdout,
-        stderr: capture.stderr,
+        stdout: stdout.output,
+        stderr: stderr.output,
         duration,
-        cleanup_duration: cleanup_started.elapsed(),
+        cleanup_duration,
     })
+}
+
+#[cfg(unix)]
+fn child_exited_without_reaping(child: &Child) -> io::Result<bool> {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+
+    let pid = i32::try_from(child.id())
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "child pid must be nonzero"))?;
+    waitid(
+        WaitId::Pid(pid),
+        WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT,
+    )
+    .map(|status| status.is_some())
+    .map_err(io::Error::from)
+}
+
+#[cfg(not(unix))]
+fn child_exited_without_reaping(_: &Child) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process groups are unsupported",
+    ))
 }
 
 struct ChildCleanupGuard {
@@ -333,8 +411,12 @@ impl Drop for ChildCleanupGuard {
     fn drop(&mut self) {
         if self.armed {
             let mut exit_status = None;
-            let _ignored =
-                terminate_process_group(&mut self.child, self.process_group, &mut exit_status);
+            let _ignored = terminate_child(
+                &mut self.child,
+                self.process_group,
+                &mut exit_status,
+                signal_process_group,
+            );
         }
     }
 }
@@ -361,241 +443,470 @@ fn spawn_child(spec: &ProcessSpec) -> Result<Child, ProcessError> {
     })
 }
 
-#[derive(Clone, Copy)]
-enum Stream {
-    Stdout,
-    Stderr,
+struct CapturedStream {
+    output: BoundedOutput,
+    failed: bool,
 }
 
-enum CaptureEvent {
-    Chunk(Stream, Vec<u8>),
-    Done(Stream),
-    Failed(Stream),
-}
-
-fn spawn_capture<R: Read + Send + 'static>(
-    reader: R,
-    stream: Stream,
-    sender: SyncSender<CaptureEvent>,
-) -> Result<(), ProcessError> {
-    let stream_name = match stream {
-        Stream::Stdout => "stdout",
-        Stream::Stderr => "stderr",
-    };
-    thread::Builder::new()
-        .name(format!("ruff-{stream_name}-capture"))
-        .spawn(move || capture_stream(reader, stream, &sender))
-        .map(drop)
-        .map_err(|source| ProcessError::CaptureSpawn {
-            stream: stream_name,
-            source,
-        })
-}
-
-fn capture_stream<R: Read>(mut reader: R, stream: Stream, sender: &SyncSender<CaptureEvent>) {
+fn capture(
+    mut reader: impl Read,
+    limit: usize,
+    overflow: &AtomicBool,
+    cancel: &AtomicBool,
+) -> CapturedStream {
+    let mut output = BoundedOutput::with_capacity(limit);
     let mut buffer = [0_u8; IO_CHUNK_BYTES];
     loop {
+        if cancel.load(Ordering::Acquire) {
+            break;
+        }
         match reader.read(&mut buffer) {
-            Ok(0) => {
-                let _ignored = sender.send(CaptureEvent::Done(stream));
-                break;
-            }
+            Ok(0) => break,
             Ok(size) => {
-                if sender
-                    .send(CaptureEvent::Chunk(stream, buffer[..size].to_vec()))
-                    .is_err()
-                {
-                    break;
+                output.append(&buffer[..size], limit);
+                if output.truncated {
+                    overflow.store(true, Ordering::Release);
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(POLL_INTERVAL);
+            }
             Err(_) => {
-                let _ignored = sender.send(CaptureEvent::Failed(stream));
-                break;
+                return CapturedStream {
+                    output,
+                    failed: true,
+                };
             }
         }
     }
+    CapturedStream {
+        output,
+        failed: false,
+    }
 }
 
-struct CaptureState {
-    stdout: BoundedOutput,
-    stderr: BoundedOutput,
-    stdout_done: bool,
-    stderr_done: bool,
-    failure: Option<IncompleteReason>,
+fn spawn_reader<R>(
+    reader: R,
+    limit: usize,
+    overflow: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+    stream: &'static str,
+) -> Result<thread::JoinHandle<CapturedStream>, ProcessError>
+where
+    R: Read + Send + 'static,
+{
+    thread::Builder::new()
+        .name(format!("ruff-{stream}-capture"))
+        .spawn(move || capture(reader, limit, &overflow, &cancel))
+        .map_err(|source| ProcessError::CaptureSpawn { stream, source })
 }
 
-impl CaptureState {
-    fn new(limits: &ProcessLimits) -> Self {
-        Self {
-            stdout: BoundedOutput::with_capacity(limits.max_stdout_bytes),
-            stderr: BoundedOutput::with_capacity(limits.max_stderr_bytes),
-            stdout_done: false,
-            stderr_done: false,
-            failure: None,
+fn join_reader(
+    handle: thread::JoinHandle<CapturedStream>,
+    stream: &'static str,
+) -> Result<CapturedStream, ProcessError> {
+    handle
+        .join()
+        .map_err(|_| ProcessError::CapturePanic(stream))
+}
+
+#[cfg(unix)]
+fn configure_nonblocking<R>(reader: R, stream: &'static str) -> Result<R, ProcessError>
+where
+    R: AsFd,
+{
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+    let flags = fcntl_getfl(&reader).map_err(|source| ProcessError::CaptureConfiguration {
+        stream,
+        source: source.into(),
+    })?;
+    fcntl_setfl(&reader, flags | OFlags::NONBLOCK).map_err(|source| {
+        ProcessError::CaptureConfiguration {
+            stream,
+            source: source.into(),
         }
-    }
+    })?;
+    Ok(reader)
+}
 
-    fn is_done(&self) -> bool {
-        self.stdout_done && self.stderr_done
-    }
+#[cfg(not(unix))]
+fn configure_nonblocking<R>(_: R, _: &'static str) -> Result<R, ProcessError> {
+    Err(ProcessError::UnsupportedPlatform)
+}
 
-    fn accept(&mut self, event: CaptureEvent, limits: &ProcessLimits) {
-        match event {
-            CaptureEvent::Chunk(Stream::Stdout, chunk) => {
-                self.stdout.append(&chunk, limits.max_stdout_bytes);
-                if self.stdout.truncated {
-                    self.failure
-                        .get_or_insert(IncompleteReason::StdoutLimitExceeded);
+struct JoinedCaptures {
+    stdout: Option<CapturedStream>,
+    stderr: Option<CapturedStream>,
+    errors: Vec<ProcessError>,
+}
+
+struct CaptureReaders {
+    stdout: Option<thread::JoinHandle<CapturedStream>>,
+    stderr: Option<thread::JoinHandle<CapturedStream>>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl CaptureReaders {
+    fn spawn(
+        child: &mut ChildCleanupGuard,
+        limits: ProcessLimits,
+        stdout_overflow: Arc<AtomicBool>,
+        stderr_overflow: Arc<AtomicBool>,
+    ) -> Result<Self, ProcessError> {
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(ProcessError::MissingPipe { stream: "stdout" })?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or(ProcessError::MissingPipe { stream: "stderr" })?;
+        let stdout: ChildStdout = configure_nonblocking(stdout, "stdout")?;
+        let stderr: ChildStderr = configure_nonblocking(stderr, "stderr")?;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stdout = spawn_reader(
+            stdout,
+            limits.max_stdout_bytes,
+            stdout_overflow,
+            Arc::clone(&cancel),
+            "stdout",
+        )?;
+        let stderr = match spawn_reader(
+            stderr,
+            limits.max_stderr_bytes,
+            stderr_overflow,
+            Arc::clone(&cancel),
+            "stderr",
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                cancel.store(true, Ordering::Release);
+                let mut errors = vec![error];
+                if let Err(error) = join_reader(stdout, "stdout") {
+                    errors.push(error);
                 }
+                return Err(combine_errors(errors));
             }
-            CaptureEvent::Chunk(Stream::Stderr, chunk) => {
-                self.stderr.append(&chunk, limits.max_stderr_bytes);
-                if self.stderr.truncated {
-                    self.failure
-                        .get_or_insert(IncompleteReason::StderrLimitExceeded);
-                }
-            }
-            CaptureEvent::Done(Stream::Stdout) => self.stdout_done = true,
-            CaptureEvent::Done(Stream::Stderr) => self.stderr_done = true,
-            CaptureEvent::Failed(Stream::Stdout) => {
-                self.stdout_done = true;
-                self.failure.get_or_insert(IncompleteReason::StdoutFailure);
-            }
-            CaptureEvent::Failed(Stream::Stderr) => {
-                self.stderr_done = true;
-                self.failure.get_or_insert(IncompleteReason::StderrFailure);
-            }
-        }
+        };
+        Ok(Self {
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            cancel,
+        })
     }
 
-    fn mark_disconnected(&mut self) {
-        if !self.stdout_done {
-            self.failure.get_or_insert(IncompleteReason::StdoutFailure);
-            self.stdout_done = true;
-        }
-        if !self.stderr_done {
-            self.failure.get_or_insert(IncompleteReason::StderrFailure);
-            self.stderr_done = true;
-        }
+    fn is_finished(&self) -> bool {
+        self.stdout
+            .as_ref()
+            .is_none_or(thread::JoinHandle::is_finished)
+            && self
+                .stderr
+                .as_ref()
+                .is_none_or(thread::JoinHandle::is_finished)
     }
-}
 
-fn drain_capture_events(
-    receiver: &Receiver<CaptureEvent>,
-    capture: &mut CaptureState,
-    limits: &ProcessLimits,
-) {
-    for _ in 0..CAPTURE_QUEUE_DEPTH {
-        match receiver.try_recv() {
-            Ok(event) => capture.accept(event, limits),
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => {
-                capture.mark_disconnected();
-                break;
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+
+    fn join_all(&mut self) -> JoinedCaptures {
+        let mut captures = JoinedCaptures {
+            stdout: None,
+            stderr: None,
+            errors: Vec::new(),
+        };
+        if let Some(handle) = self.stdout.take() {
+            match join_reader(handle, "stdout") {
+                Ok(output) => captures.stdout = Some(output),
+                Err(error) => captures.errors.push(error),
             }
         }
+        if let Some(handle) = self.stderr.take() {
+            match join_reader(handle, "stderr") {
+                Ok(output) => captures.stderr = Some(output),
+                Err(error) => captures.errors.push(error),
+            }
+        }
+        captures
     }
 }
 
-fn receive_capture_event(
-    receiver: &Receiver<CaptureEvent>,
-    capture: &mut CaptureState,
-    limits: &ProcessLimits,
-    wait: Duration,
-) {
-    match receiver.recv_timeout(wait) {
-        Ok(event) => capture.accept(event, limits),
-        Err(RecvTimeoutError::Timeout) => {}
-        Err(RecvTimeoutError::Disconnected) => capture.mark_disconnected(),
+impl Drop for CaptureReaders {
+    fn drop(&mut self) {
+        self.cancel();
+        let _joined = self.join_all();
     }
 }
 
-fn drain_after_termination(
-    receiver: &Receiver<CaptureEvent>,
-    capture: &mut CaptureState,
-    limits: &ProcessLimits,
-) {
-    let deadline = Instant::now()
+fn cleanup_setup_failure(
+    child: &mut ChildCleanupGuard,
+    error: ProcessError,
+    group_signal: fn(u32) -> io::Result<()>,
+) -> ProcessError {
+    let mut errors = vec![error];
+    let mut exit_status = None;
+    let termination = terminate_and_reap(child, &mut exit_status, group_signal);
+    if let Err(error) = termination {
+        push_error(&mut errors, error);
+    }
+    if exit_status.is_some() {
+        child.disarm();
+    }
+    combine_errors(errors)
+}
+
+fn finish_execution(
+    child: &mut ChildCleanupGuard,
+    readers: &mut CaptureReaders,
+    mut exit_status: Option<ExitStatus>,
+    mut errors: Vec<ProcessError>,
+    group_signal: fn(u32) -> io::Result<()>,
+) -> Result<(ExitStatus, CapturedStream, CapturedStream), ProcessError> {
+    let termination = terminate_and_reap(child, &mut exit_status, group_signal);
+    if let Err(error) = termination {
+        push_error(&mut errors, error);
+    }
+    if exit_status.is_some() {
+        child.disarm();
+    }
+    let drain_deadline = Instant::now()
         .checked_add(TERMINATION_GRACE)
         .unwrap_or_else(Instant::now);
-    while !capture.is_done() {
-        let wait = deadline.saturating_duration_since(Instant::now());
-        if wait.is_zero() {
-            break;
-        }
-        receive_capture_event(receiver, capture, limits, wait.min(POLL_INTERVAL));
+    while !readers.is_finished() && Instant::now() < drain_deadline {
+        thread::sleep(POLL_INTERVAL);
     }
+    if !readers.is_finished() {
+        readers.cancel();
+        errors.push(ProcessError::CaptureDrainTimeout);
+    }
+    let captures = readers.join_all();
+    for error in captures.errors {
+        push_error(&mut errors, error);
+    }
+    if !errors.is_empty() {
+        return Err(combine_errors(errors));
+    }
+    // The reaped leader's numeric PGID may be reused while readers drain, so
+    // cleanup errors must never arm a second destructive group signal.
+    Ok((
+        exit_status.expect("reaped status was checked"),
+        captures.stdout.expect("stdout join was checked"),
+        captures.stderr.expect("stderr join was checked"),
+    ))
 }
 
-fn terminate_group_and_reap(
+fn terminate_and_reap(
     child: &mut ChildCleanupGuard,
     exit_status: &mut Option<ExitStatus>,
+    group_signal: fn(u32) -> io::Result<()>,
 ) -> Result<(), ProcessError> {
-    terminate_process_group(&mut child.child, child.process_group, exit_status)
+    terminate_child(
+        &mut child.child,
+        child.process_group,
+        exit_status,
+        group_signal,
+    )
 }
 
-fn terminate_process_group(
+fn terminate_child(
     child: &mut Child,
     process_group: u32,
     exit_status: &mut Option<ExitStatus>,
+    group_signal: fn(u32) -> io::Result<()>,
 ) -> Result<(), ProcessError> {
-    #[cfg(unix)]
-    let group_signal_error = signal_process_group(process_group).err();
-
-    #[cfg(not(unix))]
-    let _ = process_group;
-
-    if exit_status.is_none() {
-        *exit_status = child.try_wait().map_err(ProcessError::Wait)?;
-    }
-
-    #[cfg(not(unix))]
-    if exit_status.is_none() {
-        child.kill().map_err(ProcessError::Wait)?;
-    }
-
-    #[cfg(unix)]
-    let fatal_group_signal = if let Some(error) = group_signal_error {
-        if exit_status.is_none() {
-            child.kill().map_err(ProcessError::Wait)?;
-            Some(error)
-        } else {
-            None
-        }
+    let deadline = Instant::now()
+        .checked_add(PROCESS_GROUP_GRACE)
+        .unwrap_or_else(Instant::now);
+    let mut errors = Vec::new();
+    let leader_exited_before_signal = if exit_status.is_some() {
+        true
     } else {
-        None
+        match child_exited_without_reaping(child) {
+            Ok(exited) => exited,
+            Err(source) => {
+                errors.push(ProcessError::Wait(source));
+                false
+            }
+        }
     };
-
+    let group_signal_error = if exit_status.is_some() {
+        None
+    } else {
+        group_signal(process_group).err()
+    };
+    // LLM cleanup contract: SIGNALING -> REAPING only suppresses a native
+    // zombie-race EPERM after a non-reaping exit observation; injected signal
+    // failures remain typed cleanup evidence.
+    let leader_exited_during_native_permission_race = match group_signal_error.as_ref() {
+        Some(source)
+            if !leader_exited_before_signal && is_native_group_permission_error(source) =>
+        {
+            match child_exited_without_reaping(child) {
+                Ok(exited) => exited,
+                Err(source) => {
+                    errors.push(ProcessError::Wait(source));
+                    false
+                }
+            }
+        }
+        _ => false,
+    };
+    let group_signal_failed = group_signal_error.is_some();
     if exit_status.is_none() {
-        *exit_status = child
-            .wait_timeout(TERMINATION_GRACE)
-            .map_err(ProcessError::Wait)?;
+        match child.try_wait() {
+            Ok(status) => *exit_status = status,
+            Err(source) => errors.push(ProcessError::Reap(source)),
+        }
+    }
+    if exit_status.is_none() && group_signal_failed {
+        if let Err(source) = child.kill() {
+            errors.push(ProcessError::LeaderSignal(source));
+        }
     }
     if exit_status.is_none() {
-        return Err(ProcessError::Unreaped);
+        match child.wait_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(status) => *exit_status = status,
+            Err(source) => errors.push(ProcessError::Reap(source)),
+        }
     }
-
-    #[cfg(unix)]
-    if let Some(error) = fatal_group_signal {
-        return Err(ProcessError::ProcessGroup(error));
+    if exit_status.is_none() {
+        errors.push(ProcessError::Unreaped);
     }
+    let group_wait = wait_for_process_group(process_group, deadline);
+    let zombie_only_permission_race = matches!(
+        (&group_signal_error, &group_wait),
+        (Some(source), Ok(true))
+            if source.kind() == io::ErrorKind::PermissionDenied
+                && is_native_group_permission_error(source)
+                && (leader_exited_before_signal
+                    || leader_exited_during_native_permission_race)
+                && exit_status.is_some()
+    );
+    if let Some(source) = group_signal_error {
+        if !zombie_only_permission_race {
+            errors.push(ProcessError::GroupSignal(source));
+        }
+    }
+    match group_wait {
+        Ok(true) => {}
+        Ok(false) => errors.push(ProcessError::GroupUnreaped),
+        Err(source) => errors.push(ProcessError::GroupWait(source)),
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(combine_errors(errors))
+    }
+}
 
-    Ok(())
+#[cfg(unix)]
+fn is_native_group_permission_error(source: &io::Error) -> bool {
+    let native = io::Error::from(rustix::io::Errno::PERM);
+    source.kind() == io::ErrorKind::PermissionDenied
+        && source.raw_os_error().is_some()
+        && source.raw_os_error() == native.raw_os_error()
+}
+
+#[cfg(not(unix))]
+fn is_native_group_permission_error(_: &io::Error) -> bool {
+    false
 }
 
 #[cfg(unix)]
 fn signal_process_group(process_group: u32) -> io::Result<()> {
-    let status = Command::new("/bin/kill")
-        .args(["-s", "KILL", &format!("-{process_group}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
+    use rustix::process::{Pid, Signal, kill_process_group};
+
+    let process_group = i32::try_from(process_group)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "process group must be nonzero")
+        })?;
+    match kill_process_group(process_group, Signal::KILL) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(error) => Err(io::Error::from(error)),
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_process_group(_: u32) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process groups are unsupported",
+    ))
+}
+
+#[cfg(unix)]
+fn process_group_exists(process_group: u32) -> io::Result<bool> {
+    use rustix::process::{Pid, test_kill_process_group};
+
+    let process_group = i32::try_from(process_group)
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "process group must be nonzero")
+        })?;
+    map_process_group_probe(test_kill_process_group(process_group))
+}
+
+#[cfg(unix)]
+fn map_process_group_probe(result: Result<(), rustix::io::Errno>) -> io::Result<bool> {
+    use rustix::io::Errno;
+
+    match result {
+        Err(Errno::SRCH) => Ok(false),
+        Ok(()) => Ok(true),
+        Err(Errno::PERM) => Err(io::Error::from(Errno::PERM)),
+        Err(error) => Err(io::Error::from(error)),
+    }
+}
+
+#[cfg(not(unix))]
+fn process_group_exists(_: u32) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process groups are unsupported",
+    ))
+}
+
+fn wait_for_process_group(process_group: u32, deadline: Instant) -> io::Result<bool> {
+    wait_for_process_group_with_probe(process_group, deadline, process_group_exists)
+}
+
+fn wait_for_process_group_with_probe(
+    process_group: u32,
+    deadline: Instant,
+    probe: fn(u32) -> io::Result<bool>,
+) -> io::Result<bool> {
+    loop {
+        let permission_denied = match probe(process_group) {
+            Ok(false) => return Ok(true),
+            Ok(true) => None,
+            Err(source) if source.kind() == io::ErrorKind::PermissionDenied => Some(source),
+            Err(source) => return Err(source),
+        };
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            return permission_denied.map_or(Ok(false), Err);
+        }
+        thread::sleep(wait.min(POLL_INTERVAL));
+    }
+}
+
+fn push_error(errors: &mut Vec<ProcessError>, error: ProcessError) {
+    match error {
+        ProcessError::MultipleFailures { failures } => errors.extend(failures),
+        error => errors.push(error),
+    }
+}
+
+fn combine_errors(mut errors: Vec<ProcessError>) -> ProcessError {
+    if errors.len() == 1 {
+        errors.pop().expect("one process error is present")
     } else {
-        Err(io::Error::other(format!("/bin/kill exited with {status}")))
+        ProcessError::MultipleFailures { failures: errors }
     }
 }
 
@@ -616,16 +927,42 @@ mod tests {
     use std::time::Duration;
 
     #[cfg(unix)]
-    use super::{IncompleteReason, ProcessState};
+    use super::{ProcessState, run_bounded_with_group_signal, signal_process_group};
     #[cfg(unix)]
     use std::{
+        fs,
         process::{Command, Stdio},
+        sync::{
+            Mutex, MutexGuard,
+            atomic::{AtomicU64, Ordering},
+        },
         thread,
         time::Instant,
     };
 
+    #[cfg(unix)]
+    static PROCESS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    fn process_test_guard() -> MutexGuard<'static, ()> {
+        PROCESS_TEST_LOCK
+            .lock()
+            .expect("process test lock is healthy")
+    }
+
+    #[cfg(unix)]
+    fn signal_then_fail(process_group: u32) -> std::io::Result<()> {
+        signal_process_group(process_group)?;
+        Err(std::io::Error::other("injected group-signal failure"))
+    }
+
+    #[cfg(unix)]
+    static NEXT_ESCAPED_MARKER: AtomicU64 = AtomicU64::new(0);
+
     #[test]
     fn rejects_a_missing_current_directory_before_spawn() {
+        #[cfg(unix)]
+        let _guard = process_test_guard();
         let missing = std::env::temp_dir().join(format!(
             "diagnostic-triage-missing-cwd-{}",
             std::process::id()
@@ -647,25 +984,37 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn leader_exit_with_descendant_held_pipes_remains_bounded() {
+    fn zero_exit_kills_closed_stdio_descendant_and_preserves_status() {
+        assert_closed_stdio_descendant_is_killed(0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nonzero_exit_kills_closed_stdio_descendant_and_preserves_status() {
+        assert_closed_stdio_descendant_is_killed(7);
+    }
+
+    #[cfg(unix)]
+    fn assert_closed_stdio_descendant_is_killed(exit_code: u8) {
+        let _guard = process_test_guard();
         let started = Instant::now();
         let outcome = run_bounded(
             &ProcessSpec::new("/bin/sh").args([
                 "-c",
-                r#"while :; do :; done & descendant=$!; printf '%s\n' "$descendant"; exit 0"#,
+                r#"sleep 5 </dev/null >/dev/null 2>&1 & descendant=$!; printf '%s\n' "$descendant"; exit "$1""#,
+                "sh",
+                &exit_code.to_string(),
             ]),
             ProcessLimits {
-                timeout: Duration::from_millis(80),
+                timeout: Duration::from_secs(2),
                 max_stdout_bytes: 64,
                 max_stderr_bytes: 64,
             },
         )
-        .expect("descendant-held pipes produce a typed outcome");
+        .expect("leader status and descendant cleanup are both preserved");
 
-        assert_eq!(
-            outcome.state,
-            ProcessState::Incomplete(IncompleteReason::Timeout)
-        );
+        assert_eq!(outcome.state, ProcessState::Complete);
+        assert_eq!(outcome.exit_code, Some(exit_code));
         assert!(started.elapsed() < Duration::from_secs(1));
         let descendant = String::from_utf8(outcome.stdout.bytes)
             .expect("pid is UTF-8")
@@ -676,19 +1025,228 @@ mod tests {
 
     #[cfg(unix)]
     fn assert_process_stopped(pid: &str) {
-        for _ in 0..25 {
-            let status = Command::new("/bin/kill")
-                .args(["-s", "0", pid])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .expect("kill is available on supported Unix targets");
-            if !status.success() {
-                return;
+        use rustix::{
+            io::Errno,
+            process::{Pid, test_kill_process},
+        };
+
+        let pid = Pid::from_raw(pid.parse().expect("pid is numeric")).expect("pid is nonzero");
+        for _ in 0..50 {
+            match test_kill_process(pid) {
+                Err(Errno::SRCH) => return,
+                Ok(()) => thread::sleep(Duration::from_millis(10)),
+                Err(error) => panic!("failed to probe descendant {pid:?}: {error}"),
             }
-            thread::sleep(Duration::from_millis(10));
         }
-        panic!("descendant process {pid} survived process-group termination");
+        panic!("descendant process {pid:?} survived process-group termination");
+    }
+
+    #[cfg(unix)]
+    fn contains_group_signal(error: &ProcessError) -> bool {
+        match error {
+            ProcessError::GroupSignal(_) => true,
+            ProcessError::MultipleFailures { failures } => {
+                failures.iter().any(contains_group_signal)
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(unix)]
+    struct ProcessGroupGuard(Option<u32>);
+
+    #[cfg(unix)]
+    impl ProcessGroupGuard {
+        fn terminate(mut self) {
+            let process_group = self.0.take().expect("process group is armed");
+            signal_process_group(process_group)
+                .expect("test cleanup terminates escaped process group");
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ProcessGroupGuard {
+        fn drop(&mut self) {
+            if let Some(process_group) = self.0.take() {
+                let _ignored = signal_process_group(process_group);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn injected_zombie_permission_error_is_typed_without_resignal() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static SIGNAL_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn deny_and_count(_: u32) -> std::io::Result<()> {
+            SIGNAL_CALLS.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+
+        let _guard = process_test_guard();
+        SIGNAL_CALLS.store(0, Ordering::SeqCst);
+        let error = run_bounded_with_group_signal(
+            &ProcessSpec::new("/usr/bin/true"),
+            ProcessLimits {
+                timeout: Duration::from_secs(2),
+                max_stdout_bytes: 64,
+                max_stderr_bytes: 64,
+            },
+            deny_and_count,
+        )
+        .expect_err("an injected group-signal failure remains typed");
+
+        assert!(contains_group_signal(&error), "error: {error:?}");
+        assert_eq!(SIGNAL_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transient_group_probe_permission_error_is_retried() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static PROBE_CALLS: AtomicUsize = AtomicUsize::new(0);
+        fn deny_once_then_absent(_: u32) -> std::io::Result<bool> {
+            if PROBE_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+            }
+            Ok(false)
+        }
+
+        PROBE_CALLS.store(0, Ordering::SeqCst);
+        let reaped = super::wait_for_process_group_with_probe(
+            1,
+            Instant::now() + Duration::from_millis(100),
+            deny_once_then_absent,
+        )
+        .expect("a transient group-probe EPERM is retried");
+
+        assert!(reaped);
+        assert_eq!(PROBE_CALLS.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_group_probe_permission_error_is_typed() {
+        fn always_deny(_: u32) -> std::io::Result<bool> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        }
+
+        let error = super::wait_for_process_group_with_probe(1, Instant::now(), always_deny)
+            .expect_err("a persistent group-probe EPERM must propagate");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let production_error =
+            super::map_process_group_probe(Err(rustix::io::Errno::PERM)).unwrap_err();
+        assert_eq!(
+            production_error.kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_signal_failure_is_typed_after_reap_and_reader_join() {
+        let _guard = process_test_guard();
+
+        // The injected signal seam is required because a same-user child cannot
+        // portably induce EPERM. Restoring the legacy "ignore after reap" branch
+        // makes this assertion fail even though the seam itself still compiles.
+        let error = run_bounded_with_group_signal(
+            &ProcessSpec::new("/bin/sh")
+                .args(["-c", "sleep 5 </dev/null >/dev/null 2>&1 & exit 0"]),
+            ProcessLimits {
+                timeout: Duration::from_secs(2),
+                max_stdout_bytes: 64,
+                max_stderr_bytes: 64,
+            },
+            signal_then_fail,
+        )
+        .expect_err("injected group-signal failures must propagate");
+
+        assert!(contains_group_signal(&error));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn escaped_session_pipe_holder_is_cancelled_and_readers_join_before_return() {
+        let _guard = process_test_guard();
+        let python = Command::new("python3")
+            .args(["-c", "import os"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("python3 is required to test the Python provider process boundary");
+        assert!(
+            python.success(),
+            "python3 must execute for this provider test"
+        );
+
+        let marker = std::env::temp_dir().join(format!(
+            "diagnostic-triage-python-{}-{}-escaped",
+            std::process::id(),
+            NEXT_ESCAPED_MARKER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let started = Instant::now();
+        let threads_before = os_thread_count();
+        let result = run_bounded(
+            &ProcessSpec::new("/bin/sh").args([
+                "-c",
+                r#"python3 -c 'import os,sys,time; os.setsid(); marker=open(sys.argv[1],"w"); marker.write(str(os.getpid())); marker.close(); exec("while True:\n time.sleep(1)")' "$1" & while [ ! -s "$1" ]; do sleep 0.01; done; exit 0"#,
+                "sh",
+                &marker.to_string_lossy(),
+            ]),
+            ProcessLimits {
+                timeout: Duration::from_secs(2),
+                max_stdout_bytes: 64,
+                max_stderr_bytes: 64,
+            },
+        );
+        let threads_after = os_thread_count();
+        let escaped = fs::read_to_string(&marker).expect("escaped process records its pid");
+        let escaped_pid = escaped.trim().parse().expect("pid is numeric");
+        let cleanup = ProcessGroupGuard(Some(escaped_pid));
+
+        assert!(
+            matches!(result, Err(ProcessError::CaptureDrainTimeout)),
+            "escaped pipe holder must force joined-reader cleanup: {result:?}"
+        );
+        assert_eq!(
+            threads_after, threads_before,
+            "run_bounded must not return with detached capture workers"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+
+        cleanup.terminate();
+        assert_process_stopped(escaped.trim());
+        fs::remove_file(marker).expect("test marker is removable");
+    }
+
+    #[cfg(unix)]
+    fn os_thread_count() -> usize {
+        let pid = std::process::id().to_string();
+        let mut command = Command::new("ps");
+        #[cfg(target_os = "linux")]
+        command.args(["-L", "-p", &pid]);
+        #[cfg(not(target_os = "linux"))]
+        command.args(["-M", "-p", &pid]);
+        let output = command
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("ps is required to observe test-process thread ownership");
+        assert!(
+            output.status.success(),
+            "ps failed while counting threads: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("ps output is UTF-8")
+            .lines()
+            .skip(1)
+            .filter(|line| !line.trim().is_empty())
+            .count()
     }
 }
