@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
+    thread,
     time::Duration,
 };
 
@@ -673,6 +674,58 @@ printf '%s' '[{"code":"F401","filename":"src/a.py","location":{"row":1,"column":
                 && value.counts.fix_candidates == 1
                 && value.counts.evidence == 2
     ));
+}
+
+#[cfg(unix)]
+#[test]
+fn manifest_first_stdio_completion_waits_for_closed_stdio_descendant_cleanup() {
+    let fake = FakeRuff::new(
+        r#"(sleep 1; printf 'late-descendant-write' > "$DIAGNOSTIC_TRIAGE_DELAYED_MARKER") </dev/null >/dev/null 2>&1 &
+printf '[]'; exit 0"#,
+    );
+    let marker = fake.root.join("delayed-descendant-marker");
+    let mut paths = vec![fake.root.clone()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_diagnostic-triage-provider-python"))
+        .current_dir(&fake.root)
+        .env("PATH", std::env::join_paths(paths).unwrap())
+        .env("DIAGNOSTIC_TRIAGE_DELAYED_MARKER", &marker)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut manifest = String::new();
+    stdout.read_line(&mut manifest).unwrap();
+    assert_eq!(manifest.as_bytes(), include_bytes!("golden/manifest.jsonl"));
+
+    child.stdin.take().unwrap().write_all(REQUEST).unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success());
+
+    let mut tail = String::new();
+    stdout.read_to_string(&mut tail).unwrap();
+    let events = tail
+        .lines()
+        .map(|line| serde_json::from_str::<ProtocolEnvelope>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        events.last(),
+        Some(ProtocolEnvelope::Completion(value))
+            if value.status == ExecutionStatus::Complete
+                && value.tool_exit_code.0 == Some(0)
+    ));
+
+    // The child closes all captured streams, exits first, and attempts the
+    // delayed write later. Completion is valid only after the dedicated
+    // process group has been terminated and reaped.
+    thread::sleep(Duration::from_millis(1_200));
+    assert!(
+        !marker.exists(),
+        "Completion was published while a same-group descendant was still live"
+    );
 }
 
 #[cfg(unix)]
