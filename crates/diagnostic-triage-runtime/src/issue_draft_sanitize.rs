@@ -275,6 +275,46 @@ fn redact_unquoted_assignments(
 }
 
 fn unquoted_secret_at(value: &str, index: usize) -> Option<(usize, usize)> {
+    let cursor = secret_value_start(value, index)?;
+    let bytes = value.as_bytes();
+    if cursor >= bytes.len()
+        || bytes.get(cursor).is_some_and(|byte| is_quote(*byte))
+        || (bytes.get(cursor) == Some(&b'\\')
+            && bytes.get(cursor + 1).is_some_and(|byte| is_quote(*byte)))
+    {
+        return None;
+    }
+    let end = unquoted_value_end(value, cursor);
+    (end > cursor).then_some((cursor, end))
+}
+
+fn quoted_secret_at(value: &str, index: usize) -> Option<(usize, usize)> {
+    let cursor = secret_value_start(value, index)?;
+    let bytes = value.as_bytes();
+    let (start, quote, escaped_outer) =
+        if let Some(quote) = bytes.get(cursor).copied().filter(|byte| is_quote(*byte)) {
+            (cursor + 1, quote, false)
+        } else if bytes.get(cursor) == Some(&b'\\') {
+            let quote = bytes
+                .get(cursor + 1)
+                .copied()
+                .filter(|byte| is_quote(*byte))?;
+            (cursor + 2, quote, true)
+        } else {
+            return None;
+        };
+    if start >= bytes.len() {
+        return None;
+    }
+    let end = if escaped_outer {
+        escaped_quoted_value_end(bytes, start, quote)
+    } else {
+        raw_quoted_value_end(bytes, start, quote)
+    };
+    (end > start).then_some((start, end))
+}
+
+fn secret_value_start(value: &str, index: usize) -> Option<usize> {
     let matched = recognize_secret_key(value, index)?;
     let bytes = value.as_bytes();
     let mut cursor = matched.end;
@@ -309,15 +349,30 @@ fn unquoted_secret_at(value: &str, index: usize) -> Option<(usize, usize)> {
             return None;
         }
     }
-    if cursor >= bytes.len()
-        || bytes.get(cursor).is_some_and(|byte| is_quote(*byte))
-        || (bytes.get(cursor) == Some(&b'\\')
-            && bytes.get(cursor + 1).is_some_and(|byte| is_quote(*byte)))
-    {
-        return None;
+    Some(cursor)
+}
+
+fn raw_quoted_value_end(bytes: &[u8], start: usize, quote: u8) -> usize {
+    let mut cursor = start;
+    while cursor < bytes.len() {
+        if bytes[cursor] == quote && !is_escaped(bytes, start, cursor) {
+            break;
+        }
+        cursor += 1;
     }
-    let end = unquoted_value_end(value, cursor);
-    (end > cursor).then_some((cursor, end))
+    cursor
+}
+
+fn escaped_quoted_value_end(bytes: &[u8], start: usize, quote: u8) -> usize {
+    let mut cursor = start;
+    while cursor + 1 < bytes.len() {
+        if bytes[cursor] == b'\\' && bytes[cursor + 1] == quote && !is_escaped(bytes, start, cursor)
+        {
+            return cursor;
+        }
+        cursor += 1;
+    }
+    bytes.len()
 }
 
 fn unquoted_value_end(value: &str, start: usize) -> usize {
@@ -429,8 +484,8 @@ fn is_pinned_format_character(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        GeneratedMarker, MarkerKind, SanitizeError, neutralize_external_text, recognize_secret_key,
-        sanitize_external_text, unquoted_secret_at,
+        GeneratedMarker, MarkerKind, SanitizeError, neutralize_external_text, quoted_secret_at,
+        recognize_secret_key, sanitize_external_text, unquoted_secret_at,
     };
 
     #[test]
@@ -620,6 +675,59 @@ mod tests {
             "token secret",
         ] {
             assert_eq!(unquoted_secret_at(input, 0), None, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn parses_raw_and_escaped_quoted_secret_value_spans() {
+        let cases = [
+            (r#"token="secret" next"#, "secret"),
+            ("token='秘密' tail", "秘密"),
+            (r#"--client-secret "tiny" rest"#, "tiny"),
+            (r#"token="a\"b" tail"#, r#"a\"b"#),
+            (r#"token=\"secret\" tail"#, "secret"),
+            (r"token=\'secret\' tail", "secret"),
+            (r#"token="missing"#, "missing"),
+            (r#"token=\"missing"#, "missing"),
+        ];
+        for (input, expected_value) in cases {
+            let (start, end) = quoted_secret_at(input, 0).unwrap();
+            assert_eq!(&input[start..end], expected_value, "input {input:?}");
+        }
+
+        for input in [
+            "token=\"\"",
+            "token=''",
+            r#"token=\"\""#,
+            "token=\"",
+            r#"token=\""#,
+            r#""token":"secret""#,
+        ] {
+            assert_eq!(quoted_secret_at(input, 0), None, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn quoted_delimiters_use_fixed_backslash_parity() {
+        for slash_count in 0..=4 {
+            let slashes = "\\".repeat(slash_count);
+            let input = format!("token=\"value{slashes}\"tail");
+            let expected = if slash_count % 2 == 0 {
+                format!("value{slashes}")
+            } else {
+                format!("value{slashes}\"tail")
+            };
+            let (start, end) = quoted_secret_at(&input, 0).unwrap();
+            assert_eq!(&input[start..end], expected, "raw input {input:?}");
+
+            let input = format!("token=\\\"value{slashes}\\\"tail");
+            let expected = if slash_count % 2 == 0 {
+                format!("value{slashes}")
+            } else {
+                format!("value{slashes}\\\"tail")
+            };
+            let (start, end) = quoted_secret_at(&input, 0).unwrap();
+            assert_eq!(&input[start..end], expected, "escaped input {input:?}");
         }
     }
 
