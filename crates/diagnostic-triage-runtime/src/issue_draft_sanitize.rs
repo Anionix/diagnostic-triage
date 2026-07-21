@@ -2,6 +2,11 @@
 
 // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
 
+#[cfg(test)]
+std::thread_local! {
+    static ASSIGNMENT_WHITESPACE_SCAN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 const PROVIDER_TOKEN_PREFIXES: &[(&str, usize, bool)] = &[
     ("ghp_", 20, false),
     ("gho_", 20, false),
@@ -241,6 +246,12 @@ fn recognize_secret_key(value: &str, index: usize) -> Option<SecretKeyMatch> {
         if bytes.get(end) == Some(&b'=') {
             return Some(SecretKeyMatch { end, cli_dashes: 0 });
         }
+    }
+
+    // LLM contract: INPUT_BOUNDARY -> POSSIBLE_KEY_START | REJECTED_BEFORE_SUFFIX_SCAN.
+    let first = bytes.get(index)?;
+    if !first.is_ascii_alphanumeric() && *first != b'-' {
+        return None;
     }
 
     let mut cursor = index;
@@ -854,6 +865,8 @@ fn skip_assignment_whitespace(value: &str, mut cursor: usize) -> usize {
         "[CONTROL-U+000D]",
     ];
     while cursor < value.len() {
+        #[cfg(test)]
+        ASSIGNMENT_WHITESPACE_SCAN_STEPS.with(|steps| steps.set(steps.get() + 1));
         if let Some(marker) = MARKERS
             .iter()
             .find(|marker| value[cursor..].starts_with(**marker))
@@ -969,9 +982,10 @@ fn is_pinned_format_character(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        GeneratedMarker, MarkerKind, PROVIDER_TOKEN_PREFIXES, SanitizeError,
-        neutralize_external_text, quoted_secret_at, recognize_secret_key, sanitize_external_text,
-        sanitize_identifier_text, sanitize_repository_path_text, unquoted_secret_at,
+        ASSIGNMENT_WHITESPACE_SCAN_STEPS, GeneratedMarker, MarkerKind, PROVIDER_TOKEN_PREFIXES,
+        SanitizeError, neutralize_external_text, quoted_secret_at, recognize_secret_key,
+        sanitize_external_text, sanitize_identifier_text, sanitize_repository_path_text,
+        unquoted_secret_at,
     };
 
     #[test]
@@ -1088,6 +1102,23 @@ mod tests {
             assert_eq!(&input[matched.end..], suffix, "input {input:?}");
             assert_eq!(matched.cli_dashes, cli_dashes, "input {input:?}");
         }
+    }
+
+    #[test]
+    fn impossible_key_starts_do_not_scan_suffix_whitespace() {
+        ASSIGNMENT_WHITESPACE_SCAN_STEPS.with(|steps| steps.set(0));
+        assert!(recognize_secret_key("token \t=value", 0).is_some());
+        assert!(ASSIGNMENT_WHITESPACE_SCAN_STEPS.with(std::cell::Cell::get) > 0);
+
+        ASSIGNMENT_WHITESPACE_SCAN_STEPS.with(|steps| steps.set(0));
+        let whitespace = " \t\n\u{2003}".repeat(64);
+        for (index, _) in whitespace.char_indices() {
+            assert_eq!(recognize_secret_key(&whitespace, index), None);
+        }
+        assert_eq!(
+            ASSIGNMENT_WHITESPACE_SCAN_STEPS.with(std::cell::Cell::get),
+            0
+        );
     }
 
     #[test]
