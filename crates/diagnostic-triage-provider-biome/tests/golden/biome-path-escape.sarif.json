@@ -1,0 +1,1 @@
+{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"results":[{"ruleId":"lint/style/useConst","level":"warning","message":{"text":"Use const."},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"../outside.ts"},"region":{"startLine":1,"startColumn":1,"endLine":1,"endColumn":4}}}]}]}]}
