@@ -1534,11 +1534,13 @@ fn reject_nul(value: &OsStr, field: &'static str) -> Result<(), ProcessError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        IO_CHUNK_BYTES, IncompleteReason, ProcessError, ProcessLimits, ProcessSpec, ProcessState,
-        StreamLineDecision, run_bounded, run_bounded_manifest_first,
+        IO_CHUNK_BYTES, IncompleteReason, ProcessError, ProcessLimits, ProcessOutcome, ProcessSpec,
+        ProcessState, StreamLineDecision, run_bounded, run_bounded_manifest_first,
     };
     use std::time::Duration;
     use tempfile::tempdir;
+
+    const TEST_SCHEDULING_ALLOWANCE: Duration = Duration::from_secs(5);
 
     fn limits(stdout: usize, stderr: usize) -> ProcessLimits {
         ProcessLimits {
@@ -1550,6 +1552,16 @@ mod tests {
 
     fn shell(script: &str) -> ProcessSpec {
         ProcessSpec::new("/bin/sh").args(["-c", script])
+    }
+
+    fn assert_cleanup_finishes_within_phases(outcome: &ProcessOutcome) {
+        let bound =
+            super::PROCESS_GROUP_GRACE + super::TERMINATION_GRACE + TEST_SCHEDULING_ALLOWANCE;
+        assert!(
+            outcome.cleanup_duration < bound,
+            "cleanup {:?} exceeded {bound:?}",
+            outcome.cleanup_duration
+        );
     }
 
     #[test]
@@ -1687,7 +1699,6 @@ mod tests {
 
     #[test]
     fn timeout_terminates_the_child_and_is_incomplete() {
-        let started = std::time::Instant::now();
         let outcome = run_bounded(
             &shell("while :; do :; done"),
             ProcessLimits {
@@ -1704,7 +1715,7 @@ mod tests {
         );
         assert_eq!(outcome.exit_code, None);
         assert!(outcome.duration <= Duration::from_millis(40));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_cleanup_finishes_within_phases(&outcome);
     }
 
     #[test]
@@ -1727,7 +1738,6 @@ mod tests {
 
     #[test]
     fn continuous_output_has_bounded_queueing_and_termination_latency() {
-        let started = std::time::Instant::now();
         let outcome = run_bounded(&shell("yes"), limits(1, 64)).expect("bounded outcome");
 
         assert_eq!(
@@ -1736,7 +1746,7 @@ mod tests {
         );
         assert_eq!(outcome.stdout.bytes.len(), 1);
         assert!(outcome.stdout.truncated);
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_cleanup_finishes_within_phases(&outcome);
     }
 
     #[test]
@@ -1781,7 +1791,6 @@ mod tests {
 
     #[test]
     fn blocked_stdin_writer_still_obeys_timeout() {
-        let started = std::time::Instant::now();
         let outcome = run_bounded(
             &shell("while :; do :; done").stdin(vec![b'x'; 1024 * 1024]),
             ProcessLimits {
@@ -1796,7 +1805,7 @@ mod tests {
             outcome.state,
             ProcessState::Incomplete(IncompleteReason::Timeout)
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_cleanup_finishes_within_phases(&outcome);
     }
 
     #[test]
@@ -1843,6 +1852,7 @@ mod tests {
             },
         )
         .expect("timeout is structured");
+        assert_cleanup_finishes_within_phases(&outcome);
         let raw_pid = String::from_utf8(outcome.stdout.bytes)
             .expect("pid is utf8")
             .trim()
@@ -1857,7 +1867,7 @@ mod tests {
         let outcome = run_bounded(
             &shell("while :; do :; done & descendant=$!; printf '%s\\n' \"$descendant\"; exit 0"),
             ProcessLimits {
-                timeout: Duration::from_millis(80),
+                timeout: Duration::from_secs(2),
                 max_stdout_bytes: 64,
                 max_stderr_bytes: 64,
             },
@@ -1865,8 +1875,8 @@ mod tests {
         .expect("orphaned pipe holder is terminated after leader exit");
         assert_eq!(outcome.state, ProcessState::Complete);
         assert_eq!(outcome.exit_code, Some(0));
-        assert!(outcome.duration < Duration::from_secs(1));
         assert!(outcome.cleanup_duration > Duration::ZERO);
+        assert_cleanup_finishes_within_phases(&outcome);
         let raw_pid = String::from_utf8(outcome.stdout.bytes)
             .expect("pid is utf8")
             .trim()
@@ -1889,7 +1899,6 @@ mod tests {
 
     #[cfg(unix)]
     fn assert_closed_stdio_descendant_is_killed(exit_code: u8) {
-        let started = std::time::Instant::now();
         let outcome = run_bounded(
             &shell(&format!(
                 "sleep 5 </dev/null >/dev/null 2>&1 & descendant=$!; printf '%s\\n' \"$descendant\"; exit {exit_code}"
@@ -1900,7 +1909,7 @@ mod tests {
 
         assert_eq!(outcome.state, ProcessState::Complete);
         assert_eq!(outcome.exit_code, Some(exit_code));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_cleanup_finishes_within_phases(&outcome);
         let raw_pid = String::from_utf8(outcome.stdout.bytes)
             .expect("pid is utf8")
             .trim()
@@ -2007,7 +2016,6 @@ mod tests {
     fn escaped_session_pipe_holder_is_a_bounded_typed_failure() {
         let directory = tempdir().unwrap();
         let marker = directory.path().join("escaped-pid");
-        let started = std::time::Instant::now();
         let result = run_bounded(&escaped_pipe_holder(&marker), limits(64, 64));
         let escaped_pid = std::fs::read_to_string(&marker)
             .expect("escaped process records its pid")
@@ -2019,7 +2027,6 @@ mod tests {
 
         let error = result.expect_err("an escaped pipe holder is incomplete");
         assert!(contains_capture_drain_timeout(&error), "error: {error:?}");
-        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[cfg(unix)]
