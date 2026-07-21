@@ -648,6 +648,9 @@ fn cleanup_setup_failure(
     if let Err(error) = termination {
         push_error(&mut errors, error);
     }
+    if exit_status.is_some() {
+        child.disarm();
+    }
     combine_errors(errors)
 }
 
@@ -661,6 +664,9 @@ fn finish_execution(
     let termination = terminate_and_reap(child, &mut exit_status, group_signal);
     if let Err(error) = termination {
         push_error(&mut errors, error);
+    }
+    if exit_status.is_some() {
+        child.disarm();
     }
     let drain_deadline = Instant::now()
         .checked_add(TERMINATION_GRACE)
@@ -679,9 +685,8 @@ fn finish_execution(
     if !errors.is_empty() {
         return Err(combine_errors(errors));
     }
-    // Keep the guard armed until process-group cleanup and every capture
-    // reader have completed successfully; only then may completion publish.
-    child.disarm();
+    // The reaped leader's numeric PGID may be reused while readers drain, so
+    // cleanup errors must never arm a second destructive group signal.
     Ok((
         exit_status.expect("reaped status was checked"),
         captures.stdout.expect("stdout join was checked"),
@@ -734,20 +739,18 @@ fn terminate_child(
     if exit_status.is_none() {
         errors.push(ProcessError::Unreaped);
     }
+    let group_wait = wait_for_process_group(process_group, deadline);
+    let zombie_only_permission_race = matches!(
+        (&group_signal_error, &group_wait),
+        (Some(source), Ok(true))
+            if source.kind() == io::ErrorKind::PermissionDenied && exit_status.is_some()
+    );
     if let Some(source) = group_signal_error {
-        // On macOS, signalling a group containing only an unreaped zombie
-        // leader may report EPERM. Keep the leader PID/PGID anchored until
-        // this point, reap it, then retry: ESRCH/success proves there was no
-        // unkillable descendant, while a second EPERM remains a hard error.
-        if source.kind() == io::ErrorKind::PermissionDenied && exit_status.is_some() {
-            if let Err(retry) = group_signal(process_group) {
-                errors.push(ProcessError::GroupSignal(retry));
-            }
-        } else {
+        if !zombie_only_permission_race {
             errors.push(ProcessError::GroupSignal(source));
         }
     }
-    match wait_for_process_group(process_group, deadline) {
+    match group_wait {
         Ok(true) => {}
         Ok(false) => errors.push(ProcessError::GroupUnreaped),
         Err(source) => errors.push(ProcessError::GroupWait(source)),
@@ -1017,15 +1020,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn zombie_only_permission_error_is_retried_after_reap() {
+    fn zombie_only_permission_error_is_suppressed_without_resignal() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         static SIGNAL_CALLS: AtomicUsize = AtomicUsize::new(0);
-        fn deny_once_then_signal(process_group: u32) -> std::io::Result<()> {
-            if SIGNAL_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
-                return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
-            }
-            signal_process_group(process_group)
+        fn deny_and_count(_: u32) -> std::io::Result<()> {
+            SIGNAL_CALLS.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
         }
 
         let _guard = process_test_guard();
@@ -1037,13 +1038,13 @@ mod tests {
                 max_stdout_bytes: 64,
                 max_stderr_bytes: 64,
             },
-            deny_once_then_signal,
+            deny_and_count,
         )
         .expect("a zombie-only EPERM is resolved by the post-reap retry");
 
         assert_eq!(outcome.state, ProcessState::Complete);
         assert_eq!(outcome.exit_code, Some(0));
-        assert_eq!(SIGNAL_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(SIGNAL_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(unix)]
