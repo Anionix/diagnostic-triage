@@ -866,19 +866,22 @@ fn secret_value_start(
             if cursor > value_start && looks_like_assignment(value, cursor, neutralized) {
                 return None;
             }
-        } else if skip_assignment_whitespace_with_provenance(value, cursor, neutralized) > cursor {
-            cursor = skip_assignment_whitespace_with_provenance(value, cursor, neutralized);
+        } else {
+            let (separator_end, provenance_backed) =
+                skip_key_separator_whitespace(value, cursor, neutralized);
+            if separator_end <= cursor {
+                return None;
+            }
+            cursor = separator_end;
             if matches!(bytes.get(cursor), Some(b'=' | b':')) {
                 return None;
             }
-            if looks_like_assignment(value, cursor, neutralized) {
+            if provenance_backed && looks_like_assignment(value, cursor, neutralized) {
                 return None;
             }
-        } else {
-            return None;
         }
     } else {
-        cursor = skip_assignment_whitespace_with_provenance(value, cursor, neutralized);
+        cursor = skip_key_separator_whitespace(value, cursor, neutralized).0;
         if !matches!(bytes.get(cursor), Some(b'=' | b':')) {
             return None;
         }
@@ -982,6 +985,18 @@ fn skip_assignment_whitespace_with_provenance(
         || skip_assignment_whitespace(value, cursor),
         |text| skip_provenance_whitespace(text, cursor),
     )
+}
+
+fn skip_key_separator_whitespace(
+    value: &str,
+    cursor: usize,
+    neutralized: Option<&NeutralizedText>,
+) -> (usize, bool) {
+    let provenance_end = skip_assignment_whitespace_with_provenance(value, cursor, neutralized);
+    if provenance_end > cursor || neutralized.is_none() {
+        return (provenance_end, true);
+    }
+    (skip_assignment_whitespace(value, cursor), false)
 }
 
 fn looks_like_assignment(value: &str, start: usize, neutralized: Option<&NeutralizedText>) -> bool {
@@ -2087,6 +2102,48 @@ mod tests {
             assert_eq!(
                 sanitize_external_text(input, 4096).unwrap().as_str(),
                 expected,
+                "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_control_marker_secret_separators_fail_closed() {
+        let cases = [
+            (
+                "token[CONTROL-U+0009]=secret",
+                "token[CONTROL-U+0009]=[REDACTED_SECRET]",
+            ),
+            (
+                "--token[CONTROL-U+0009]secret",
+                "--token[CONTROL-U+0009][REDACTED_SECRET]",
+            ),
+            (
+                "--token[CONTROL-U+000A]next=ok",
+                "--token[CONTROL-U+000A][REDACTED_SECRET]",
+            ),
+            ("token=[CONTROL-U+000A]next=ok", "token=[REDACTED_SECRET]"),
+            ("--token\nnext=ok", "--token[CONTROL-U+000A]next=ok"),
+        ];
+
+        for (input, expected) in cases {
+            let neutralized_bytes = neutralize_external_text(input, 4096)
+                .unwrap()
+                .as_str()
+                .len();
+            let required_bytes = neutralized_bytes.max(expected.len());
+            assert_eq!(
+                sanitize_external_text(input, required_bytes)
+                    .unwrap_or_else(|error| panic!("input {input:?}: {error}"))
+                    .as_str(),
+                expected,
+                "input {input:?}"
+            );
+            assert_eq!(
+                sanitize_external_text(input, required_bytes - 1),
+                Err(SanitizeError::OutputLimitExceeded {
+                    max_bytes: required_bytes - 1,
+                }),
                 "input {input:?}"
             );
         }
