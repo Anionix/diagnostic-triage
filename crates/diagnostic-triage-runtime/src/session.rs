@@ -123,10 +123,11 @@ fn run_provider_session_with_handshake_timeout(
         Some(HandshakeResult::Unsupported {
             manifest,
             missing_required,
+            reason,
         }) => Ok(ProviderSessionOutcome {
             state: ProviderSessionState::Unsupported {
                 missing_required,
-                reason: "required capability is unsupported".to_owned(),
+                reason,
             },
             manifest: Some(manifest),
             process,
@@ -253,6 +254,7 @@ enum HandshakeResult {
     Unsupported {
         manifest: ManifestEnvelope,
         missing_required: Vec<Capability>,
+        reason: String,
     },
 }
 
@@ -468,8 +470,11 @@ fn validate_handshake(
         ) | (AdapterKind::Observer, Operation::Observe)
     );
     if !role_supported {
-        return HandshakeResult::Incomplete {
-            manifest: Some(manifest),
+        // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
+        // LLM contract: MANIFEST_VALIDATED -> UNSUPPORTED; request remains UNSENT.
+        return HandshakeResult::Unsupported {
+            manifest,
+            missing_required: Vec::new(),
             reason: "adapter role does not support the requested operation".to_owned(),
         };
     }
@@ -486,6 +491,7 @@ fn validate_handshake(
         HandshakeResult::Unsupported {
             manifest,
             missing_required,
+            reason: "required capability is unsupported".to_owned(),
         }
     }
 }
@@ -520,11 +526,20 @@ mod tests {
     const REQUEST_ID: &str = "019f7e95-0000-7000-8000-000000000001";
 
     fn request(required: &str, optional: &[&str], stdout: u64) -> RequestEnvelope {
+        request_for("CHECK", required, optional, stdout)
+    }
+
+    fn request_for(
+        operation: &str,
+        required: &str,
+        optional: &[&str],
+        stdout: u64,
+    ) -> RequestEnvelope {
         let value = serde_json::json!({
             "protocol_version": "diagnostic-triage.protocol/v1",
             "kind": "request",
             "request_id": REQUEST_ID,
-            "operation": "CHECK",
+            "operation": operation,
             "workspace": ".",
             "targets": ["src/lib.rs"],
             "required_capabilities": [required],
@@ -545,13 +560,21 @@ mod tests {
     }
 
     fn manifest(capabilities: &[&str]) -> String {
+        manifest_for("PROVIDER", capabilities)
+    }
+
+    fn manifest_for(kind: &str, capabilities: &[&str]) -> String {
+        manifest_for_adapter("test-provider", kind, capabilities)
+    }
+
+    fn manifest_for_adapter(adapter_id: &str, kind: &str, capabilities: &[&str]) -> String {
         serde_json::json!({
             "protocol_version": "diagnostic-triage.protocol/v1",
             "kind": "manifest",
             "adapter": {
-                "id": "test-provider",
+                "id": adapter_id,
                 "version": "1.0.0",
-                "kind": "PROVIDER",
+                "kind": kind,
                 "capabilities": capabilities,
                 "languages": ["python"]
             }
@@ -659,6 +682,61 @@ mod tests {
         assert!(matches!(
             outcome.state,
             ProviderSessionState::Unsupported { .. }
+        ));
+        assert_eq!(outcome.request_bytes_written, 0);
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn handshake_mismatch_role_is_unsupported_without_request_bytes() {
+        for (kind, operation, capability) in [
+            ("PROVIDER", "OBSERVE", "execution.observe/v1"),
+            ("OBSERVER", "CHECK", "diagnostic.check/v1"),
+            ("OBSERVER", "FIX", "fix.propose/v1"),
+            ("OBSERVER", "VERIFY", "diagnostic.check/v1"),
+        ] {
+            let directory = tempdir().unwrap();
+            let marker = directory.path().join("request-received");
+            let script = ProcessSpec::new("/bin/sh").args([
+                "-c",
+                "printf '%s\\n' \"$1\"; if IFS= read -r request; then : > \"$2\"; fi",
+                "sh",
+                &manifest_for(kind, &[capability]),
+                marker.to_str().unwrap(),
+            ]);
+            let request = request_for(operation, capability, &[], 16_384);
+            let outcome = run_provider_session(script, &adapter_id(), &request).unwrap();
+
+            assert!(matches!(
+                outcome.state,
+                ProviderSessionState::Unsupported {
+                    ref missing_required,
+                    ..
+                } if missing_required.is_empty()
+            ));
+            assert_eq!(outcome.request_bytes_written, 0);
+            assert!(!marker.exists());
+        }
+    }
+
+    #[test]
+    fn handshake_mismatch_adapter_id_remains_incomplete_without_request_bytes() {
+        let directory = tempdir().unwrap();
+        let marker = directory.path().join("request-received");
+        let script = ProcessSpec::new("/bin/sh").args([
+            "-c",
+            "printf '%s\\n' \"$1\"; if IFS= read -r request; then : > \"$2\"; fi",
+            "sh",
+            &manifest_for_adapter("other-provider", "PROVIDER", &["diagnostic.check/v1"]),
+            marker.to_str().unwrap(),
+        ]);
+        let request = request("diagnostic.check/v1", &[], 16_384);
+        let outcome = run_provider_session(script, &adapter_id(), &request).unwrap();
+
+        assert!(matches!(
+            outcome.state,
+            ProviderSessionState::Incomplete { ref reason }
+                if reason == "manifest adapter id does not match configured adapter"
         ));
         assert_eq!(outcome.request_bytes_written, 0);
         assert!(!marker.exists());
