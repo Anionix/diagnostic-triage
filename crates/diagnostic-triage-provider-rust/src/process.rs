@@ -7,10 +7,10 @@ use std::{
     io::{self, Read},
     ops::{Deref, DerefMut},
     path::Path,
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -18,6 +18,14 @@ use std::{
 
 use thiserror::Error;
 use wait_timeout::ChildExt;
+
+#[cfg(unix)]
+use rustix::{
+    io::Errno,
+    process::{Pid, Signal, kill_process_group, test_kill_process_group},
+};
+#[cfg(unix)]
+use std::os::fd::AsFd;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const TERMINATION_GRACE: Duration = Duration::from_millis(250);
@@ -64,12 +72,20 @@ pub(crate) struct ProcessOutcome {
 pub(crate) enum ProcessError {
     #[error("Cargo request budget was exhausted before the next process step")]
     BudgetExhausted,
+    #[error("bounded Cargo process-group execution is unsupported on this platform")]
+    UnsupportedPlatform,
     #[error("failed to spawn Cargo: {0}")]
     Spawn(#[source] io::Error),
     #[error("spawned Cargo process did not expose {0}")]
     MissingPipe(&'static str),
     #[error("failed while waiting for Cargo: {0}")]
     Wait(#[source] io::Error),
+    #[error("failed to configure the Cargo {stream} capture pipe: {source}")]
+    CaptureConfiguration {
+        stream: &'static str,
+        #[source]
+        source: io::Error,
+    },
     #[error("failed to capture Cargo {stream}: {source}")]
     Capture {
         stream: &'static str,
@@ -86,8 +102,20 @@ pub(crate) enum ProcessError {
     CapturePanic(&'static str),
     #[error("Cargo child could not be reaped after termination")]
     Unreaped,
+    #[error("failed to signal the Cargo process group: {0}")]
+    GroupSignal(#[source] io::Error),
+    #[error("failed while waiting for the Cargo process group: {0}")]
+    GroupWait(#[source] io::Error),
+    #[error("Cargo process group remained live after termination")]
+    GroupUnreaped,
+    #[error("failed to terminate the Cargo group leader directly: {0}")]
+    LeaderSignal(#[source] io::Error),
+    #[error("failed while reaping the Cargo group leader: {0}")]
+    Reap(#[source] io::Error),
     #[error("Cargo capture pipes remained open after process termination")]
     CaptureDrainTimeout,
+    #[error("multiple Cargo process failures: {failures:?}")]
+    MultipleFailures { failures: Vec<ProcessError> },
 }
 
 pub(crate) fn run_direct(
@@ -96,6 +124,49 @@ pub(crate) fn run_direct(
     current_dir: &Path,
     limits: ProcessLimits,
 ) -> Result<ProcessOutcome, ProcessError> {
+    run_direct_with_group_signal(program, argv, current_dir, limits, signal_process_group)
+}
+
+fn run_direct_with_group_signal(
+    program: &OsStr,
+    argv: &[String],
+    current_dir: &Path,
+    limits: ProcessLimits,
+    group_signal: fn(u32) -> io::Result<()>,
+) -> Result<ProcessOutcome, ProcessError> {
+    run_direct_with_reader_probe(program, argv, current_dir, limits, group_signal, None)
+}
+
+#[cfg(test)]
+fn run_direct_with_group_signal_and_reader_probe(
+    program: &OsStr,
+    argv: &[String],
+    current_dir: &Path,
+    limits: ProcessLimits,
+    group_signal: fn(u32) -> io::Result<()>,
+    reader_join_probe: Arc<AtomicUsize>,
+) -> Result<ProcessOutcome, ProcessError> {
+    run_direct_with_reader_probe(
+        program,
+        argv,
+        current_dir,
+        limits,
+        group_signal,
+        Some(reader_join_probe),
+    )
+}
+
+fn run_direct_with_reader_probe(
+    program: &OsStr,
+    argv: &[String],
+    current_dir: &Path,
+    limits: ProcessLimits,
+    group_signal: fn(u32) -> io::Result<()>,
+    reader_join_probe: Option<Arc<AtomicUsize>>,
+) -> Result<ProcessOutcome, ProcessError> {
+    if cfg!(not(unix)) {
+        return Err(ProcessError::UnsupportedPlatform);
+    }
     let started = Instant::now();
     let mut command = Command::new(program);
     command
@@ -111,32 +182,23 @@ pub(crate) fn run_direct(
         command.process_group(0);
     }
     let mut child = ChildGuard::new(command.spawn().map_err(ProcessError::Spawn)?);
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or(ProcessError::MissingPipe("stdout"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or(ProcessError::MissingPipe("stderr"))?;
     let stdout_overflow = Arc::new(AtomicBool::new(false));
     let stderr_overflow = Arc::new(AtomicBool::new(false));
-    let stdout_reader = spawn_reader(
-        stdout,
-        limits.max_stdout_bytes,
+    let mut readers = match spawn_capture_readers(
+        &mut child,
+        limits,
         Arc::clone(&stdout_overflow),
-        "stdout",
-    )?;
-    let stderr_reader = spawn_reader(
-        stderr,
-        limits.max_stderr_bytes,
         Arc::clone(&stderr_overflow),
-        "stderr",
-    )?;
+        reader_join_probe,
+    ) {
+        Ok(readers) => readers,
+        Err(error) => return Err(cleanup_setup_failure(&mut child, error, group_signal)),
+    };
     let deadline = started.checked_add(limits.timeout).unwrap_or(started);
     let mut forced_reason = None;
-
     let mut exit_status = None;
+    let mut errors = Vec::new();
+
     loop {
         if stdout_overflow.load(Ordering::Acquire) {
             forced_reason = Some(IncompleteReason::StdoutOverflow);
@@ -146,38 +208,27 @@ pub(crate) fn run_direct(
             forced_reason = Some(IncompleteReason::Timeout);
         }
         if forced_reason.is_some() {
-            terminate_and_reap(&mut child, &mut exit_status)?;
             break;
         }
 
         let wait = deadline
             .saturating_duration_since(Instant::now())
             .min(POLL_INTERVAL);
-        if exit_status.is_none() {
-            exit_status = child.wait_timeout(wait).map_err(ProcessError::Wait)?;
-        } else if stdout_reader.is_finished() && stderr_reader.is_finished() {
-            break;
-        } else {
-            thread::sleep(wait);
+        match child.wait_timeout(wait) {
+            Ok(Some(status)) => {
+                exit_status = Some(status);
+                break;
+            }
+            Ok(None) => {}
+            Err(source) => {
+                errors.push(ProcessError::Wait(source));
+                break;
+            }
         }
     }
 
-    let drain_deadline = Instant::now()
-        .checked_add(TERMINATION_GRACE)
-        .unwrap_or_else(Instant::now);
-    while !(stdout_reader.is_finished() && stderr_reader.is_finished())
-        && Instant::now() < drain_deadline
-    {
-        thread::sleep(POLL_INTERVAL);
-    }
-    if !(stdout_reader.is_finished() && stderr_reader.is_finished()) {
-        return Err(ProcessError::CaptureDrainTimeout);
-    }
-
-    let stdout = join_reader(stdout_reader, "stdout")?;
-    let stderr = join_reader(stderr_reader, "stderr")?;
-    let status = exit_status.ok_or(ProcessError::Unreaped)?;
-    child.disarm();
+    let (status, stdout, stderr) =
+        finish_execution(&mut child, &mut readers, exit_status, errors, group_signal)?;
     let reason = forced_reason
         .or_else(|| stdout.truncated.then_some(IncompleteReason::StdoutOverflow))
         .or_else(|| stderr.truncated.then_some(IncompleteReason::StderrOverflow));
@@ -203,10 +254,90 @@ pub(crate) fn run_direct(
     })
 }
 
+fn spawn_capture_readers(
+    child: &mut ChildGuard,
+    limits: ProcessLimits,
+    stdout_overflow: Arc<AtomicBool>,
+    stderr_overflow: Arc<AtomicBool>,
+    reader_join_probe: Option<Arc<AtomicUsize>>,
+) -> Result<CaptureReaders, ProcessError> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(ProcessError::MissingPipe("stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or(ProcessError::MissingPipe("stderr"))?;
+    CaptureReaders::spawn(
+        configure_nonblocking(stdout, "stdout")?,
+        configure_nonblocking(stderr, "stderr")?,
+        limits,
+        stdout_overflow,
+        stderr_overflow,
+        reader_join_probe,
+    )
+}
+
+fn cleanup_setup_failure(
+    child: &mut ChildGuard,
+    error: ProcessError,
+    group_signal: fn(u32) -> io::Result<()>,
+) -> ProcessError {
+    let mut errors = vec![error];
+    let mut exit_status = None;
+    let termination = terminate_and_reap(child, &mut exit_status, group_signal);
+    if let Err(error) = termination {
+        push_error(&mut errors, error);
+    } else if exit_status.is_some() {
+        child.disarm();
+    }
+    combine_errors(errors)
+}
+
+fn finish_execution(
+    child: &mut ChildGuard,
+    readers: &mut CaptureReaders,
+    mut exit_status: Option<ExitStatus>,
+    mut errors: Vec<ProcessError>,
+    group_signal: fn(u32) -> io::Result<()>,
+) -> Result<(ExitStatus, CapturedOutput, CapturedOutput), ProcessError> {
+    let termination = terminate_and_reap(child, &mut exit_status, group_signal);
+    if let Err(error) = termination {
+        push_error(&mut errors, error);
+    }
+    let drain_deadline = Instant::now()
+        .checked_add(TERMINATION_GRACE)
+        .unwrap_or_else(Instant::now);
+    while !readers.is_finished() && Instant::now() < drain_deadline {
+        thread::sleep(POLL_INTERVAL);
+    }
+    if !readers.is_finished() {
+        readers.cancel();
+        errors.push(ProcessError::CaptureDrainTimeout);
+    }
+    let captures = readers.join_all();
+    for error in captures.errors {
+        push_error(&mut errors, error);
+    }
+    if !errors.is_empty() {
+        return Err(combine_errors(errors));
+    }
+    // Completion may publish only after process-group cleanup and every
+    // capture reader have both completed successfully.
+    child.disarm();
+    Ok((
+        exit_status.expect("reaped status was checked"),
+        captures.stdout.expect("stdout join was checked"),
+        captures.stderr.expect("stderr join was checked"),
+    ))
+}
+
 fn spawn_reader<R>(
     reader: R,
     limit: usize,
     overflow: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
     stream: &'static str,
 ) -> Result<thread::JoinHandle<io::Result<CapturedOutput>>, ProcessError>
 where
@@ -214,7 +345,7 @@ where
 {
     thread::Builder::new()
         .name(format!("cargo-{stream}-capture"))
-        .spawn(move || capture(reader, limit, &overflow))
+        .spawn(move || capture(reader, limit, &overflow, &cancel))
         .map_err(|source| ProcessError::CaptureSpawn { stream, source })
 }
 
@@ -222,20 +353,31 @@ fn capture(
     mut reader: impl Read,
     limit: usize,
     overflow: &AtomicBool,
+    cancel: &AtomicBool,
 ) -> io::Result<CapturedOutput> {
     let mut bytes = Vec::with_capacity(limit.min(8192));
     let mut observed_bytes = 0_u64;
     let mut buffer = [0_u8; 8192];
     loop {
-        let count = reader.read(&mut buffer)?;
-        if count == 0 {
+        if cancel.load(Ordering::Acquire) {
             break;
         }
-        observed_bytes = observed_bytes.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
-        let retained = count.min(limit.saturating_sub(bytes.len()));
-        bytes.extend_from_slice(&buffer[..retained]);
-        if retained != count {
-            overflow.store(true, Ordering::Release);
+        match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                observed_bytes =
+                    observed_bytes.saturating_add(u64::try_from(count).unwrap_or(u64::MAX));
+                let retained = count.min(limit.saturating_sub(bytes.len()));
+                bytes.extend_from_slice(&buffer[..retained]);
+                if retained != count {
+                    overflow.store(true, Ordering::Release);
+                }
+            }
+            Err(source) if source.kind() == io::ErrorKind::Interrupted => {}
+            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(POLL_INTERVAL);
+            }
+            Err(source) => return Err(source),
         }
     }
     Ok(CapturedOutput {
@@ -253,6 +395,139 @@ fn join_reader(
         .join()
         .map_err(|_| ProcessError::CapturePanic(stream))?
         .map_err(|source| ProcessError::Capture { stream, source })
+}
+
+#[cfg(unix)]
+fn configure_nonblocking<R>(reader: R, stream: &'static str) -> Result<R, ProcessError>
+where
+    R: AsFd,
+{
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+    let flags = fcntl_getfl(&reader).map_err(|source| ProcessError::CaptureConfiguration {
+        stream,
+        source: source.into(),
+    })?;
+    fcntl_setfl(&reader, flags | OFlags::NONBLOCK).map_err(|source| {
+        ProcessError::CaptureConfiguration {
+            stream,
+            source: source.into(),
+        }
+    })?;
+    Ok(reader)
+}
+
+#[cfg(not(unix))]
+fn configure_nonblocking<R>(_: R, _: &'static str) -> Result<R, ProcessError> {
+    Err(ProcessError::UnsupportedPlatform)
+}
+
+struct JoinedCaptures {
+    stdout: Option<CapturedOutput>,
+    stderr: Option<CapturedOutput>,
+    errors: Vec<ProcessError>,
+}
+
+struct CaptureReaders {
+    stdout: Option<thread::JoinHandle<io::Result<CapturedOutput>>>,
+    stderr: Option<thread::JoinHandle<io::Result<CapturedOutput>>>,
+    cancel: Arc<AtomicBool>,
+    reader_join_probe: Option<Arc<AtomicUsize>>,
+}
+
+impl CaptureReaders {
+    fn spawn(
+        stdout: ChildStdout,
+        stderr: ChildStderr,
+        limits: ProcessLimits,
+        stdout_overflow: Arc<AtomicBool>,
+        stderr_overflow: Arc<AtomicBool>,
+        reader_join_probe: Option<Arc<AtomicUsize>>,
+    ) -> Result<Self, ProcessError> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stdout = spawn_reader(
+            stdout,
+            limits.max_stdout_bytes,
+            stdout_overflow,
+            Arc::clone(&cancel),
+            "stdout",
+        )?;
+        let stderr = match spawn_reader(
+            stderr,
+            limits.max_stderr_bytes,
+            stderr_overflow,
+            Arc::clone(&cancel),
+            "stderr",
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                cancel.store(true, Ordering::Release);
+                let mut errors = vec![error];
+                if let Err(error) = join_reader(stdout, "stdout") {
+                    errors.push(error);
+                }
+                return Err(combine_errors(errors));
+            }
+        };
+        Ok(Self {
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            cancel,
+            reader_join_probe,
+        })
+    }
+
+    fn is_finished(&self) -> bool {
+        self.stdout
+            .as_ref()
+            .is_none_or(thread::JoinHandle::is_finished)
+            && self
+                .stderr
+                .as_ref()
+                .is_none_or(thread::JoinHandle::is_finished)
+    }
+
+    fn cancel(&self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+
+    fn join_all(&mut self) -> JoinedCaptures {
+        let mut captures = JoinedCaptures {
+            stdout: None,
+            stderr: None,
+            errors: Vec::new(),
+        };
+        if let Some(handle) = self.stdout.take() {
+            match join_reader(handle, "stdout") {
+                Ok(output) => {
+                    captures.stdout = Some(output);
+                    if let Some(probe) = &self.reader_join_probe {
+                        probe.fetch_add(1, Ordering::Release);
+                    }
+                }
+                Err(error) => captures.errors.push(error),
+            }
+        }
+        if let Some(handle) = self.stderr.take() {
+            match join_reader(handle, "stderr") {
+                Ok(output) => {
+                    captures.stderr = Some(output);
+                    if let Some(probe) = &self.reader_join_probe {
+                        probe.fetch_add(1, Ordering::Release);
+                    }
+                }
+                Err(error) => captures.errors.push(error),
+            }
+        }
+        captures
+    }
+}
+
+impl Drop for CaptureReaders {
+    fn drop(&mut self) {
+        self.cancel();
+        let _joined = self.join_all();
+    }
 }
 
 struct ChildGuard {
@@ -293,7 +568,12 @@ impl Drop for ChildGuard {
     fn drop(&mut self) {
         if self.armed {
             let mut exit_status = None;
-            let _ignored = terminate_child(&mut self.child, self.process_group, &mut exit_status);
+            let _ignored = terminate_child(
+                &mut self.child,
+                self.process_group,
+                &mut exit_status,
+                signal_process_group,
+            );
         }
     }
 }
@@ -301,53 +581,147 @@ impl Drop for ChildGuard {
 fn terminate_and_reap(
     child: &mut ChildGuard,
     exit_status: &mut Option<ExitStatus>,
+    group_signal: fn(u32) -> io::Result<()>,
 ) -> Result<(), ProcessError> {
-    terminate_child(&mut child.child, child.process_group, exit_status)
+    terminate_child(
+        &mut child.child,
+        child.process_group,
+        exit_status,
+        group_signal,
+    )
 }
 
 fn terminate_child(
     child: &mut Child,
     process_group: u32,
     exit_status: &mut Option<ExitStatus>,
+    group_signal: fn(u32) -> io::Result<()>,
 ) -> Result<(), ProcessError> {
-    #[cfg(unix)]
-    let _group_signal = signal_process_group(process_group);
-    #[cfg(not(unix))]
-    let _ = process_group;
-
+    let deadline = Instant::now()
+        .checked_add(TERMINATION_GRACE)
+        .unwrap_or_else(Instant::now);
+    let mut errors = Vec::new();
+    let group_signal_failed = match group_signal(process_group) {
+        Ok(()) => false,
+        Err(source) => {
+            errors.push(ProcessError::GroupSignal(source));
+            true
+        }
+    };
     if exit_status.is_none() {
-        *exit_status = child.try_wait().map_err(ProcessError::Wait)?;
+        match child.try_wait() {
+            Ok(status) => *exit_status = status,
+            Err(source) => errors.push(ProcessError::Reap(source)),
+        }
+    }
+    if exit_status.is_none() && group_signal_failed {
+        if let Err(source) = child.kill() {
+            errors.push(ProcessError::LeaderSignal(source));
+        }
     }
     if exit_status.is_none() {
-        child.kill().map_err(ProcessError::Wait)?;
-        *exit_status = child
-            .wait_timeout(TERMINATION_GRACE)
-            .map_err(ProcessError::Wait)?;
+        match child.wait_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(status) => *exit_status = status,
+            Err(source) => errors.push(ProcessError::Reap(source)),
+        }
     }
     if exit_status.is_none() {
-        return Err(ProcessError::Unreaped);
+        errors.push(ProcessError::Unreaped);
     }
-    Ok(())
+    match wait_for_process_group(process_group, deadline) {
+        Ok(true) => {}
+        Ok(false) => errors.push(ProcessError::GroupUnreaped),
+        Err(source) => errors.push(ProcessError::GroupWait(source)),
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(combine_errors(errors))
+    }
 }
 
 #[cfg(unix)]
 fn signal_process_group(process_group: u32) -> io::Result<()> {
-    let status = Command::new("/bin/kill")
-        .args(["-s", "KILL", &format!("-{process_group}")])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
+    let pid = process_group_pid(process_group)?;
+    match kill_process_group(pid, Signal::KILL) {
+        Ok(()) | Err(Errno::SRCH) => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_process_group(_: u32) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process groups are unsupported",
+    ))
+}
+
+#[cfg(unix)]
+fn process_group_exists(process_group: u32) -> io::Result<bool> {
+    let pid = process_group_pid(process_group)?;
+    match test_kill_process_group(pid) {
+        Ok(()) => Ok(true),
+        Err(Errno::SRCH) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+fn process_group_pid(process_group: u32) -> io::Result<Pid> {
+    let raw_pid = i32::try_from(process_group)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process-group ID overflow"))?;
+    Pid::from_raw(raw_pid).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process-group ID must be positive",
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn process_group_exists(_: u32) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "process groups are unsupported",
+    ))
+}
+
+fn wait_for_process_group(process_group: u32, deadline: Instant) -> io::Result<bool> {
+    loop {
+        if !process_group_exists(process_group)? {
+            return Ok(true);
+        }
+        let wait = deadline.saturating_duration_since(Instant::now());
+        if wait.is_zero() {
+            return Ok(false);
+        }
+        thread::sleep(wait.min(POLL_INTERVAL));
+    }
+}
+
+fn push_error(errors: &mut Vec<ProcessError>, error: ProcessError) {
+    match error {
+        ProcessError::MultipleFailures { failures } => errors.extend(failures),
+        error => errors.push(error),
+    }
+}
+
+fn combine_errors(mut errors: Vec<ProcessError>) -> ProcessError {
+    if errors.len() == 1 {
+        errors.pop().expect("one process error is present")
     } else {
-        Err(io::Error::other(format!("/bin/kill exited with {status}")))
+        ProcessError::MultipleFailures { failures: errors }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{IncompleteReason, ProcessLimits, ProcessState, run_direct};
+    use super::{
+        IncompleteReason, ProcessError, ProcessLimits, ProcessState, run_direct,
+        run_direct_with_group_signal, run_direct_with_group_signal_and_reader_probe,
+        signal_process_group,
+    };
     use std::{
         ffi::OsStr,
         path::Path,
@@ -362,6 +736,59 @@ mod tests {
             max_stdout_bytes: stdout,
             max_stderr_bytes: stderr,
         }
+    }
+
+    fn contains_group_signal(error: &ProcessError) -> bool {
+        match error {
+            ProcessError::GroupSignal(_) => true,
+            ProcessError::MultipleFailures { failures } => {
+                failures.iter().any(contains_group_signal)
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_process_disappears(raw_pid: &str) {
+        for _ in 0..25 {
+            let probe = Command::new("ps")
+                .args(["-p", raw_pid, "-o", "pid="])
+                .stdin(Stdio::null())
+                .output()
+                .expect("ps is available on supported Unix targets");
+            if !probe.status.success() || probe.stdout.trim_ascii().is_empty() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("descendant process {raw_pid} survived process-group termination");
+    }
+
+    #[cfg(unix)]
+    fn assert_closed_stdio_descendant_is_killed(exit_code: u8) {
+        let started = Instant::now();
+        let outcome = run_direct(
+            OsStr::new("/bin/sh"),
+            &[
+                "-c".to_owned(),
+                r#"sleep 5 </dev/null >/dev/null 2>&1 & descendant=$!; printf '%s\n' "$descendant"; exit "$1""#
+                    .to_owned(),
+                "sh".to_owned(),
+                exit_code.to_string(),
+            ],
+            Path::new("."),
+            limits(64, 64),
+        )
+        .expect("leader status and descendant cleanup are both preserved");
+
+        assert_eq!(outcome.state, ProcessState::Complete);
+        assert_eq!(outcome.exit_code, Some(exit_code));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let descendant = String::from_utf8(outcome.stdout.bytes)
+            .expect("pid is UTF-8")
+            .trim()
+            .to_owned();
+        assert_process_disappears(&descendant);
     }
 
     #[test]
@@ -454,44 +881,106 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn leader_exit_with_descendant_held_pipes_is_bounded() {
-        let started = Instant::now();
-        let mut process_limits = limits(64, 64);
-        process_limits.timeout = Duration::from_millis(80);
-        let outcome = run_direct(
+    fn zero_exit_kills_closed_stdio_delayed_descendant_and_preserves_status() {
+        assert_closed_stdio_descendant_is_killed(0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn nonzero_exit_kills_closed_stdio_delayed_descendant_and_preserves_status() {
+        assert_closed_stdio_descendant_is_killed(7);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn group_signal_failure_is_typed_after_reap_and_reader_join() {
+        fn signal_then_fail(process_group: u32) -> std::io::Result<()> {
+            signal_process_group(process_group)?;
+            Err(std::io::Error::other("injected group-signal failure"))
+        }
+
+        let error = run_direct_with_group_signal(
             OsStr::new("/bin/sh"),
             &[
                 "-c".to_owned(),
-                r#"while :; do :; done & descendant=$!; printf '%s\n' "$descendant"; exit 0"#
-                    .to_owned(),
+                "sleep 5 </dev/null >/dev/null 2>&1 & exit 0".to_owned(),
             ],
             Path::new("."),
-            process_limits,
+            limits(64, 64),
+            signal_then_fail,
         )
-        .expect("descendant-held pipes produce a typed outcome");
+        .expect_err("injected group-signal failures must propagate");
 
-        assert_eq!(
-            outcome.state,
-            ProcessState::Incomplete(IncompleteReason::Timeout)
+        assert!(contains_group_signal(&error), "error: {error:?}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn escaped_session_pipe_holder_is_cancelled_and_readers_join_before_return() {
+        use std::{
+            fs,
+            sync::{
+                Arc,
+                atomic::{AtomicU64, AtomicUsize, Ordering},
+            },
+        };
+
+        static NEXT_MARKER: AtomicU64 = AtomicU64::new(0);
+        let python_check = Command::new("python3")
+            .args(["-c", "import os; os.getpid()"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("the Unix process-group regression test requires python3");
+        assert!(
+            python_check.success(),
+            "the Unix process-group regression test requires python3"
+        );
+        let marker = std::env::temp_dir().join(format!(
+            "diagnostic-triage-cargo-{}-{}-escaped",
+            std::process::id(),
+            NEXT_MARKER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let started = Instant::now();
+        let reader_join_probe = Arc::new(AtomicUsize::new(0));
+        let result = run_direct_with_group_signal_and_reader_probe(
+            OsStr::new("python3"),
+            &[
+                "-c".to_owned(),
+                r#"import os, sys, time
+child = os.fork()
+if child == 0:
+    os.setsid()
+    with open(sys.argv[1], "w", encoding="ascii") as marker:
+        marker.write(str(os.getpid()))
+    time.sleep(60)
+while not os.path.exists(sys.argv[1]) or os.path.getsize(sys.argv[1]) == 0:
+    time.sleep(0.01)
+os._exit(0)"#
+                    .to_owned(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            Path::new("."),
+            limits(64, 64),
+            signal_process_group,
+            Arc::clone(&reader_join_probe),
+        );
+        let escaped = fs::read_to_string(&marker).expect("escaped process records its pid");
+        let readers_joined = reader_join_probe.load(Ordering::Acquire) == 2;
+        signal_process_group(escaped.trim().parse().expect("pid is numeric"))
+            .expect("test cleanup terminates escaped process group");
+        let _removed = fs::remove_file(marker);
+
+        assert!(
+            matches!(result, Err(ProcessError::CaptureDrainTimeout)),
+            "result: {result:?}"
         );
         assert!(started.elapsed() < Duration::from_secs(1));
-        let descendant = String::from_utf8(outcome.stdout.bytes)
-            .expect("pid is UTF-8")
-            .trim()
-            .to_owned();
-        for _ in 0..25 {
-            let status = Command::new("/bin/kill")
-                .args(["-s", "0", &descendant])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .expect("kill is available on supported Unix targets");
-            if !status.success() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
-        panic!("descendant process {descendant} survived process-group termination");
+        assert!(
+            readers_joined,
+            "capture readers must be joined before run returns"
+        );
+        assert_process_disappears(escaped.trim());
     }
 }
