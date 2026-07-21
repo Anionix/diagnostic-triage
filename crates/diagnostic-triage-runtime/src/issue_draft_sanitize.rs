@@ -1061,11 +1061,16 @@ fn skip_key_separator_whitespace(
     cursor: usize,
     neutralized: Option<&NeutralizedText>,
 ) -> (usize, bool) {
+    // LLM contract: SEPARATOR_PREFIX -> PROVENANCE_ONLY | LITERAL_TAINTED | ABSENT.
     let provenance_end = skip_assignment_whitespace_with_provenance(value, cursor, neutralized);
-    if provenance_end > cursor || neutralized.is_none() {
+    if neutralized.is_none() {
         return (provenance_end, true);
     }
-    (skip_assignment_whitespace(value, cursor), false)
+    let literal_end = skip_assignment_whitespace(value, provenance_end);
+    if literal_end > provenance_end {
+        return (literal_end, false);
+    }
+    (provenance_end, provenance_end > cursor)
 }
 
 fn looks_like_assignment(value: &str, start: usize, neutralized: Option<&NeutralizedText>) -> bool {
@@ -2298,6 +2303,54 @@ mod tests {
                     max_bytes: required_bytes - 1,
                 }),
                 "input {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_provenance_and_literal_secret_separators_fail_closed() {
+        let cases = [
+            (
+                "token\t[CONTROL-U+0009]=secret",
+                "token[CONTROL-U+0009][CONTROL-U+0009]=[REDACTED_SECRET]",
+            ),
+            (
+                "api_key \r[CONTROL-U+000D]:secret",
+                "api_key [CONTROL-U+000D][CONTROL-U+000D]:[REDACTED_SECRET]",
+            ),
+            (
+                "--token\t[CONTROL-U+0009]secret",
+                "--token[CONTROL-U+0009][CONTROL-U+0009][REDACTED_SECRET]",
+            ),
+            (
+                "--token\n[CONTROL-U+000A]next=ok",
+                "--token[CONTROL-U+000A][CONTROL-U+000A][REDACTED_SECRET]",
+            ),
+            (
+                "token\t[CONTROL-U+0009][CONTROL-U+000D]=secret",
+                "token[CONTROL-U+0009][CONTROL-U+0009][CONTROL-U+000D]=[REDACTED_SECRET]",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            let required_bytes = neutralize_external_text(input, 4096)
+                .unwrap()
+                .as_str()
+                .len()
+                .max(expected.len());
+            assert_eq!(
+                sanitize_external_text(input, required_bytes)
+                    .unwrap_or_else(|error| panic!("input {input:?}: {error}"))
+                    .as_str(),
+                expected,
+                "input {input:?}"
+            );
+            assert_eq!(
+                sanitize_external_text(input, required_bytes - 1),
+                Err(SanitizeError::OutputLimitExceeded {
+                    max_bytes: required_bytes - 1,
+                }),
+                "bound for {input:?}"
             );
         }
     }
