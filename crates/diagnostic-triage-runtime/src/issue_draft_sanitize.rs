@@ -244,16 +244,17 @@ fn recognize_secret_key(value: &str, index: usize) -> Option<SecretKeyMatch> {
             break;
         };
         if byte.is_ascii_alphanumeric() {
-            if normalized.len() == 32 {
+            if normalized.len() >= 32 {
                 return None;
             }
             normalized.push(char::from(byte.to_ascii_lowercase()));
             cursor += 1;
             needs_alphanumeric = false;
         } else if matches!(byte, b'_' | b'-') {
-            if normalized.is_empty() || needs_alphanumeric {
+            if normalized.is_empty() || needs_alphanumeric || normalized.len() >= 32 {
                 return None;
             }
+            normalized.push('_');
             cursor += 1;
             needs_alphanumeric = true;
         } else if let Some(end) = neutralization_marker_end(value, cursor) {
@@ -299,17 +300,18 @@ fn neutralization_marker_end(value: &str, index: usize) -> Option<usize> {
 }
 
 fn is_secret_key(value: &str) -> bool {
+    // LLM contract: CANDIDATE -> POSITION_PRESERVED -> DECLARED_ALIAS | REJECTED.
     matches!(
         value,
         "token"
-            | "apikey"
+            | "api_key"
             | "password"
             | "passwd"
             | "secret"
-            | "clientsecret"
-            | "accesstoken"
-            | "refreshtoken"
-            | "privatekey"
+            | "client_secret"
+            | "access_token"
+            | "refresh_token"
+            | "private_key"
     )
 }
 
@@ -465,16 +467,17 @@ fn json_quoted_secret_at(neutralized: &NeutralizedText, index: usize) -> Option<
     let mut needs_alphanumeric = false;
     while let Some(byte) = bytes.get(cursor).copied() {
         if byte.is_ascii_alphanumeric() {
-            if normalized.len() == 32 {
+            if normalized.len() >= 32 {
                 return None;
             }
             normalized.push(char::from(byte.to_ascii_lowercase()));
             cursor += 1;
             needs_alphanumeric = false;
         } else if matches!(byte, b'_' | b'-') {
-            if normalized.is_empty() || needs_alphanumeric {
+            if normalized.is_empty() || needs_alphanumeric || normalized.len() >= 32 {
                 return None;
             }
+            normalized.push('_');
             cursor += 1;
             needs_alphanumeric = true;
         } else {
@@ -939,6 +942,70 @@ mod tests {
             let matched = recognize_secret_key(input, index).unwrap();
             assert_eq!(&input[matched.end..], suffix, "input {input:?}");
             assert_eq!(matched.cli_dashes, cli_dashes, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn secret_key_aliases_preserve_separator_positions() {
+        let accepted = [
+            "token",
+            "api_key",
+            "api-key",
+            "password",
+            "passwd",
+            "secret",
+            "client_secret",
+            "client-secret",
+            "access_token",
+            "access-token",
+            "refresh_token",
+            "refresh-token",
+            "private_key",
+            "private-key",
+        ];
+        for key in accepted {
+            let input = format!("{key}=");
+            assert_eq!(recognize_secret_key(&input, 0).unwrap().end, key.len());
+        }
+
+        for key in [
+            "apikey",
+            "clientsecret",
+            "s-e-c-r-e-t",
+            "pa-ssword",
+            "api__key",
+            "api--key",
+            "--_token",
+            "token_",
+            "api-key-",
+        ] {
+            let input = format!("{key}=");
+            assert_eq!(recognize_secret_key(&input, 0), None, "key {key:?}");
+        }
+    }
+
+    #[test]
+    fn redacts_only_declared_secret_key_aliases() {
+        let input = "api-key=one client_secret=two";
+        assert_eq!(
+            sanitize_external_text(input, 4096).unwrap().as_str(),
+            "api-key=[REDACTED_SECRET] client_secret=[REDACTED_SECRET]"
+        );
+
+        for (input, expected) in [
+            ("s-e-c-r-e-t=public", "s-e-c-r-e-t=public"),
+            ("pa-ssword:public", "pa-ssword:public"),
+            ("apikey=public", "apikey=public"),
+            (
+                r#"{"clientsecret":"public","client-secret":"private"}"#,
+                r#"{"clientsecret":"public","client-secret":"[REDACTED_SECRET]"}"#,
+            ),
+        ] {
+            assert_eq!(
+                sanitize_external_text(input, 4096).unwrap().as_str(),
+                expected,
+                "input {input:?}"
+            );
         }
     }
 
