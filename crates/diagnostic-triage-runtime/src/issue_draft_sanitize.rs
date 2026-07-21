@@ -580,7 +580,13 @@ fn authorization_secret_at(neutralized: &NeutralizedText, index: usize) -> Optio
         if let Some(key_end) = generated_keyword_end(neutralized, index, b"authorization") {
             let separator = skip_provenance_whitespace(neutralized, key_end);
             matches!(bytes.get(separator), Some(b'=' | b':')).then_some(())?;
-            skip_provenance_whitespace(neutralized, separator + 1)
+            // LLM contract: AUTH_KEY -> PROVENANCE_WHITESPACE -> CREDENTIAL | EMPTY_ASSIGNMENT.
+            let value_start = separator + 1;
+            let cursor = skip_provenance_whitespace(neutralized, value_start);
+            if cursor > value_start && looks_like_assignment(value, cursor, Some(neutralized)) {
+                return None;
+            }
+            cursor
         } else {
             let scheme_end = authorization_scheme_end(neutralized, index)?;
             let value_start = skip_provenance_whitespace(neutralized, scheme_end);
@@ -733,12 +739,12 @@ fn secret_value_start(
     if matched.cli_dashes > 0 {
         if bytes.get(cursor) == Some(&b'=') {
             let value_start = cursor + 1;
-            cursor = skip_assignment_whitespace(value, value_start);
+            cursor = skip_assignment_whitespace_with_provenance(value, value_start, neutralized);
             if cursor > value_start && looks_like_assignment(value, cursor, neutralized) {
                 return None;
             }
-        } else if skip_assignment_whitespace(value, cursor) > cursor {
-            cursor = skip_assignment_whitespace(value, cursor);
+        } else if skip_assignment_whitespace_with_provenance(value, cursor, neutralized) > cursor {
+            cursor = skip_assignment_whitespace_with_provenance(value, cursor, neutralized);
             if matches!(bytes.get(cursor), Some(b'=' | b':')) {
                 return None;
             }
@@ -749,12 +755,12 @@ fn secret_value_start(
             return None;
         }
     } else {
-        cursor = skip_assignment_whitespace(value, cursor);
+        cursor = skip_assignment_whitespace_with_provenance(value, cursor, neutralized);
         if !matches!(bytes.get(cursor), Some(b'=' | b':')) {
             return None;
         }
         let value_start = cursor + 1;
-        cursor = skip_assignment_whitespace(value, value_start);
+        cursor = skip_assignment_whitespace_with_provenance(value, value_start, neutralized);
         if matches!(bytes.get(cursor), Some(b'=' | b':'))
             || (cursor > value_start && looks_like_assignment(value, cursor, neutralized))
         {
@@ -842,6 +848,17 @@ fn skip_assignment_whitespace(value: &str, mut cursor: usize) -> usize {
     cursor
 }
 
+fn skip_assignment_whitespace_with_provenance(
+    value: &str,
+    cursor: usize,
+    neutralized: Option<&NeutralizedText>,
+) -> usize {
+    neutralized.map_or_else(
+        || skip_assignment_whitespace(value, cursor),
+        |text| skip_provenance_whitespace(text, cursor),
+    )
+}
+
 fn looks_like_assignment(value: &str, start: usize, neutralized: Option<&NeutralizedText>) -> bool {
     const MAX_MARKERS: u8 = 8;
     const MAX_MARKER_SPAN: usize = 256;
@@ -877,7 +894,11 @@ fn looks_like_assignment(value: &str, start: usize, neutralized: Option<&Neutral
         && !needs_key_character
         && value
             .as_bytes()
-            .get(skip_assignment_whitespace(value, cursor))
+            .get(skip_assignment_whitespace_with_provenance(
+                value,
+                cursor,
+                neutralized,
+            ))
             .is_some_and(|byte| matches!(byte, b'=' | b':'))
 }
 
@@ -1470,6 +1491,53 @@ mod tests {
             let actual = sanitize_external_text(input, 4096).unwrap();
             assert_eq!(actual.as_str(), input, "input {input:?}");
         }
+    }
+
+    #[test]
+    fn empty_authorization_preserves_only_provenance_backed_following_assignments() {
+        let cases = [
+            (
+                "Authorization:\nnext=ok",
+                "Authorization:[CONTROL-U+000A]next=ok",
+            ),
+            ("Authorization:   next=ok", "Authorization:   next=ok"),
+            (
+                "Authorization:\tnext=ok",
+                "Authorization:[CONTROL-U+0009]next=ok",
+            ),
+            ("--token=\nnext=ok", "--token=[CONTROL-U+000A]next=ok"),
+            (
+                "Authorization:[CONTROL-U+000A]next=ok",
+                "Authorization:[REDACTED_SECRET]",
+            ),
+            (
+                "--token=[CONTROL-U+000A]next=ok",
+                "--token=[REDACTED_SECRET]",
+            ),
+            (
+                "Authorization:\nBearer credential",
+                "Authorization:[CONTROL-U+000A]Bearer [REDACTED_SECRET]",
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                sanitize_external_text(input, input.len().max(expected.len()))
+                    .unwrap()
+                    .as_str(),
+                expected,
+                "input {input:?}"
+            );
+        }
+
+        let input = "Authorization:\nnext=ok";
+        let expected = "Authorization:[CONTROL-U+000A]next=ok";
+        assert_eq!(
+            sanitize_external_text(input, expected.len() - 1),
+            Err(SanitizeError::OutputLimitExceeded {
+                max_bytes: expected.len() - 1,
+            })
+        );
     }
 
     #[test]
