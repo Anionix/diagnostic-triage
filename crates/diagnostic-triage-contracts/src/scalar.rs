@@ -5,6 +5,7 @@ use std::{fmt, str::FromStr};
 use camino::Utf8PathBuf;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
@@ -77,6 +78,15 @@ validated_string!(
     valid_sha256,
     "expected 64 lowercase hexadecimal characters"
 );
+
+impl Sha256Digest {
+    /// Compute the canonical lowercase SHA-256 digest for `bytes`.
+    #[must_use]
+    pub fn compute(bytes: &[u8]) -> Self {
+        Self(format!("{:x}", Sha256::digest(bytes)))
+    }
+}
+
 validated_string!(
     /// Full lowercase SHA-1 or SHA-256 Git object identifier.
     SourceRevision,
@@ -257,7 +267,19 @@ fn valid_repo_path(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AdapterId, Capability, ObjectId, RepoPath, SourceRevision};
+    use super::{AdapterId, Capability, ObjectId, RepoPath, Sha256Digest, SourceRevision};
+
+    #[test]
+    fn sha256_digest_compute_matches_known_vectors() {
+        assert_eq!(
+            Sha256Digest::compute(b"").as_str(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            Sha256Digest::compute(b"hello").as_str(),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+    }
 
     #[test]
     fn rejects_noncanonical_paths() {
