@@ -39,18 +39,32 @@
       "additionalProperties": false,
       "required": ["line", "column"],
       "properties": {
-        "line": { "type": "integer", "minimum": 1, "maximum": 4294967295 },
-        "column": { "type": "integer", "minimum": 1, "maximum": 4294967295 }
+        "line": {
+          "description": "One-based line number.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "column": {
+          "description": "One-based Unicode code-point column.",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        }
       }
     },
     "location": {
+      "description": "One-based half-open [start, end) source range. An omitted end is a point at start; an explicit end equal to start is a valid zero-width insertion point. Columns count Unicode code points.",
       "type": "object",
       "additionalProperties": false,
       "required": ["path", "start"],
       "properties": {
         "path": { "$ref": "#/$defs/relativePath" },
         "start": { "$ref": "#/$defs/position" },
-        "end": { "$ref": "#/$defs/position" }
+        "end": {
+          "description": "Exclusive end position; omission denotes a point at start.",
+          "$ref": "#/$defs/position"
+        }
       }
     },
     "tool": {

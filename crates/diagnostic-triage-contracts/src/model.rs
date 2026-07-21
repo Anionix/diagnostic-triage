@@ -65,15 +65,23 @@ pub enum Origin {
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Position {
+    /// One-based line number.
     pub line: u32,
+    /// One-based Unicode code-point column.
     pub column: u32,
 }
 
+/// A one-based half-open `[start, end)` source range.
+///
+/// An omitted `end` is a point at `start`. An explicit `end == start` is a
+/// valid zero-width insertion point. Columns count Unicode code points, not
+/// grapheme clusters, display cells, UTF-8 bytes, or UTF-16 code units.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Location {
     pub path: RepoPath,
     pub start: Position,
+    /// Exclusive end position; omission denotes a point at `start`.
     #[serde(
         default,
         deserialize_with = "deserialize_optional",

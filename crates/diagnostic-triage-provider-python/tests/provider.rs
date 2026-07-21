@@ -10,6 +10,7 @@ use std::{
 // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
 
 use diagnostic_triage_contracts::{
+    Sha256Digest,
     model::{Applicability, EvidenceSource, ExecutionStatus},
     protocol::{Operation, ProtocolEnvelope},
 };
@@ -176,6 +177,87 @@ fn findings_match_golden_and_preserve_only_explicit_safe_unsafe_metadata() {
             .map(|evidence| evidence.retained_bytes)
             .sum::<u64>()
     );
+}
+
+#[test]
+fn ruff_locations_preserve_points_insertions_and_half_open_code_point_ranges() {
+    let request = request();
+    let mut builder = CompletionBuilder::new(&request);
+    let input = r#"[
+      {"code":"POINT","filename":"src/unicode.py","location":{"row":1,"column":2},"message":"point after α","severity":"warning","fix":null},
+      {"code":"INSERT","filename":"src/unicode.py","location":{"row":2,"column":3},"end_location":{"row":2,"column":3},"message":"insertion","severity":"warning","fix":null},
+      {"code":"SAME","filename":"src/unicode.py","location":{"row":3,"column":2},"end_location":{"row":3,"column":4},"message":"same line","severity":"warning","fix":null},
+      {"code":"NEXT","filename":"src/unicode.py","location":{"row":4,"column":1},"end_location":{"row":5,"column":1},"message":"through newline","severity":"warning","fix":null}
+    ]"#;
+    let normalized = normalize_ruff_json(
+        &request,
+        "0.15.2",
+        Path::new("/repo"),
+        input.as_bytes(),
+        &[],
+        &mut builder,
+    )
+    .expect("Ruff Location v1 shapes normalize");
+    let locations = normalized
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ProtocolEnvelope::Observation(value) => value.observation.location.as_ref(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(locations.len(), 4);
+    assert!(locations[0].end.is_none(), "absent end remains a point");
+    assert_eq!(locations[1].start, locations[1].end.clone().unwrap());
+    assert_eq!(locations[2].end.as_ref().unwrap().column, 4);
+    assert_eq!(locations[3].end.as_ref().unwrap().line, 5);
+    assert_eq!(locations[3].end.as_ref().unwrap().column, 1);
+}
+
+#[test]
+fn ruff_non_bmp_fixture_proves_scalar_not_utf16_or_utf8_columns() {
+    let provenance: serde_json::Value =
+        serde_json::from_slice(include_bytes!("golden/ruff-unicode.provenance.json"))
+            .expect("Ruff fixture provenance is JSON");
+    assert_eq!(provenance["tool"], "ruff");
+    assert_eq!(provenance["tool_version"], "ruff 0.15.14");
+    assert_eq!(
+        provenance["coordinate_probe"]["unicode_scalar_start_column"],
+        10
+    );
+    assert_eq!(provenance["coordinate_probe"]["utf16_start_column"], 11);
+    assert_eq!(provenance["coordinate_probe"]["utf8_byte_start_column"], 13);
+    assert_eq!(
+        provenance["source_sha256"],
+        Sha256Digest::compute(include_bytes!("golden/ruff-unicode.py")).as_str()
+    );
+    assert_eq!(
+        provenance["output_sha256"],
+        Sha256Digest::compute(include_bytes!("golden/ruff-unicode.json")).as_str()
+    );
+
+    let request = request();
+    let mut builder = CompletionBuilder::new(&request);
+    let normalized = normalize_ruff_json(
+        &request,
+        "0.15.14",
+        Path::new("/repo"),
+        include_bytes!("golden/ruff-unicode.json"),
+        &[],
+        &mut builder,
+    )
+    .expect("pinned Ruff JSON fixture normalizes");
+    let location = normalized
+        .events
+        .iter()
+        .find_map(|event| match event {
+            ProtocolEnvelope::Observation(value) => value.observation.location.as_ref(),
+            _ => None,
+        })
+        .expect("fixture emits one location");
+    assert_eq!(location.start.column, 10);
+    assert_eq!(location.end.as_ref().expect("Ruff end_location").column, 11);
 }
 
 #[test]

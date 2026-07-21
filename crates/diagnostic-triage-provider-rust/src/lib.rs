@@ -91,33 +91,54 @@ pub fn manifest() -> ManifestEnvelope {
 /// Returns [`ProviderError`] when framing, process execution, normalization,
 /// or protocol emission cannot be completed safely.
 pub fn run_stdio() -> Result<(), ProviderError> {
+    let stdin = io::stdin();
     let stdout = io::stdout();
-    let mut output = stdout.lock();
+    run_stdio_with(stdin.lock(), stdout.lock(), execute)
+}
+
+fn run_stdio_with<R, W, F>(
+    reader: R,
+    mut output: W,
+    execute_request: F,
+) -> Result<(), ProviderError>
+where
+    R: Read,
+    W: Write,
+    F: Fn(&RequestEnvelope) -> ProviderResponse,
+{
     write_envelope(&mut output, &ProtocolEnvelope::Manifest(manifest()))?;
     output.flush()?;
 
-    let stdin = io::stdin();
-    let mut input = Vec::new();
-    BufReader::new(stdin.lock())
+    let mut request_bytes = Vec::new();
+    BufReader::new(reader)
         .take(u64::try_from(MAX_REQUEST_BYTES).unwrap_or(u64::MAX) + 1)
-        .read_until(b'\n', &mut input)?;
-    let (request, response) = match decode_request(&input) {
+        .read_until(b'\n', &mut request_bytes)?;
+    let (request, response) = match decode_request(&request_bytes) {
         Ok(request) => {
-            let response = execute(&request);
+            let response = execute_request(&request);
             (Some(request), response)
         }
         Err(error) => (
             None,
             terminal_for_id(
-                recover_request_id(&input),
+                recover_request_id(&request_bytes),
                 ExecutionStatus::Incomplete,
                 &error.to_string(),
             ),
         ),
     };
-    if let Some(request) = &request {
-        validate_response(request, &response)?;
-    }
+    let response = if let Some(request) = &request {
+        match validate_response(request, &response) {
+            Ok(()) => response,
+            Err(error) => terminal_for_id(
+                request.request_id.clone(),
+                ExecutionStatus::Incomplete,
+                &format!("provider response validation failed: {error}"),
+            ),
+        }
+    } else {
+        response
+    };
     for event in &response.events {
         write_envelope(&mut output, event)?;
     }
@@ -632,8 +653,11 @@ fn location(
     workspace: &RepoPath,
     workspace_root: &Path,
 ) -> Result<Location, ProviderError> {
-    Ok(Location {
+    validate_rustc_span(span)?;
+    let location = Location {
         path: normalize_path(&span.file_name, workspace, workspace_root)?,
+        // rustc JSON exposes one-based character offsets with an exclusive
+        // span end, so its Unicode code-point coordinates match Location v1.
         start: Position {
             line: to_u32(span.line_start, "line_start")?,
             column: to_u32(span.column_start, "column_start")?,
@@ -642,7 +666,33 @@ fn location(
             line: to_u32(span.line_end, "line_end")?,
             column: to_u32(span.column_end, "column_end")?,
         }),
-    })
+    };
+    location
+        .validate()
+        .map_err(|error| ProviderError::Model(error.to_string()))?;
+    Ok(location)
+}
+
+fn validate_rustc_span(span: &RustcSpan) -> Result<(), ProviderError> {
+    if span.line_start == 0
+        || span.line_end == 0
+        || span.column_start == 0
+        || span.column_end == 0
+        || (span.line_end, span.column_end) < (span.line_start, span.column_start)
+    {
+        return Err(ProviderError::Model(
+            "rustc span position must be positive and end must not precede start".to_owned(),
+        ));
+    }
+    for (value, field) in [
+        (span.line_start, "line_start"),
+        (span.line_end, "line_end"),
+        (span.column_start, "column_start"),
+        (span.column_end, "column_end"),
+    ] {
+        to_u32(value, field)?;
+    }
+    Ok(())
 }
 
 fn normalize_path(
@@ -1126,13 +1176,20 @@ impl IdFactory {
 #[cfg(test)]
 mod tests {
     use super::{
-        CHECK_CAPABILITY, ProviderError, cargo_argv, decode_request, diagnostic_message,
-        execute_with_program, manifest, normalize_path, read_request, severity, validate_response,
+        CHECK_CAPABILITY, MAX_MESSAGE_CHARS, ProviderError, cargo_argv, decode_request,
+        diagnostic_message, execute_with_program, location, manifest, normalize_path, read_request,
+        run_stdio_with, severity, terminal_for_id, validate_response,
     };
-    use crate::cargo_json::{RustcChild, RustcDiagnostic};
+    use crate::cargo_json::{RustcChild, RustcDiagnostic, RustcSpan};
     use diagnostic_triage_contracts::{
-        model::{ExecutionStatus, Severity},
-        protocol::{ProtocolEnvelope, RequestEnvelope},
+        Sha256Digest,
+        model::{
+            ExecutionStatus, Location, Observation, ObservationSchemaVersion, Origin, Position,
+            Severity, Tool,
+        },
+        protocol::{
+            EnvelopeKind, ObservationEnvelope, ProtocolEnvelope, ProtocolVersion, RequestEnvelope,
+        },
     };
     use std::{
         fs,
@@ -1248,6 +1305,66 @@ mod tests {
     }
 
     #[test]
+    fn run_stdio_turns_invalid_observation_into_terminal_completion() {
+        let request = request();
+        let mut response = terminal_for_id(
+            request.request_id.clone(),
+            ExecutionStatus::Complete,
+            "test response",
+        );
+        response
+            .events
+            .push(ProtocolEnvelope::Observation(ObservationEnvelope {
+                protocol_version: ProtocolVersion::V1,
+                kind: EnvelopeKind::Observation,
+                request_id: request.request_id.clone(),
+                sequence: 0,
+                observation: Observation {
+                    schema_version: ObservationSchemaVersion::V1,
+                    observation_id: request.request_id.clone(),
+                    tool: Tool {
+                        name: "rustc".to_owned(),
+                        version: "1.85.1".to_owned(),
+                        rule_id: None,
+                    },
+                    language: "rust".parse().unwrap(),
+                    severity: Severity::Error,
+                    origin: Origin::Normal,
+                    message: "invalid location".to_owned(),
+                    location: Some(Location {
+                        path: "src/lib.rs".parse().unwrap(),
+                        start: Position { line: 0, column: 1 },
+                        end: None,
+                    }),
+                    symbol: None,
+                    expected: None,
+                    observed: None,
+                    evidence_ids: Vec::new(),
+                },
+            }));
+        let mut input =
+            serde_json::to_vec(&ProtocolEnvelope::Request(request)).expect("request serializes");
+        input.push(b'\n');
+        let mut output = Vec::new();
+
+        run_stdio_with(Cursor::new(input), &mut output, |_| response.clone())
+            .expect("invalid response is converted to a terminal completion");
+
+        let events = String::from_utf8(output)
+            .expect("protocol output is UTF-8")
+            .lines()
+            .map(|line| serde_json::from_str::<ProtocolEnvelope>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            events.as_slice(),
+            [ProtocolEnvelope::Manifest(_), ProtocolEnvelope::Completion(value)]
+                if value.status == ExecutionStatus::Incomplete
+                    && value.tool_exit_code.0.is_none()
+                    && value.message.as_deref().is_some_and(|message| message.len() <= MAX_MESSAGE_CHARS)
+        ));
+    }
+
+    #[test]
     fn unsupported_required_capability_finishes_without_running_cargo() {
         let mut request = request();
         request.required_capabilities = vec!["rust.future/v1".parse().unwrap()];
@@ -1279,6 +1396,109 @@ mod tests {
         let workspace = "crates/member".parse().unwrap();
         let path = normalize_path("src/lib.rs", &workspace, Path::new("crates/member")).unwrap();
         assert_eq!(path.as_str(), "crates/member/src/lib.rs");
+    }
+
+    #[test]
+    fn rustc_locations_preserve_insertions_and_half_open_code_point_ranges() {
+        let workspace = ".".parse().unwrap();
+        let spans = [
+            RustcSpan {
+                file_name: "src/unicode.rs".to_owned(),
+                line_start: 1,
+                line_end: 1,
+                column_start: 2,
+                column_end: 2,
+                is_primary: true,
+            },
+            RustcSpan {
+                file_name: "src/unicode.rs".to_owned(),
+                line_start: 2,
+                line_end: 2,
+                column_start: 2,
+                column_end: 4,
+                is_primary: true,
+            },
+            RustcSpan {
+                file_name: "src/unicode.rs".to_owned(),
+                line_start: 3,
+                line_end: 4,
+                column_start: 1,
+                column_end: 1,
+                is_primary: true,
+            },
+        ];
+        let locations = spans
+            .iter()
+            .map(|span| location(span, &workspace, Path::new(".")))
+            .collect::<Result<Vec<_>, _>>()
+            .expect("rustc coordinates match Location v1");
+
+        assert_eq!(locations[0].start, locations[0].end.clone().unwrap());
+        assert_eq!(locations[1].end.as_ref().unwrap().column, 4);
+        assert_eq!(locations[2].end.as_ref().unwrap().line, 4);
+        assert_eq!(locations[2].end.as_ref().unwrap().column, 1);
+    }
+
+    #[test]
+    fn rustc_location_boundary_rejects_non_positive_and_reversed_spans() {
+        let workspace = ".".parse().unwrap();
+        for (line_start, line_end, column_start, column_end) in
+            [(0, 1, 1, 1), (1, 1, 0, 1), (2, 1, 1, 1), (1, 1, 3, 2)]
+        {
+            let span = RustcSpan {
+                file_name: "src/lib.rs".to_owned(),
+                line_start,
+                line_end,
+                column_start,
+                column_end,
+                is_primary: true,
+            };
+            assert!(location(&span, &workspace, Path::new(".")).is_err());
+        }
+    }
+
+    #[test]
+    fn rustc_non_bmp_fixture_proves_scalar_not_utf16_or_utf8_columns() {
+        let provenance: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../tests/golden/rustc-unicode.provenance.json"
+        ))
+        .expect("rustc fixture provenance is JSON");
+        assert_eq!(provenance["tool"], "rustc");
+        assert_eq!(
+            provenance["tool_version"],
+            "rustc 1.85.1 (4eb161250 2025-03-15)"
+        );
+        assert_eq!(
+            provenance["commit_hash"],
+            "4eb161250e340c8f48f66e2b929ef4a5bed7c181"
+        );
+        assert_eq!(
+            provenance["coordinate_probe"]["unicode_scalar_start_column"],
+            26
+        );
+        assert_eq!(provenance["coordinate_probe"]["utf16_start_column"], 27);
+        assert_eq!(provenance["coordinate_probe"]["utf8_byte_start_column"], 29);
+        assert_eq!(
+            provenance["source_sha256"],
+            Sha256Digest::compute(include_bytes!("../tests/golden/rustc-unicode.rs")).as_str()
+        );
+        assert_eq!(
+            provenance["output_sha256"],
+            Sha256Digest::compute(include_bytes!("../tests/golden/rustc-unicode.jsonl")).as_str()
+        );
+
+        let first_line = std::str::from_utf8(include_bytes!("../tests/golden/rustc-unicode.jsonl"))
+            .expect("rustc fixture is UTF-8")
+            .lines()
+            .next()
+            .expect("rustc fixture has a diagnostic");
+        let diagnostic = serde_json::from_str::<RustcDiagnostic>(first_line)
+            .expect("pinned rustc JSON fixture parses");
+        let span = diagnostic.spans[0].clone();
+        let location = location(&span, &".".parse().unwrap(), Path::new("."))
+            .expect("rustc fixture span normalizes");
+        assert_eq!(location.start.column, 26);
+        assert_eq!(location.end.as_ref().expect("rustc span end").column, 33);
     }
 
     #[cfg(unix)]

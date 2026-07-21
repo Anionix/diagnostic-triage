@@ -334,6 +334,16 @@ fn response_from_outcome(
     };
     let report = match parse_sarif(&outcome.stdout.bytes) {
         Ok(report) => report,
+        Err(error @ SarifError::UnsupportedColumnKind) => {
+            return finish(
+                request,
+                bounded_events(request, evidence_events),
+                diagnostic_triage_contracts::model::ExecutionStatus::Unsupported,
+                None,
+                total_duration,
+                Some(error.to_string()),
+            );
+        }
         Err(error) => {
             return incomplete(
                 request,
@@ -442,6 +452,8 @@ fn location(
     };
     Ok(Some(diagnostic_triage_contracts::model::Location {
         path,
+        // SARIF endColumn is exclusive. parse_sarif has already required an
+        // explicit unicodeCodePoints declaration for every non-empty run.
         start: Position {
             line: to_u32(range.start_line, "startLine")?,
             column: to_u32(range.start_column, "startColumn")?,
@@ -981,7 +993,7 @@ impl IdFactory {
 mod tests {
     use super::{
         CHECK_CAPABILITY, ProviderError, biome_argv, decode_request, manifest, read_request,
-        response_from_outcome,
+        response_from_outcome, validate_response,
     };
     use crate::process::{CapturedOutput, ProcessOutcome, ProcessState};
     use diagnostic_triage_contracts::{
@@ -1202,6 +1214,62 @@ mod tests {
                 if value.tool.rule_id.as_deref() == Some("assist/source/organizeImports")
                     && value.location.as_ref().is_some_and(|location| location.end.is_some())
         ));
+    }
+
+    #[test]
+    fn locations_preserve_half_open_unicode_points_insertions_and_next_line_end() {
+        let response = response_from_outcome(
+            &request(),
+            Path::new("."),
+            "2.4.15",
+            &complete_output(
+                include_str!("../tests/golden/biome-locations.sarif.json"),
+                1,
+            ),
+            Duration::from_millis(14),
+        );
+        let locations = response
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ProtocolEnvelope::Observation(value) => value.observation.location.as_ref(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(response.completion.status, ExecutionStatus::Complete);
+        assert_eq!(locations.len(), 4);
+        assert_eq!(locations[0].end.as_ref().unwrap().line, 1);
+        assert_eq!(locations[0].end.as_ref().unwrap().column, 3);
+        assert_eq!(locations[1].start, locations[1].end.clone().unwrap());
+        assert_eq!(
+            locations[2].start.line,
+            locations[2].end.as_ref().unwrap().line
+        );
+        assert_eq!(locations[2].end.as_ref().unwrap().column, 4);
+        assert_eq!(locations[3].end.as_ref().unwrap().line, 5);
+        assert_eq!(locations[3].end.as_ref().unwrap().column, 1);
+    }
+
+    #[test]
+    fn utf16_sarif_columns_finish_unsupported_without_observations() {
+        let request = request();
+        let response = response_from_outcome(
+            &request,
+            Path::new("."),
+            "2.4.15",
+            &complete_output(
+                include_str!("../tests/golden/biome-utf16-columns.sarif.json"),
+                1,
+            ),
+            Duration::from_millis(14),
+        );
+
+        assert_eq!(response.completion.status, ExecutionStatus::Unsupported);
+        assert_eq!(response.completion.tool_exit_code.0, None);
+        assert_eq!(response.completion.counts.observations, 0);
+        assert_eq!(response.completion.counts.evidence, 1);
+        validate_response(&request, &response).expect("UNSUPPORTED response satisfies protocol v1");
     }
 
     #[test]

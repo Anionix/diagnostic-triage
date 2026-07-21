@@ -1,0 +1,25 @@
+{
+  "schema_version": "diagnostic-triage.fixture-provenance/v1",
+  "tool": "rustc",
+  "tool_version": "rustc 1.85.1 (4eb161250 2025-03-15)",
+  "release": "1.85.1",
+  "commit_hash": "4eb161250e340c8f48f66e2b929ef4a5bed7c181",
+  "commit_date": "2025-03-15",
+  "host": "aarch64-apple-darwin",
+  "llvm_version": "19.1.7",
+  "nixpkgs_revision": "fca2dbd4c00c3063235e56bb91758e24fc67b7b8",
+  "rust_overlay_revision": "58c6334db52d51fc5dd8877c90b01f00cf8a696b",
+  "working_directory": "repository root",
+  "command": "nix develop --command rustc --crate-name diagnostic_triage_unicode_probe --edition=2021 --error-format=json --json=diagnostic-short --emit=metadata=/dev/null crates/diagnostic-triage-provider-rust/tests/golden/rustc-unicode.rs",
+  "expected_exit_code": 1,
+  "source_path": "crates/diagnostic-triage-provider-rust/tests/golden/rustc-unicode.rs",
+  "source_sha256": "66762a47fb12dd277b4c79ab4940753d516711d0cdac7a7a0162d3dd067a769a",
+  "output_path": "crates/diagnostic-triage-provider-rust/tests/golden/rustc-unicode.jsonl",
+  "output_sha256": "6df2b01a286afd386c7077389cad66d6e37232c1524ba14b62327e62a989137c",
+  "coordinate_probe": {
+    "identifier": "missing",
+    "unicode_scalar_start_column": 26,
+    "utf16_start_column": 27,
+    "utf8_byte_start_column": 29
+  }
+}

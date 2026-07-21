@@ -2,7 +2,7 @@
 
 // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use thiserror::Error;
 
 const MAX_RESULTS: usize = 10_000;
@@ -19,8 +19,28 @@ pub(crate) struct SarifLog {
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub(crate) struct SarifRun {
     pub(crate) tool: SarifTool,
+    #[serde(
+        rename = "columnKind",
+        default,
+        deserialize_with = "deserialize_column_kind"
+    )]
+    pub(crate) column_kind: Option<SarifColumnKind>,
     #[serde(default)]
     pub(crate) results: Vec<SarifResult>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum SarifColumnKind {
+    Utf16CodeUnits,
+    UnicodeCodePoints,
+}
+
+fn deserialize_column_kind<'de, D>(deserializer: D) -> Result<Option<SarifColumnKind>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    SarifColumnKind::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
@@ -98,6 +118,8 @@ const fn one() -> u64 {
 pub enum SarifError {
     #[error("Biome SARIF is malformed: {0}")]
     Malformed(#[from] serde_json::Error),
+    #[error("Biome SARIF columnKind is unsupported; Location v1 requires unicodeCodePoints")]
+    UnsupportedColumnKind,
     #[error("Biome SARIF violates the typed boundary: {0}")]
     Invalid(String),
 }
@@ -119,6 +141,13 @@ pub(crate) fn parse_sarif(input: &[u8]) -> Result<SarifLog, SarifError> {
         return Err(SarifError::Invalid(
             "tool.driver.name must identify Biome".to_owned(),
         ));
+    }
+    // A non-empty SARIF run without columnKind has no authoritative column
+    // unit. Never guess or relabel it at the Location v1 boundary.
+    if run.column_kind == Some(SarifColumnKind::Utf16CodeUnits)
+        || (run.column_kind.is_none() && !run.results.is_empty())
+    {
+        return Err(SarifError::UnsupportedColumnKind);
     }
     if run.results.len() > MAX_RESULTS {
         return Err(SarifError::Invalid(format!(
@@ -196,15 +225,54 @@ mod tests {
     use super::{SarifError, parse_sarif};
 
     #[test]
-    fn rejects_partial_wrong_tool_and_incomplete_end_positions() {
+    fn rejects_partial_wrong_tool_and_invalid_end_positions() {
         assert!(matches!(parse_sarif(b"{"), Err(SarifError::Malformed(_))));
-        for input in [
-            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Other"}},"results":[]}]}"#,
-            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"results":[{"ruleId":"rule","message":{"text":"message"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"x.js"},"region":{"startLine":1,"startColumn":1,"endLine":1}}}]}]}]}"#,
+        let wrong_tool =
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Other"}},"results":[]}]}"#;
+        assert!(matches!(
+            parse_sarif(wrong_tool.as_bytes()),
+            Err(SarifError::Invalid(_))
+        ));
+
+        let implicit_end_column = r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"columnKind":"unicodeCodePoints","results":[{"ruleId":"rule","message":{"text":"message"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"x.js"},"region":{"startLine":1,"startColumn":1,"endLine":1}}}]}]}]}"#;
+        assert!(matches!(
+            parse_sarif(implicit_end_column.as_bytes()),
+            Err(SarifError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn validates_column_kind_without_silently_relabelling_units() {
+        let unicode = r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"columnKind":"unicodeCodePoints","results":[{"ruleId":"rule","message":{"text":"message"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"x.js"},"region":{"startLine":1,"startColumn":1,"endLine":1,"endColumn":2}}}]}]}]}"#;
+        parse_sarif(unicode.as_bytes()).expect("Location v1 column unit is accepted");
+
+        let omitted_empty =
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"results":[]}] }"#;
+        parse_sarif(omitted_empty.as_bytes()).expect("an empty run carries no coordinates");
+
+        for omitted_nonempty in [
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"results":[{"ruleId":"rule","message":{"text":"message"},"locations":[]}]}]}"#,
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"results":[{"ruleId":"rule","message":{"text":"message"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"x.js"},"region":{"startLine":1,"startColumn":1,"endLine":1,"endColumn":2}}}]}]}]}"#,
         ] {
             assert!(matches!(
-                parse_sarif(input.as_bytes()),
-                Err(SarifError::Invalid(_))
+                parse_sarif(omitted_nonempty.as_bytes()),
+                Err(SarifError::UnsupportedColumnKind)
+            ));
+        }
+
+        let utf16 = r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"columnKind":"utf16CodeUnits","results":[]}] }"#;
+        assert!(matches!(
+            parse_sarif(utf16.as_bytes()),
+            Err(SarifError::UnsupportedColumnKind)
+        ));
+
+        for invalid in [
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"columnKind":"bytes","results":[]}] }"#,
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"columnKind":null,"results":[]}] }"#,
+        ] {
+            assert!(matches!(
+                parse_sarif(invalid.as_bytes()),
+                Err(SarifError::Malformed(_))
             ));
         }
     }

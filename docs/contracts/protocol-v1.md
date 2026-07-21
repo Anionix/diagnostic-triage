@@ -188,6 +188,35 @@ Workspace and target paths are repository-relative POSIX paths. `.` is allowed
 for the workspace root. Absolute paths, Windows drive paths, backslashes, NUL,
 and a `..` segment are invalid. An Evidence path is validated by the same rule.
 
+### Location ranges and columns
+
+`Location.start` and `Location.end` are one-based positions. A Location with an
+end is the half-open range `[start, end)`: `start` identifies the first included
+code point and `end` identifies the first excluded code point. A next-line
+endpoint at column 1 therefore includes the preceding line's newline sequence.
+The end may equal the start; that explicit zero-width range is an insertion
+point. When `end` is absent, the Location denotes only the point at `start` and
+must not be expanded to a token, line, or file range by inference.
+
+Every v1 column counts Unicode code points from the beginning of its line.
+Column 1 is before the first code point and column N+1 is after N code points.
+Columns are not grapheme clusters, terminal display cells, UTF-8 bytes, or
+UTF-16 code units. A Provider whose source tool uses another unit must convert
+from authoritative source text or reject the diagnostic as unsupported; it
+must not relabel or guess the column unit.
+
+The exact Nix-locked Ruff and rustc versions have tool-produced non-BMP
+fixtures proving that their JSON character columns use this unit. Biome is not
+present in the locked shell, so the Provider does not infer a unit from the
+tool name or version. It accepts an explicit SARIF `unicodeCodePoints`, rejects
+an explicit `utf16CodeUnits`, and treats an omitted `run.columnKind` on every
+non-empty run as `UNSUPPORTED`. Omission is accepted only for an empty result
+set, where no coordinate can cross the boundary. Unknown values and explicit
+`null` are malformed SARIF. The Provider preserves the SARIF end-position
+boundary: a region with both `endLine` and `endColumn` omitted has no end,
+while a partial end position is invalid. When both are present, it copies them
+as the exclusive v1 endpoint; it does not infer a missing line-end position.
+
 ## Completion semantics
 
 - `COMPLETE` means the adapter finished its requested operation and has an

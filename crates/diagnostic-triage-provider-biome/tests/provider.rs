@@ -39,7 +39,7 @@ impl FakeBiome {
                 "#!/bin/sh\n",
                 "if [ \"$1\" = \"--version\" ]; then printf 'Version: 2.4.15\\n'; exit 0; fi\n",
                 "if [ \"$1\" != \"check\" ] || [ \"$2\" != \"--reporter=sarif\" ] || [ \"$3\" != \"--max-diagnostics=none\" ] || [ \"$4\" != \"--no-errors-on-unmatched\" ] || [ \"$5\" != \"--\" ] || [ \"$6\" != \"src/main.ts\" ]; then printf 'bad argv' >&2; exit 2; fi\n",
-                "printf '%s' '{\"version\":\"2.1.0\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"Biome\"}},\"results\":[{\"ruleId\":\"lint/suspicious/noDebugger\",\"level\":\"error\",\"message\":{\"text\":\"Unexpected debugger.\"},\"locations\":[{\"physicalLocation\":{\"artifactLocation\":{\"uri\":\"src/main.ts\"},\"region\":{\"startLine\":2,\"startColumn\":1,\"endLine\":2,\"endColumn\":9}}}]}]}]}'\n",
+                "printf '%s' '{\"version\":\"2.1.0\",\"runs\":[{\"tool\":{\"driver\":{\"name\":\"Biome\"}},\"columnKind\":\"unicodeCodePoints\",\"results\":[{\"ruleId\":\"lint/suspicious/noDebugger\",\"level\":\"error\",\"message\":{\"text\":\"Unexpected debugger.\"},\"locations\":[{\"physicalLocation\":{\"artifactLocation\":{\"uri\":\"src/main.ts\"},\"region\":{\"startLine\":2,\"startColumn\":1,\"endLine\":2,\"endColumn\":9}}}]}]}]}'\n",
                 "exit 1\n"
             ),
         )

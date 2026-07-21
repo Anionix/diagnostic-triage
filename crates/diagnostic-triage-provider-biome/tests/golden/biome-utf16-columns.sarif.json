@@ -1,0 +1,1 @@
+{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"columnKind":"utf16CodeUnits","results":[{"ruleId":"lint/style/useConst","level":"warning","message":{"text":"Ambiguous non-BMP column 😀"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"src/unicode.ts"},"region":{"startLine":1,"startColumn":3,"endLine":1,"endColumn":5}}}]}]}]}
