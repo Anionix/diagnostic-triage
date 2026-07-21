@@ -52,6 +52,7 @@ fn finding_decision_location_and_complete_execution_match_golden() {
         "https://docs.oasis-open.org/sarif/sarif/v2.1.0/os/schemas/sarif-schema-2.1.0.json"
     );
     assert_eq!(value["version"], "2.1.0");
+    assert_eq!(value["runs"][0]["columnKind"], "unicodeCodePoints");
     assert_eq!(
         value["runs"][0]["tool"]["driver"]["name"],
         "diagnostic-triage"
@@ -102,7 +103,7 @@ fn incomplete_and_unsupported_executions_are_notifications() {
     assert_eq!(
         incomplete.pointer("/runs/0/invocations/0/toolExecutionNotifications/0"),
         Some(&json!({
-            "descriptor": {"id": "diagnostic-triage.execution.incomplete"},
+            "descriptor": {"id": "diagnostic-triage.execution.incomplete", "index": 0},
             "level": "error",
             "message": {"text": "provider output ended before completion"}
         }))
@@ -155,6 +156,32 @@ fn point_locations_emit_an_explicit_zero_width_sarif_region() {
             "startColumn": 12,
             "endLine": 7,
             "endColumn": 12
+        })
+    );
+}
+
+#[test]
+fn non_bmp_text_locations_declare_unicode_code_point_columns() {
+    let mut report = report("valid-report.json");
+    report.observations[0].message = "Unexpected name after 😀".to_owned();
+    report.findings[0].message = "Unexpected name after 😀".to_owned();
+    for location in [
+        report.observations[0].location.as_mut().unwrap(),
+        report.findings[0].location.as_mut().unwrap(),
+    ] {
+        location.start.column = 2;
+        location.end.as_mut().unwrap().column = 3;
+    }
+    let value = encoded_value(report);
+
+    assert_eq!(value["runs"][0]["columnKind"], "unicodeCodePoints");
+    assert_eq!(
+        value["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["region"],
+        json!({
+            "startLine": 7,
+            "startColumn": 2,
+            "endLine": 7,
+            "endColumn": 3
         })
     );
 }

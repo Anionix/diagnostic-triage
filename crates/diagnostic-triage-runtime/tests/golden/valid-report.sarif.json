@@ -22,6 +22,7 @@
         }
       },
       "automationDetails": { "id": "019f7e95-0000-7000-8000-000000000101" },
+      "columnKind": "unicodeCodePoints",
       "invocations": [
         {
           "executionSuccessful": true,

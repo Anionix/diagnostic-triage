@@ -22,12 +22,13 @@
         }
       },
       "automationDetails": { "id": "019f7e95-0000-7000-8000-000000000401" },
+      "columnKind": "unicodeCodePoints",
       "invocations": [
         {
           "executionSuccessful": false,
           "toolExecutionNotifications": [
             {
-              "descriptor": { "id": "diagnostic-triage.execution.unsupported" },
+              "descriptor": { "id": "diagnostic-triage.execution.unsupported", "index": 0 },
               "level": "error",
               "message": { "text": "required capability fix.propose/v1 is unsupported" }
             }

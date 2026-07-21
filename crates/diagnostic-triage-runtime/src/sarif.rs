@@ -143,7 +143,15 @@ impl<'a> SarifLog<'a> {
                     .or_insert_with(|| SarifNotificationDescriptor::new(metadata));
             }
         }
-        let invocations = executions.into_iter().map(SarifInvocation::new).collect();
+        let notification_indexes = notification_descriptors
+            .keys()
+            .enumerate()
+            .map(|(index, id)| (*id, index))
+            .collect::<BTreeMap<_, _>>();
+        let invocations = executions
+            .into_iter()
+            .map(|execution| SarifInvocation::new(execution, &notification_indexes))
+            .collect();
         let run = SarifRun {
             tool: SarifTool {
                 driver: SarifDriver {
@@ -160,6 +168,7 @@ impl<'a> SarifLog<'a> {
             automation_details: SarifAutomationDetails {
                 id: report.session_id.as_str(),
             },
+            column_kind: "unicodeCodePoints",
             invocations,
             results,
             properties: SarifRunProperties {
@@ -180,6 +189,7 @@ impl<'a> SarifLog<'a> {
 struct SarifRun<'a> {
     tool: SarifTool<'a>,
     automation_details: SarifAutomationDetails<'a>,
+    column_kind: &'static str,
     invocations: Vec<SarifInvocation<'a>>,
     results: Vec<SarifResult<'a>>,
     properties: SarifRunProperties<'a>,
@@ -502,11 +512,14 @@ struct SarifInvocation<'a> {
 }
 
 impl<'a> SarifInvocation<'a> {
-    fn new(execution: &'a Execution) -> Self {
+    fn new(execution: &'a Execution, notification_indexes: &BTreeMap<&'static str, usize>) -> Self {
         let notification = notification_metadata(&execution.status);
         let tool_execution_notifications = notification
             .map(|metadata| SarifNotification {
-                descriptor: SarifDescriptorReference { id: metadata.id },
+                descriptor: SarifDescriptorReference {
+                    id: metadata.id,
+                    index: notification_indexes[metadata.id],
+                },
                 level: if execution.required {
                     "error"
                 } else {
@@ -556,6 +569,7 @@ struct SarifNotification<'a> {
 #[derive(Serialize)]
 struct SarifDescriptorReference {
     id: &'static str,
+    index: usize,
 }
 
 #[derive(Serialize)]
