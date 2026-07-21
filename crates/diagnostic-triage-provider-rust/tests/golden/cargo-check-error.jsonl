@@ -1,0 +1,2 @@
+{"reason":"compiler-message","message":{"message":"mismatched types","code":{"code":"E0308","explanation":null},"level":"error","spans":[{"file_name":"src/lib.rs","line_start":3,"line_end":3,"column_start":20,"column_end":21,"is_primary":true}],"children":[{"message":"expected String, found integer","level":"note"}],"rendered":"error[E0308]: mismatched types\n --> src/lib.rs:3:20\n  |\n3 | let value: String = 7;\n  |                     ^ expected String, found integer\n"}}
+{"reason":"build-finished","success":false}
