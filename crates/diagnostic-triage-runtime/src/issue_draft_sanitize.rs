@@ -521,11 +521,18 @@ fn quoted_secret_at_inner(
 fn json_quoted_secret_at(neutralized: &NeutralizedText, index: usize) -> Option<(usize, usize)> {
     let value = neutralized.as_str();
     let bytes = value.as_bytes();
-    if bytes.get(index) != Some(&b'"') || !is_json_key_boundary(neutralized, index) {
+    let escaped_key = if bytes.get(index) == Some(&b'"') {
+        false
+    } else if bytes.get(index) == Some(&b'\\') && bytes.get(index + 1) == Some(&b'"') {
+        true
+    } else {
+        return None;
+    };
+    if !is_json_key_boundary(neutralized, index) {
         return None;
     }
 
-    let mut cursor = index + 1;
+    let mut cursor = index + 1 + usize::from(escaped_key);
     let mut normalized = String::with_capacity(16);
     let mut needs_alphanumeric = false;
     while let Some(byte) = bytes.get(cursor).copied() {
@@ -547,23 +554,56 @@ fn json_quoted_secret_at(neutralized: &NeutralizedText, index: usize) -> Option<
             break;
         }
     }
-    if needs_alphanumeric || bytes.get(cursor) != Some(&b'"') || !is_secret_key(&normalized) {
+    let closing_key_width =
+        if escaped_key && bytes.get(cursor) == Some(&b'\\') && bytes.get(cursor + 1) == Some(&b'"')
+        {
+            2
+        } else if !escaped_key && bytes.get(cursor) == Some(&b'"') {
+            1
+        } else {
+            return None;
+        };
+    let authorization = normalized == "authorization";
+    if needs_alphanumeric || (!authorization && !is_secret_key(&normalized)) {
         return None;
     }
 
-    cursor = skip_json_whitespace(neutralized, cursor + 1);
+    cursor = skip_json_whitespace(neutralized, cursor + closing_key_width);
     if bytes.get(cursor) != Some(&b':') {
         return None;
     }
     cursor = skip_json_whitespace(neutralized, cursor + 1);
-    if bytes.get(cursor) != Some(&b'"') {
+    let escaped_value = if bytes.get(cursor) == Some(&b'"') {
+        false
+    } else if bytes.get(cursor) == Some(&b'\\') && bytes.get(cursor + 1) == Some(&b'"') {
+        true
+    } else {
         return None;
-    }
-    let start = cursor + 1;
+    };
+    let start = cursor + 1 + usize::from(escaped_value);
     if start >= bytes.len() {
         return None;
     }
-    let end = raw_quoted_value_end(bytes, start, b'"');
+    let end = if escaped_value {
+        escaped_quoted_value_end(bytes, start, b'"')
+    } else {
+        raw_quoted_value_end(bytes, start, b'"')
+    };
+    if authorization {
+        // LLM contract: JSON_AUTH_VALUE -> ASSIGNMENT_RECOGNIZED -> VALUE_BOUNDED | REJECTED.
+        let (assignment_start, crossed_record_boundary) =
+            skip_authorization_value_whitespace(neutralized, start);
+        if crossed_record_boundary || assignment_start >= end {
+            return None;
+        }
+        let separator = assignment_separator_at(value, assignment_start, Some(neutralized))?;
+        return authorization_assignment_credential_at(
+            neutralized,
+            assignment_start,
+            separator,
+            end,
+        );
+    }
     (end > start).then_some((start, end))
 }
 
@@ -627,6 +667,7 @@ fn authorization_secret_at(neutralized: &NeutralizedText, index: usize) -> Optio
                     neutralized,
                     cursor,
                     assignment_separator,
+                    value.len(),
                 );
             }
             cursor
@@ -760,43 +801,62 @@ fn authorization_assignment_credential_at(
     neutralized: &NeutralizedText,
     start: usize,
     separator: usize,
+    limit: usize,
 ) -> Option<(usize, usize)> {
     let value = neutralized.as_str();
     let bytes = value.as_bytes();
+    let limit = limit.min(bytes.len());
+    (separator < limit).then_some(())?;
     let (mut cursor, crossed_record_boundary) =
         skip_authorization_value_whitespace(neutralized, separator + 1);
+    (cursor < limit).then_some(())?;
     if crossed_record_boundary && looks_like_assignment(value, cursor, Some(neutralized)) {
         return None;
     }
-    if let Some(scheme_end) = authorization_scheme_end(neutralized, cursor) {
-        let credential_start = skip_provenance_whitespace(neutralized, scheme_end);
+    // LLM contract: AUTH_SCHEME -> SAME_RECORD_CREDENTIAL | RECORD_BOUNDARY_PRESERVED.
+    if let Some(scheme_end) =
+        authorization_scheme_end(neutralized, cursor).filter(|end| *end <= limit)
+    {
+        let (credential_start, crossed_record_boundary) =
+            skip_authorization_value_whitespace(neutralized, scheme_end);
         (credential_start > scheme_end).then_some(())?;
+        if crossed_record_boundary
+            && credential_start < limit
+            && looks_like_assignment(value, credential_start, Some(neutralized))
+        {
+            return Some((start, scheme_end));
+        }
+        (credential_start < limit).then_some(())?;
         cursor = credential_start;
     }
-    let (content_start, content_end, redaction_end) =
-        if let Some(quote) = bytes.get(cursor).copied().filter(|byte| is_quote(*byte)) {
-            let content_start = cursor + 1;
-            let content_end = raw_quoted_value_end(bytes, content_start, quote);
-            let redaction_end = content_end
-                + usize::from(bytes.get(content_end).is_some_and(|byte| *byte == quote));
-            (content_start, content_end, redaction_end)
-        } else if bytes.get(cursor) == Some(&b'\\')
-            && bytes.get(cursor + 1).is_some_and(|byte| is_quote(*byte))
-        {
-            let quote = bytes
-                .get(cursor + 1)
-                .copied()
-                .expect("escaped quote checked above");
-            let content_start = cursor + 2;
-            let content_end = escaped_quoted_value_end(bytes, content_start, quote);
-            let has_closing_quote = bytes.get(content_end) == Some(&b'\\')
-                && bytes.get(content_end + 1) == Some(&quote);
-            let redaction_end = content_end + usize::from(has_closing_quote) * 2;
-            (content_start, content_end, redaction_end)
-        } else {
-            let content_end = unquoted_value_end(value, cursor, Some(neutralized));
-            (cursor, content_end, content_end)
-        };
+    let (content_start, content_end, redaction_end) = if let Some(quote) =
+        bytes.get(cursor).copied().filter(|byte| is_quote(*byte))
+    {
+        let content_start = cursor + 1;
+        let content_end = raw_quoted_value_end(&bytes[..limit], content_start, quote);
+        let redaction_end = content_end
+            + usize::from(
+                content_end < limit && bytes.get(content_end).is_some_and(|byte| *byte == quote),
+            );
+        (content_start, content_end, redaction_end)
+    } else if bytes.get(cursor) == Some(&b'\\')
+        && bytes.get(cursor + 1).is_some_and(|byte| is_quote(*byte))
+    {
+        let quote = bytes
+            .get(cursor + 1)
+            .copied()
+            .expect("escaped quote checked above");
+        let content_start = cursor + 2;
+        let content_end = escaped_quoted_value_end(&bytes[..limit], content_start, quote);
+        let has_closing_quote = content_end + 1 < limit
+            && bytes.get(content_end) == Some(&b'\\')
+            && bytes.get(content_end + 1) == Some(&quote);
+        let redaction_end = content_end + usize::from(has_closing_quote) * 2;
+        (content_start, content_end, redaction_end)
+    } else {
+        let content_end = unquoted_value_end_bounded(value, cursor, Some(neutralized), limit);
+        (cursor, content_end, content_end)
+    };
     (content_end > content_start).then_some((start, redaction_end))
 }
 
@@ -920,9 +980,18 @@ fn escaped_quoted_value_end(bytes: &[u8], start: usize, quote: u8) -> usize {
 }
 
 fn unquoted_value_end(value: &str, start: usize, neutralized: Option<&NeutralizedText>) -> usize {
+    unquoted_value_end_bounded(value, start, neutralized, value.len())
+}
+
+fn unquoted_value_end_bounded(
+    value: &str,
+    start: usize,
+    neutralized: Option<&NeutralizedText>,
+    limit: usize,
+) -> usize {
     let bytes = value.as_bytes();
     let mut cursor = start;
-    while cursor < value.len() {
+    while cursor < limit.min(value.len()) {
         if neutralized
             .and_then(|text| text.marker_at(cursor))
             .is_some_and(is_assignment_whitespace_marker)
@@ -1745,6 +1814,90 @@ mod tests {
                 "bound for {input:?}"
             );
         }
+    }
+
+    fn assert_review_followup_authorization_cases(cases: &[(&str, &str)]) {
+        for &(input, expected) in cases {
+            let neutralized_bytes = neutralize_external_text(input, 4096)
+                .unwrap()
+                .as_str()
+                .len();
+            let required_bytes = neutralized_bytes.max(expected.len());
+            assert_eq!(
+                sanitize_external_text(input, required_bytes)
+                    .unwrap_or_else(|error| panic!("input {input:?}: {error}"))
+                    .as_str(),
+                expected,
+                "input {input:?}"
+            );
+            assert_eq!(
+                sanitize_external_text(input, required_bytes - 1),
+                Err(SanitizeError::OutputLimitExceeded {
+                    max_bytes: required_bytes - 1,
+                }),
+                "bound for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn review_followup_authorization_json_assignment_values() {
+        let cases = [
+            (
+                r#"{"Authorization":"Credential=abcdef","name":"ok"}"#,
+                r#"{"Authorization":"[REDACTED_SECRET]","name":"ok"}"#,
+            ),
+            (
+                r#"{ "Authorization" : "token : abcdef", "name" : "ok" }"#,
+                r#"{ "Authorization" : "[REDACTED_SECRET]", "name" : "ok" }"#,
+            ),
+            (
+                r#"{\"Authorization\":\"Credential=abcdef\",\"name\":\"ok\"}"#,
+                r#"{\"Authorization\":\"[REDACTED_SECRET]\",\"name\":\"ok\"}"#,
+            ),
+            (
+                r#"{"Authorization":"Credential=\"abcdef\"","name":"ok"}"#,
+                r#"{"Authorization":"[REDACTED_SECRET]","name":"ok"}"#,
+            ),
+            (
+                r#"{"Authorization":"  token=Bearer abcdef","name":"ok"}"#,
+                r#"{"Authorization":"  [REDACTED_SECRET]","name":"ok"}"#,
+            ),
+            (
+                r#"{"Authorization":"Credential=[CONTROL-U+000A]next=ok","name":"ok"}"#,
+                r#"{"Authorization":"[REDACTED_SECRET]","name":"ok"}"#,
+            ),
+            (
+                r#"{"Authorization":"Credential=abcdef"#,
+                r#"{"Authorization":"[REDACTED_SECRET]"#,
+            ),
+        ];
+
+        assert_review_followup_authorization_cases(&cases);
+    }
+
+    #[test]
+    fn review_followup_authorization_scheme_record_boundaries() {
+        let cases = [
+            (
+                "Authorization: token=Bearer\nnext=ok",
+                "Authorization: [REDACTED_SECRET][CONTROL-U+000A]next=ok",
+            ),
+            (
+                "Authorization=Credential=Basic\rnext=ok",
+                "Authorization=[REDACTED_SECRET][CONTROL-U+000D]next=ok",
+            ),
+            (
+                "Authorization: token=Bearer\r\nnext=ok",
+                "Authorization: [REDACTED_SECRET][CONTROL-U+000D][CONTROL-U+000A]next=ok",
+            ),
+            (
+                "Authorization=token=Basic abcdef\nnext=ok",
+                "Authorization=[REDACTED_SECRET][CONTROL-U+000A]next=ok",
+            ),
+        ];
+
+        assert_review_followup_authorization_cases(&cases);
     }
 
     #[test]
