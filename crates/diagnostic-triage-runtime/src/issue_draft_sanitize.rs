@@ -2,6 +2,36 @@
 
 // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
 
+const PROVIDER_TOKEN_PREFIXES: &[(&str, usize, bool)] = &[
+    ("ghp_", 20, false),
+    ("gho_", 20, false),
+    ("ghu_", 20, false),
+    ("ghs_", 20, true),
+    ("ghr_", 20, false),
+    ("github_pat_", 20, false),
+    ("glpat-", 20, false),
+    ("gloas-", 20, false),
+    ("gldt-", 20, false),
+    ("glrt-", 20, false),
+    ("glrtr-", 20, false),
+    ("glcbt-", 20, false),
+    ("glptt-", 20, false),
+    ("glft-", 20, false),
+    ("glimt-", 20, false),
+    ("glagent-", 20, false),
+    ("glwt-", 20, false),
+    ("glsoat-", 20, false),
+    ("glffct-", 20, false),
+    ("npm_", 32, false),
+    ("sk-", 32, false),
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SanitizationMode {
+    ExternalText,
+    Identifier,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SanitizedText(String);
 
@@ -115,8 +145,23 @@ pub(crate) fn sanitize_external_text(
     value: &str,
     max_bytes: usize,
 ) -> Result<SanitizedText, SanitizeError> {
+    sanitize_text(value, max_bytes, SanitizationMode::ExternalText)
+}
+
+pub(crate) fn sanitize_identifier_text(
+    value: &str,
+    max_bytes: usize,
+) -> Result<SanitizedText, SanitizeError> {
+    sanitize_text(value, max_bytes, SanitizationMode::Identifier)
+}
+
+fn sanitize_text(
+    value: &str,
+    max_bytes: usize,
+    mode: SanitizationMode,
+) -> Result<SanitizedText, SanitizeError> {
     let neutralized = neutralize_external_text(value, max_bytes)?;
-    redact_secret_assignments(&neutralized, max_bytes)
+    redact_secret_assignments(&neutralized, max_bytes, mode)
 }
 
 fn neutralize_external_text(
@@ -271,7 +316,9 @@ fn is_secret_key(value: &str) -> bool {
 fn redact_secret_assignments(
     neutralized: &NeutralizedText,
     max_bytes: usize,
+    mode: SanitizationMode,
 ) -> Result<SanitizedText, SanitizeError> {
+    // LLM contract: NEUTRALIZED -> EXPLICIT_REDACTED -> SHAPE_REDACTED | IDENTIFIER_PRESERVED.
     let value = neutralized.as_str();
     let mut output = BoundedText::new(value.len(), max_bytes);
     let mut index = 0;
@@ -280,6 +327,11 @@ fn redact_secret_assignments(
             .or_else(|| quoted_secret_at(value, index))
             .or_else(|| json_quoted_secret_at(neutralized, index))
             .or_else(|| authorization_secret_at(neutralized, index))
+            .or_else(|| {
+                (mode == SanitizationMode::ExternalText)
+                    .then(|| token_shape_at(value, index))
+                    .flatten()
+            })
         {
             output.push_str(&value[index..start])?;
             output.push_str("[REDACTED_SECRET]")?;
@@ -291,6 +343,74 @@ fn redact_secret_assignments(
         }
     }
     Ok(output.finish())
+}
+
+fn token_shape_at(value: &str, index: usize) -> Option<(usize, usize)> {
+    is_word_boundary(value, index, true).then_some(())?;
+    let end = provider_token_end(value, index)
+        .or_else(|| jwt_token_end(value, index))
+        .or_else(|| generic_token_end(value, index))?;
+    Some((index, end))
+}
+
+fn provider_token_end(value: &str, index: usize) -> Option<usize> {
+    const MAX_PROVIDER_BYTES: usize = 1_024;
+    let tail = value.get(index..)?;
+    let &(prefix, minimum, allow_dot) = PROVIDER_TOKEN_PREFIXES
+        .iter()
+        .find(|(prefix, _, _)| tail.starts_with(prefix))?;
+    let end = bounded_token_end(value, index, MAX_PROVIDER_BYTES, allow_dot)?;
+    (end - index - prefix.len() >= minimum && is_word_boundary(value, end, false)).then_some(end)
+}
+
+fn jwt_token_end(value: &str, index: usize) -> Option<usize> {
+    const MAX_JWT_BYTES: usize = 1_024;
+    value.get(index..)?.starts_with("eyJ").then_some(())?;
+    let mut cursor = index;
+    for segment in 0..3 {
+        let remaining = MAX_JWT_BYTES.checked_sub(cursor - index)?;
+        let end = bounded_token_end(value, cursor, remaining, false)?;
+        (end > cursor).then_some(())?;
+        cursor = end;
+        if segment < 2 {
+            (value.as_bytes().get(cursor) == Some(&b'.')).then_some(())?;
+            cursor += 1;
+        }
+    }
+    (cursor - index >= 32 && is_word_boundary(value, cursor, false)).then_some(cursor)
+}
+
+fn generic_token_end(value: &str, index: usize) -> Option<usize> {
+    const MIN_BYTES: usize = 32;
+    const MAX_BYTES: usize = 128;
+    let end = bounded_token_end(value, index, MAX_BYTES, false)?;
+    let token = &value.as_bytes()[index..end];
+    let diverse = token.iter().any(u8::is_ascii_lowercase)
+        && token.iter().any(u8::is_ascii_uppercase)
+        && token.iter().any(u8::is_ascii_digit)
+        && token.iter().any(|byte| matches!(byte, b'_' | b'-'));
+    ((MIN_BYTES..=MAX_BYTES).contains(&token.len())
+        && diverse
+        && is_word_boundary(value, end, false))
+    .then_some(end)
+}
+
+fn bounded_token_end(
+    value: &str,
+    index: usize,
+    max_bytes: usize,
+    allow_dot: bool,
+) -> Option<usize> {
+    let mut cursor = index;
+    while value.as_bytes().get(cursor).is_some_and(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') || (allow_dot && *byte == b'.')
+    }) {
+        if cursor - index == max_bytes {
+            return None;
+        }
+        cursor += 1;
+    }
+    Some(cursor)
 }
 
 fn unquoted_secret_at(value: &str, index: usize) -> Option<(usize, usize)> {
@@ -701,8 +821,9 @@ fn is_pinned_format_character(character: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        GeneratedMarker, MarkerKind, SanitizeError, neutralize_external_text, quoted_secret_at,
-        recognize_secret_key, sanitize_external_text, unquoted_secret_at,
+        GeneratedMarker, MarkerKind, PROVIDER_TOKEN_PREFIXES, SanitizeError,
+        neutralize_external_text, quoted_secret_at, recognize_secret_key, sanitize_external_text,
+        sanitize_identifier_text, unquoted_secret_at,
     };
 
     #[test]
@@ -1147,6 +1268,77 @@ mod tests {
         );
 
         let input = "basicish bearerish authorizationish ".repeat(10_000);
+        let actual = sanitize_external_text(&input, input.len()).unwrap();
+        assert_eq!(actual.as_str(), input);
+    }
+
+    #[test]
+    fn redacts_documented_provider_and_jwt_token_shapes() {
+        // Sources: docs.github.com/.../about-authentication-to-github#githubs-token-formats,
+        // docs.gitlab.com/security/tokens/#token-prefixes, and
+        // github.blog/changelog/2021-09-23-npm-has-a-new-access-token-format/.
+        // Payload lengths and `sk-` are this sanitizer's explicit bounded v1 contract.
+        for &(prefix, minimum, allow_dot) in PROVIDER_TOKEN_PREFIXES {
+            let mut payload = "A1".repeat(minimum.div_ceil(2));
+            if allow_dot {
+                payload.insert(minimum / 2, '.');
+            }
+            let input = format!("before {prefix}{payload}, after");
+            let expected = "before [REDACTED_SECRET], after";
+            let actual = sanitize_external_text(&input, 4096).unwrap();
+            assert_eq!(actual.as_str(), expected);
+        }
+
+        // rfc-editor.org/rfc/rfc7519.html: JWS compact form has three base64url parts.
+        let jwt = "eyJhbGciOiJIUzI1NiJ9.e30.c2lnbmF0dXJlMDEyMzQ1Njc4OTA";
+        let actual = sanitize_external_text(jwt, 4096).unwrap();
+        assert_eq!(actual.as_str(), "[REDACTED_SECRET]");
+
+        let generic = "Ab1_".repeat(8);
+        let actual = sanitize_external_text(&generic, 4096).unwrap();
+        assert_eq!(actual.as_str(), "[REDACTED_SECRET]");
+    }
+
+    #[test]
+    fn preserves_identifiers_and_rejects_token_shape_spoofs() {
+        let finding_id = "019f7e95-0000-7000-8000-000000000105";
+        let digest = "a".repeat(64);
+        let generic = "Ab1_".repeat(8);
+        for identifier in [
+            finding_id,
+            digest.as_str(),
+            "F821",
+            "sk-linter",
+            "ghp_A1A1A1A1A1A1A1A1A1A1",
+            generic.as_str(),
+        ] {
+            let actual = sanitize_identifier_text(identifier, 4096).unwrap();
+            assert_eq!(actual.as_str(), identifier);
+        }
+
+        for input in [
+            finding_id,
+            digest.as_str(),
+            "sk-linter",
+            "ghp_short",
+            "a.b.c",
+        ] {
+            let actual = sanitize_external_text(input, 4096).unwrap();
+            assert_eq!(actual.as_str(), input);
+        }
+        let actual = sanitize_external_text("ghp_A1A1A1A1A1\u{200b}A1A1A1A1A1", 4096).unwrap();
+        assert_eq!(actual.as_str(), "ghp_A1A1A1A1A1[FORMAT-U+200B]A1A1A1A1A1");
+    }
+
+    #[test]
+    fn token_scanning_is_bounded_on_long_and_repeated_prefixes() {
+        for input in ["A".repeat(31), "A".repeat(129)] {
+            assert_eq!(
+                sanitize_external_text(&input, 4096).unwrap().as_str(),
+                input
+            );
+        }
+        let input = "ghp_short sk-linter not.a.jwt ".repeat(10_000);
         let actual = sanitize_external_text(&input, input.len()).unwrap();
         assert_eq!(actual.as_str(), input);
     }
