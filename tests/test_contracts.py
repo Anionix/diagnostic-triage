@@ -474,10 +474,10 @@ def validate_report(
                 execution = execution_by_id[identifier]
                 if execution["status"] != "COMPLETE":
                     raise ContractError("verified finding cites incomplete execution")
-            if execution["adapter_kind"] != "PROVIDER":
-                raise ContractError(
-                    "verified finding cites a non-provider execution"
-                )
+                if execution["adapter_kind"] != "PROVIDER":
+                    raise ContractError(
+                        "verified finding cites a non-provider execution"
+                    )
 
     referenced_observations = {
         observation_id
