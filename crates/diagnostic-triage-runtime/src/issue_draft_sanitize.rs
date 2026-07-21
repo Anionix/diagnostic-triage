@@ -219,6 +219,7 @@ struct SecretKeyMatch {
 }
 
 fn recognize_secret_key(value: &str, index: usize) -> Option<SecretKeyMatch> {
+    const GITLAB_SESSION_KEY: &str = "_gitlab_session";
     const MAX_SPAN: usize = 256;
     const MAX_MARKERS: u8 = 8;
 
@@ -232,6 +233,14 @@ fn recognize_secret_key(value: &str, index: usize) -> Option<SecretKeyMatch> {
         }
     }) {
         return None;
+    }
+
+    if value.get(index..)?.starts_with(GITLAB_SESSION_KEY) {
+        let end = index + GITLAB_SESSION_KEY.len();
+        // LLM contract: COOKIE_KEY -> EXACT_EQUALS -> VALUE_REDACTED; near miss -> GENERIC_KEY_SCAN.
+        if bytes.get(end) == Some(&b'=') {
+            return Some(SecretKeyMatch { end, cli_dashes: 0 });
+        }
     }
 
     let mut cursor = index;
@@ -1174,6 +1183,77 @@ mod tests {
         for index in (0..input.len()).step_by(prefix.len()) {
             assert_eq!(recognize_secret_key(&input, index), None);
         }
+    }
+
+    #[test]
+    fn redacts_documented_gitlab_session_cookie_at_exact_boundaries() {
+        // Sources: docs.gitlab.com/security/tokens/#token-prefixes and
+        // docs.gitlab.com/api/rest/authentication/#session-cookie.
+        let cases = [
+            (
+                "_gitlab_session=opaquevalue",
+                "_gitlab_session=[REDACTED_SECRET]",
+            ),
+            (
+                "_gitlab_session=\"opaquevalue\"",
+                "_gitlab_session=\"[REDACTED_SECRET]\"",
+            ),
+            (
+                "_gitlab_session='opaquevalue'",
+                "_gitlab_session='[REDACTED_SECRET]'",
+            ),
+            (
+                "Cookie: a=1;_gitlab_session=opaquevalue; theme=dark",
+                "Cookie: a=1;_gitlab_session=[REDACTED_SECRET]; theme=dark",
+            ),
+            (
+                "Set-Cookie: _gitlab_session=opaquevalue; Path=/; HttpOnly",
+                "Set-Cookie: _gitlab_session=[REDACTED_SECRET]; Path=/; HttpOnly",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                sanitize_external_text(input, 4096).unwrap().as_str(),
+                expected,
+                "input {input:?}"
+            );
+        }
+
+        for input in [
+            "x_gitlab_session=opaquevalue",
+            "-_gitlab_session=opaquevalue",
+            "_gitlab_sessions=opaquevalue",
+            "_gitlab_session_id=opaquevalue",
+            "_gitlab-session=opaquevalue",
+            "_GITLAB_SESSION=opaquevalue",
+            "_gitlab_session: opaquevalue",
+            "_gitlab_session =opaquevalue",
+            "_gitlab_session=",
+        ] {
+            assert_eq!(sanitize_external_text(input, 4096).unwrap().as_str(), input);
+        }
+
+        let expected = "_gitlab_session=[REDACTED_SECRET]";
+        assert_eq!(
+            sanitize_external_text("_gitlab_session=x", expected.len())
+                .unwrap()
+                .as_str(),
+            expected
+        );
+        assert_eq!(
+            sanitize_external_text("_gitlab_session=x", expected.len() - 1),
+            Err(SanitizeError::OutputLimitExceeded {
+                max_bytes: expected.len() - 1,
+            })
+        );
+
+        let repeated = "_gitlab_sessionx=public;".repeat(10_000);
+        assert_eq!(
+            sanitize_external_text(&repeated, repeated.len())
+                .unwrap()
+                .as_str(),
+            repeated
+        );
     }
 
     #[test]
