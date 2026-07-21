@@ -517,6 +517,115 @@ fn nonzero_findings_exit_is_complete_and_cross_field_valid() {
 
 #[cfg(unix)]
 #[test]
+fn nested_workspace_targets_are_resolved_from_the_repository_root() {
+    let mut fake = FakeRuff::new(
+        r#"if [ ! -d "$5" ]; then printf 'missing target: %s' "$5" >&2; exit 2; fi
+printf '%s' '[{"code":"F401","filename":"pkg/src/a.py","location":{"row":1,"column":1},"end_location":{"row":1,"column":2},"message":"unused","severity":"error","fix":null}]'; exit 1"#,
+    );
+    fs::create_dir_all(fake.root.join("tools")).unwrap();
+    fs::rename(&fake.program, fake.root.join("tools/ruff")).unwrap();
+    fake.program = PathBuf::from("tools/ruff");
+    fs::create_dir_all(fake.root.join("pkg/src")).unwrap();
+    let mut request = request();
+    request.workspace = "pkg".parse().unwrap();
+    request.targets = vec!["pkg/src".parse().unwrap()];
+
+    let session = run_ruff_session(&request, &fake.root, &fake.program).unwrap();
+
+    assert_eq!(session.completion.status, ExecutionStatus::Complete);
+    assert!(session.events.iter().any(|event| matches!(
+        event,
+        ProtocolEnvelope::Observation(value)
+            if value.observation.location.as_ref().is_some_and(|location| {
+                location.path.as_str() == "pkg/src/a.py"
+            })
+    )));
+    validate_generated_session(&request, &session).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_workspace_rejects_sibling_and_symlink_targets_before_ruff() {
+    use std::os::unix::fs::symlink;
+
+    let fake = FakeRuff::new("printf '[]'; exit 0");
+    fs::create_dir_all(fake.root.join("pkg")).unwrap();
+    fs::create_dir_all(fake.root.join("sibling")).unwrap();
+    symlink(fake.root.join("sibling"), fake.root.join("pkg/link")).unwrap();
+
+    for target in ["sibling", "pkg/link", "pkg/link/new.py"] {
+        let mut request = request();
+        request.workspace = "pkg".parse().unwrap();
+        request.targets = vec![target.parse().unwrap()];
+
+        let session = run_ruff_session(&request, &fake.root, &fake.program).unwrap();
+
+        assert_eq!(session.completion.status, ExecutionStatus::Incomplete);
+        assert!(
+            session
+                .completion
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("path escapes"))
+        );
+        assert!(session.events.is_empty());
+        validate_generated_session(&request, &session).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn nested_workspace_scope_is_revalidated_after_ruff() {
+    let fake = FakeRuff::new("rmdir pkg/src; ln -s ../sibling pkg/src; printf '[]'; exit 0");
+    fs::create_dir_all(fake.root.join("pkg/src")).unwrap();
+    fs::create_dir_all(fake.root.join("sibling")).unwrap();
+    let mut request = request();
+    request.workspace = "pkg".parse().unwrap();
+    request.targets = vec!["pkg/src".parse().unwrap()];
+
+    let session = run_ruff_session(&request, &fake.root, &fake.program).unwrap();
+
+    assert_eq!(session.completion.status, ExecutionStatus::Incomplete);
+    assert!(
+        session
+            .completion
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("path escapes"))
+    );
+    validate_generated_session(&request, &session).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn root_workspace_preserves_missing_targets_and_rejects_escape_ancestors() {
+    use std::os::unix::fs::symlink;
+
+    let fake =
+        FakeRuff::new(r#"if [ "$5" != "missing.py" ]; then exit 2; fi; printf '[]'; exit 0"#);
+    let mut request = request();
+    request.targets = vec!["missing.py".parse().unwrap()];
+
+    let session = run_ruff_session(&request, &fake.root, &fake.program).unwrap();
+    assert_eq!(session.completion.status, ExecutionStatus::Complete);
+    validate_generated_session(&request, &session).unwrap();
+
+    symlink(std::env::temp_dir(), fake.root.join("escape")).unwrap();
+    request.targets = vec!["escape/missing.py".parse().unwrap()];
+    let session = run_ruff_session(&request, &fake.root, &fake.program).unwrap();
+    assert_eq!(session.completion.status, ExecutionStatus::Incomplete);
+    assert!(
+        session
+            .completion
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("path escapes"))
+    );
+    validate_generated_session(&request, &session).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn clean_run_completes_when_caller_allows_no_payload_events() {
     let fake = FakeRuff::new("printf '[]'; exit 0");
     let mut request = request();
