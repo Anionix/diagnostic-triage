@@ -9,6 +9,7 @@ const MAX_RESULTS: usize = 10_000;
 const MAX_RULE_CHARS: usize = 256;
 const MAX_MESSAGE_CHARS: usize = 8_192;
 const MAX_URI_CHARS: usize = 4_096;
+const SOURCE_BACKED_OMITTED_COLUMN_KIND_VERSION: &str = "2.4.15";
 
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
 pub(crate) struct SarifLog {
@@ -124,7 +125,7 @@ pub enum SarifError {
     Invalid(String),
 }
 
-pub(crate) fn parse_sarif(input: &[u8]) -> Result<SarifLog, SarifError> {
+pub(crate) fn parse_sarif(input: &[u8], tool_version: &str) -> Result<SarifLog, SarifError> {
     let log = serde_json::from_slice::<SarifLog>(input)?;
     if log.version != "2.1.0" {
         return Err(SarifError::Invalid(
@@ -142,11 +143,14 @@ pub(crate) fn parse_sarif(input: &[u8]) -> Result<SarifLog, SarifError> {
             "tool.driver.name must identify Biome".to_owned(),
         ));
     }
-    // A non-empty SARIF run without columnKind has no authoritative column
-    // unit. Never guess or relabel it at the Location v1 boundary.
-    if run.column_kind == Some(SarifColumnKind::Utf16CodeUnits)
-        || (run.column_kind.is_none() && !run.results.is_empty())
-    {
+    // Biome 2.4.15 tag 9dd3271 derives SARIF columns through
+    // SourceFile::location; its column_index counts UTF-8 character boundaries.
+    // Keep the source-backed omission version-pinned instead of trusting a
+    // mutable tool name or future version.
+    let unsupported_omission = run.column_kind.is_none()
+        && !run.results.is_empty()
+        && tool_version != SOURCE_BACKED_OMITTED_COLUMN_KIND_VERSION;
+    if run.column_kind == Some(SarifColumnKind::Utf16CodeUnits) || unsupported_omission {
         return Err(SarifError::UnsupportedColumnKind);
     }
     if run.results.len() > MAX_RESULTS {
@@ -224,45 +228,54 @@ fn validate_text(field: &str, value: &str, maximum: usize) -> Result<(), SarifEr
 mod tests {
     use super::{SarifError, parse_sarif};
 
+    const SOURCE_BACKED_VERSION: &str = "2.4.15";
+
     #[test]
     fn rejects_partial_wrong_tool_and_invalid_end_positions() {
-        assert!(matches!(parse_sarif(b"{"), Err(SarifError::Malformed(_))));
+        assert!(matches!(
+            parse_sarif(b"{", SOURCE_BACKED_VERSION),
+            Err(SarifError::Malformed(_))
+        ));
         let wrong_tool =
             r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Other"}},"results":[]}]}"#;
         assert!(matches!(
-            parse_sarif(wrong_tool.as_bytes()),
+            parse_sarif(wrong_tool.as_bytes(), SOURCE_BACKED_VERSION),
             Err(SarifError::Invalid(_))
         ));
 
         let implicit_end_column = r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"columnKind":"unicodeCodePoints","results":[{"ruleId":"rule","message":{"text":"message"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"x.js"},"region":{"startLine":1,"startColumn":1,"endLine":1}}}]}]}]}"#;
         assert!(matches!(
-            parse_sarif(implicit_end_column.as_bytes()),
+            parse_sarif(implicit_end_column.as_bytes(), SOURCE_BACKED_VERSION),
             Err(SarifError::Invalid(_))
         ));
     }
 
     #[test]
-    fn validates_column_kind_without_silently_relabelling_units() {
+    fn accepts_biome_native_omission_and_rejects_explicit_unsupported_units() {
         let unicode = r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"columnKind":"unicodeCodePoints","results":[{"ruleId":"rule","message":{"text":"message"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"x.js"},"region":{"startLine":1,"startColumn":1,"endLine":1,"endColumn":2}}}]}]}]}"#;
-        parse_sarif(unicode.as_bytes()).expect("Location v1 column unit is accepted");
+        parse_sarif(unicode.as_bytes(), "future-version")
+            .expect("an explicit Location v1 column unit is accepted");
 
         let omitted_empty =
             r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"results":[]}] }"#;
-        parse_sarif(omitted_empty.as_bytes()).expect("an empty run carries no coordinates");
+        parse_sarif(omitted_empty.as_bytes(), "future-version")
+            .expect("an empty run carries no coordinates");
 
         for omitted_nonempty in [
             r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"results":[{"ruleId":"rule","message":{"text":"message"},"locations":[]}]}]}"#,
             r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"results":[{"ruleId":"rule","message":{"text":"message"},"locations":[{"physicalLocation":{"artifactLocation":{"uri":"x.js"},"region":{"startLine":1,"startColumn":1,"endLine":1,"endColumn":2}}}]}]}]}"#,
         ] {
+            parse_sarif(omitted_nonempty.as_bytes(), SOURCE_BACKED_VERSION)
+                .expect("Biome native columns have source-backed code-point semantics");
             assert!(matches!(
-                parse_sarif(omitted_nonempty.as_bytes()),
+                parse_sarif(omitted_nonempty.as_bytes(), "2.4.14"),
                 Err(SarifError::UnsupportedColumnKind)
             ));
         }
 
         let utf16 = r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"columnKind":"utf16CodeUnits","results":[]}] }"#;
         assert!(matches!(
-            parse_sarif(utf16.as_bytes()),
+            parse_sarif(utf16.as_bytes(), SOURCE_BACKED_VERSION),
             Err(SarifError::UnsupportedColumnKind)
         ));
 
@@ -271,7 +284,7 @@ mod tests {
             r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"Biome"}},"columnKind":null,"results":[]}] }"#,
         ] {
             assert!(matches!(
-                parse_sarif(invalid.as_bytes()),
+                parse_sarif(invalid.as_bytes(), SOURCE_BACKED_VERSION),
                 Err(SarifError::Malformed(_))
             ));
         }
