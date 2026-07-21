@@ -325,8 +325,8 @@ fn redact_secret_assignments(
     let mut output = BoundedText::new(value.len(), max_bytes);
     let mut index = 0;
     while index < value.len() {
-        if let Some((start, end)) = unquoted_secret_at(value, index)
-            .or_else(|| quoted_secret_at(value, index))
+        if let Some((start, end)) = unquoted_secret_at_with_provenance(neutralized, index)
+            .or_else(|| quoted_secret_at_with_provenance(neutralized, index))
             .or_else(|| json_quoted_secret_at(neutralized, index))
             .or_else(|| authorization_secret_at(neutralized, index))
             .or_else(|| {
@@ -416,7 +416,22 @@ fn bounded_token_end(
 }
 
 fn unquoted_secret_at(value: &str, index: usize) -> Option<(usize, usize)> {
-    let cursor = secret_value_start(value, index)?;
+    unquoted_secret_at_inner(value, index, None)
+}
+
+fn unquoted_secret_at_with_provenance(
+    neutralized: &NeutralizedText,
+    index: usize,
+) -> Option<(usize, usize)> {
+    unquoted_secret_at_inner(neutralized.as_str(), index, Some(neutralized))
+}
+
+fn unquoted_secret_at_inner(
+    value: &str,
+    index: usize,
+    neutralized: Option<&NeutralizedText>,
+) -> Option<(usize, usize)> {
+    let cursor = secret_value_start(value, index, neutralized)?;
     let bytes = value.as_bytes();
     if cursor >= bytes.len()
         || bytes.get(cursor).is_some_and(|byte| is_quote(*byte))
@@ -430,7 +445,22 @@ fn unquoted_secret_at(value: &str, index: usize) -> Option<(usize, usize)> {
 }
 
 fn quoted_secret_at(value: &str, index: usize) -> Option<(usize, usize)> {
-    let cursor = secret_value_start(value, index)?;
+    quoted_secret_at_inner(value, index, None)
+}
+
+fn quoted_secret_at_with_provenance(
+    neutralized: &NeutralizedText,
+    index: usize,
+) -> Option<(usize, usize)> {
+    quoted_secret_at_inner(neutralized.as_str(), index, Some(neutralized))
+}
+
+fn quoted_secret_at_inner(
+    value: &str,
+    index: usize,
+    neutralized: Option<&NeutralizedText>,
+) -> Option<(usize, usize)> {
+    let cursor = secret_value_start(value, index, neutralized)?;
     let bytes = value.as_bytes();
     let (start, quote, escaped_outer) =
         if let Some(quote) = bytes.get(cursor).copied().filter(|byte| is_quote(*byte)) {
@@ -692,7 +722,11 @@ fn is_word_boundary(value: &str, index: usize, before: bool) -> bool {
         .is_none_or(|character| !character.is_alphanumeric() && !matches!(character, '_' | '-'))
 }
 
-fn secret_value_start(value: &str, index: usize) -> Option<usize> {
+fn secret_value_start(
+    value: &str,
+    index: usize,
+    neutralized: Option<&NeutralizedText>,
+) -> Option<usize> {
     let matched = recognize_secret_key(value, index)?;
     let bytes = value.as_bytes();
     let mut cursor = matched.end;
@@ -700,7 +734,7 @@ fn secret_value_start(value: &str, index: usize) -> Option<usize> {
         if bytes.get(cursor) == Some(&b'=') {
             let value_start = cursor + 1;
             cursor = skip_assignment_whitespace(value, value_start);
-            if cursor > value_start && looks_like_assignment(value, cursor) {
+            if cursor > value_start && looks_like_assignment(value, cursor, neutralized) {
                 return None;
             }
         } else if skip_assignment_whitespace(value, cursor) > cursor {
@@ -708,7 +742,7 @@ fn secret_value_start(value: &str, index: usize) -> Option<usize> {
             if matches!(bytes.get(cursor), Some(b'=' | b':')) {
                 return None;
             }
-            if looks_like_assignment(value, cursor) {
+            if looks_like_assignment(value, cursor, neutralized) {
                 return None;
             }
         } else {
@@ -722,7 +756,7 @@ fn secret_value_start(value: &str, index: usize) -> Option<usize> {
         let value_start = cursor + 1;
         cursor = skip_assignment_whitespace(value, value_start);
         if matches!(bytes.get(cursor), Some(b'=' | b':'))
-            || (cursor > value_start && looks_like_assignment(value, cursor))
+            || (cursor > value_start && looks_like_assignment(value, cursor, neutralized))
         {
             return None;
         }
@@ -808,15 +842,39 @@ fn skip_assignment_whitespace(value: &str, mut cursor: usize) -> usize {
     cursor
 }
 
-fn looks_like_assignment(value: &str, start: usize) -> bool {
+fn looks_like_assignment(value: &str, start: usize, neutralized: Option<&NeutralizedText>) -> bool {
+    const MAX_MARKERS: u8 = 8;
+    const MAX_MARKER_SPAN: usize = 256;
+
+    // LLM contract: CANDIDATE -> PROVENANCE_MARKERS_BOUNDED -> ASSIGNMENT | REJECTED.
     let mut cursor = start;
+    let mut marker_count = 0;
+    let mut saw_key_character = false;
+    let mut needs_key_character = false;
     while let Some(character) = value[cursor..].chars().next() {
+        if saw_key_character && value.as_bytes().get(cursor) == Some(&b'[') {
+            if let Some(marker) = neutralized
+                .and_then(|text| text.marker_at(cursor))
+                .filter(|marker| matches!(marker.kind, MarkerKind::Bidi | MarkerKind::Format))
+            {
+                marker_count += 1;
+                if marker_count > MAX_MARKERS || marker.end - start > MAX_MARKER_SPAN {
+                    return false;
+                }
+                cursor = marker.end;
+                needs_key_character = true;
+                continue;
+            }
+        }
         if !(character.is_alphanumeric() || matches!(character, '_' | '-')) {
             break;
         }
         cursor += character.len_utf8();
+        saw_key_character = true;
+        needs_key_character = false;
     }
-    cursor > start
+    saw_key_character
+        && !needs_key_character
         && value
             .as_bytes()
             .get(skip_assignment_whitespace(value, cursor))
@@ -1591,5 +1649,59 @@ mod tests {
         let input = "name=value;".repeat(10_000);
         let actual = sanitize_external_text(&input, input.len()).unwrap();
         assert_eq!(actual.as_str(), input);
+    }
+
+    #[test]
+    fn marker_normalized_following_assignments_preserve_only_bounded_provenance() {
+        for (input, expected) in [
+            (
+                "token= api\u{200b}key=public",
+                "token= api[FORMAT-U+200B]key=public",
+            ),
+            (
+                "token= client\u{202e}id=public",
+                "token= client[BIDI-U+202E]id=public",
+            ),
+            (
+                "token= api[FORMAT-U+200B]key=public",
+                "token= [REDACTED_SECRET]",
+            ),
+            (
+                "token= client[BIDI-U+202E]id=public",
+                "token= [REDACTED_SECRET]",
+            ),
+        ] {
+            assert_eq!(
+                sanitize_external_text(input, 4096).unwrap().as_str(),
+                expected,
+                "input {input:?}"
+            );
+        }
+
+        let eight_markers = format!("token= a{}key=public", "\u{200b}".repeat(8));
+        let eight_expected = format!("token= a{}key=public", "[FORMAT-U+200B]".repeat(8));
+        assert_eq!(
+            sanitize_external_text(&eight_markers, 4096)
+                .unwrap()
+                .as_str(),
+            eight_expected
+        );
+
+        let exact_span = format!("token= {}\u{200b}key=public", "a".repeat(241));
+        let exact_expected = format!("token= {}[FORMAT-U+200B]key=public", "a".repeat(241));
+        assert_eq!(
+            sanitize_external_text(&exact_span, 4096).unwrap().as_str(),
+            exact_expected
+        );
+
+        for input in [
+            format!("token= a{}key=public", "\u{200b}".repeat(9)),
+            format!("token= {}\u{200b}key=public", "a".repeat(242)),
+        ] {
+            assert_eq!(
+                sanitize_external_text(&input, 4096).unwrap().as_str(),
+                "token= [REDACTED_SECRET]"
+            );
+        }
     }
 }
