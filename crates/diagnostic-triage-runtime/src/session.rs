@@ -57,10 +57,10 @@ pub enum ProviderSessionError {
 /// Execute one Provider Protocol request after a validated manifest handshake.
 ///
 /// The process receives no stdin bytes until its first complete stdout line is
-/// a valid manifest for `expected_adapter`. Protocol, EOF, crash, and limit
-/// failures become [`ProviderSessionState::Incomplete`]; missing required
-/// capabilities become [`ProviderSessionState::Unsupported`] without sending
-/// the request.
+/// a valid manifest for `expected_adapter` and `expected_adapter_version`.
+/// Protocol, EOF, crash, and limit failures become
+/// [`ProviderSessionState::Incomplete`]; missing required capabilities become
+/// [`ProviderSessionState::Unsupported`] without sending the request.
 ///
 /// # Errors
 ///
@@ -69,11 +69,13 @@ pub enum ProviderSessionError {
 pub fn run_provider_session(
     spec: ProcessSpec,
     expected_adapter: &AdapterId,
+    expected_adapter_version: &str,
     request: &RequestEnvelope,
 ) -> Result<ProviderSessionOutcome, ProviderSessionError> {
     run_provider_session_with_handshake_timeout(
         spec,
         expected_adapter,
+        expected_adapter_version,
         request,
         PROVIDER_HANDSHAKE_TIMEOUT,
     )
@@ -82,6 +84,7 @@ pub fn run_provider_session(
 fn run_provider_session_with_handshake_timeout(
     spec: ProcessSpec,
     expected_adapter: &AdapterId,
+    expected_adapter_version: &str,
     request: &RequestEnvelope,
     handshake_timeout: Duration,
 ) -> Result<ProviderSessionOutcome, ProviderSessionError> {
@@ -101,7 +104,8 @@ fn run_provider_session_with_handshake_timeout(
         limits,
         handshake_timeout,
         |line| {
-            let result = validate_handshake(line, expected_adapter, request);
+            let result =
+                validate_handshake(line, expected_adapter, expected_adapter_version, request);
             let accepted = matches!(result, HandshakeResult::Accepted(_));
             handshake.replace(Some(result));
             accepted
@@ -439,6 +443,7 @@ impl StreamEventKind {
 fn validate_handshake(
     line: &[u8],
     expected_adapter: &AdapterId,
+    expected_adapter_version: &str,
     request: &RequestEnvelope,
 ) -> HandshakeResult {
     let envelope = match serde_json::from_slice::<ProtocolEnvelope>(line) {
@@ -460,6 +465,12 @@ fn validate_handshake(
         return HandshakeResult::Incomplete {
             manifest: Some(manifest),
             reason: "manifest adapter id does not match configured adapter".to_owned(),
+        };
+    }
+    if manifest.adapter.version != expected_adapter_version {
+        return HandshakeResult::Incomplete {
+            manifest: Some(manifest),
+            reason: "manifest adapter version does not match configured adapter".to_owned(),
         };
     }
     let role_supported = matches!(
@@ -524,6 +535,7 @@ mod tests {
     use crate::process::{IncompleteReason, ProcessSpec, ProcessState};
 
     const REQUEST_ID: &str = "019f7e95-0000-7000-8000-000000000001";
+    const ADAPTER_VERSION: &str = "1.0.0";
 
     fn request(required: &str, optional: &[&str], stdout: u64) -> RequestEnvelope {
         request_for("CHECK", required, optional, stdout)
@@ -644,6 +656,7 @@ mod tests {
         let outcome = run_provider_session(
             provider_script(&manifest(&["diagnostic.check/v1"]), &completion(0)),
             &adapter_id(),
+            ADAPTER_VERSION,
             &request,
         )
         .unwrap();
@@ -654,11 +667,43 @@ mod tests {
     }
 
     #[test]
+    fn adapter_version_mismatch_is_incomplete_without_request_bytes() {
+        let directory = tempdir().unwrap();
+        let marker = directory.path().join("request-received");
+        let mut wrong: serde_json::Value =
+            serde_json::from_str(&manifest(&["diagnostic.check/v1"])).unwrap();
+        wrong["adapter"]["version"] = "2.0.0".into();
+        let script = ProcessSpec::new("/bin/sh").args([
+            "-c",
+            "printf '%s\n' \"$1\"; if IFS= read -r request; then : > \"$2\"; fi",
+            "sh",
+            &wrong.to_string(),
+            marker.to_str().unwrap(),
+        ]);
+        let outcome = run_provider_session(
+            script,
+            &adapter_id(),
+            ADAPTER_VERSION,
+            &request("diagnostic.check/v1", &[], 16_384),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome.state,
+            ProviderSessionState::Incomplete { ref reason }
+                if reason == "manifest adapter version does not match configured adapter"
+        ));
+        assert_eq!(outcome.request_bytes_written, 0);
+        assert!(!marker.exists());
+    }
+
+    #[test]
     fn ignores_unknown_optional_capability() {
         let request = request("diagnostic.check/v1", &["provider.future/v9"], 16_384);
         let outcome = run_provider_session(
             provider_script(&manifest(&["diagnostic.check/v1"]), &completion(0)),
             &adapter_id(),
+            ADAPTER_VERSION,
             &request,
         )
         .unwrap();
@@ -677,7 +722,8 @@ mod tests {
             marker.to_str().unwrap(),
         ]);
         let request = request("fix.propose/v1", &[], 16_384);
-        let outcome = run_provider_session(script, &adapter_id(), &request).unwrap();
+        let outcome =
+            run_provider_session(script, &adapter_id(), ADAPTER_VERSION, &request).unwrap();
 
         assert!(matches!(
             outcome.state,
@@ -705,7 +751,8 @@ mod tests {
                 marker.to_str().unwrap(),
             ]);
             let request = request_for(operation, capability, &[], 16_384);
-            let outcome = run_provider_session(script, &adapter_id(), &request).unwrap();
+            let outcome =
+                run_provider_session(script, &adapter_id(), ADAPTER_VERSION, &request).unwrap();
 
             assert!(matches!(
                 outcome.state,
@@ -731,7 +778,8 @@ mod tests {
             marker.to_str().unwrap(),
         ]);
         let request = request("diagnostic.check/v1", &[], 16_384);
-        let outcome = run_provider_session(script, &adapter_id(), &request).unwrap();
+        let outcome =
+            run_provider_session(script, &adapter_id(), ADAPTER_VERSION, &request).unwrap();
 
         assert!(matches!(
             outcome.state,
@@ -754,7 +802,8 @@ mod tests {
             &completion,
         ]);
         let request = request("diagnostic.check/v1", &[], 16_384);
-        let outcome = run_provider_session(script, &adapter_id(), &request).unwrap();
+        let outcome =
+            run_provider_session(script, &adapter_id(), ADAPTER_VERSION, &request).unwrap();
 
         assert!(matches!(
             outcome.state,
@@ -773,6 +822,7 @@ mod tests {
         let outcome = run_provider_session(
             provider_script("{not-json", &completion(0)),
             &adapter_id(),
+            ADAPTER_VERSION,
             &request,
         )
         .unwrap();
@@ -789,6 +839,7 @@ mod tests {
         let outcome = run_provider_session_with_handshake_timeout(
             ProcessSpec::new("/bin/sh").args(["-c", "sleep 2"]),
             &adapter_id(),
+            ADAPTER_VERSION,
             &request,
             Duration::from_millis(40),
         )
@@ -816,6 +867,7 @@ mod tests {
         let outcome = run_provider_session_with_handshake_timeout(
             script,
             &adapter_id(),
+            ADAPTER_VERSION,
             &request,
             Duration::from_millis(40),
         )
@@ -843,7 +895,8 @@ mod tests {
             &first,
             &second,
         ]);
-        let outcome = run_provider_session(script, &adapter_id(), &request).unwrap();
+        let outcome =
+            run_provider_session(script, &adapter_id(), ADAPTER_VERSION, &request).unwrap();
 
         assert_eq!(
             outcome.process.state,
@@ -870,7 +923,8 @@ mod tests {
                 &manifest,
                 &tail,
             ]);
-            let outcome = run_provider_session(script, &adapter_id(), &request).unwrap();
+            let outcome =
+                run_provider_session(script, &adapter_id(), ADAPTER_VERSION, &request).unwrap();
             assert_eq!(
                 outcome.process.state,
                 ProcessState::Incomplete(IncompleteReason::ProtocolViolation)
@@ -895,7 +949,8 @@ mod tests {
             ]),
         ];
         for spec in cases {
-            let outcome = run_provider_session(spec, &adapter_id(), &request).unwrap();
+            let outcome =
+                run_provider_session(spec, &adapter_id(), ADAPTER_VERSION, &request).unwrap();
             assert!(
                 matches!(outcome.state, ProviderSessionState::Incomplete { .. }),
                 "unexpected state: {:?}",
@@ -911,6 +966,7 @@ mod tests {
         let outcome = run_provider_session(
             provider_script(&manifest(&["diagnostic.check/v1"]), &tail),
             &adapter_id(),
+            ADAPTER_VERSION,
             &request,
         )
         .unwrap();
@@ -929,6 +985,7 @@ mod tests {
         let _outcome = run_provider_session(
             provider_script(&manifest(&["diagnostic.check/v1"]), &completion(0)),
             &adapter_id(),
+            ADAPTER_VERSION,
             &request,
         )
         .unwrap();
