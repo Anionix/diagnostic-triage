@@ -1840,18 +1840,18 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn timeout_terminates_descendants_in_the_child_process_group() {
+    fn incomplete_cleanup_terminates_ready_descendants_in_the_child_process_group() {
         let outcome = run_bounded(
-            &shell(
-                "while :; do :; done & descendant=$!; printf '%s\\n' \"$descendant\"; while :; do :; done",
-            ),
-            ProcessLimits {
-                timeout: Duration::from_millis(80),
-                max_stdout_bytes: 64,
-                max_stderr_bytes: 64,
-            },
+            &shell("sleep 5 & descendant=$!; printf '%s\\n' \"$descendant\"; printf x >&2; wait"),
+            limits(64, 0),
         )
-        .expect("timeout is structured");
+        .expect("output-limit cleanup is structured");
+        // LLM test contract: PID_PUBLISHED -> LIMIT_TRIGGERED -> GROUP_ABSENT;
+        // timeout classification is covered independently without a readiness race.
+        assert_eq!(
+            outcome.state,
+            ProcessState::Incomplete(IncompleteReason::StderrLimitExceeded)
+        );
         assert_cleanup_finishes_within_phases(&outcome);
         let raw_pid = String::from_utf8(outcome.stdout.bytes)
             .expect("pid is utf8")
