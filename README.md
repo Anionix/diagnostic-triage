@@ -14,6 +14,9 @@ The project is establishing its versioned contracts. The stable v1 interfaces
 will be the `diagnostic-triage` command, `diagnostic-triage.toml`, JSON/JSONL
 schemas, and exit codes. Rust workspace crates are internal and will not be
 published during v1 development. No alpha contract has been published yet.
+Before that first alpha, checked-in config shapes are revision-specific and
+consumers must pin the full commit object ID. Missing Provider identity fields
+are rejected with a migration error; the runtime never guesses identity data.
 
 The canonical architecture and terminology are recorded in [CONTEXT.md](CONTEXT.md)
 and [ADR 0001](docs/adr/0001-standalone-canonical-engine.md).
