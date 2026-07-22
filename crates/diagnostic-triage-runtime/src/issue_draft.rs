@@ -108,10 +108,22 @@ pub fn bug_issue_draft_json_bytes(
 pub fn bug_issue_draft_markdown_bytes(
     report: &ValidatedSessionReport,
 ) -> Result<Vec<u8>, ReporterError> {
-    encode_markdown(
-        &bug_issue_draft_json_bytes(report)?,
+    bug_issue_draft_markdown_bytes_with_limits(
+        report.as_report(),
+        MAX_ISSUE_DRAFT_OUTPUT_BYTES,
         MAX_ISSUE_DRAFT_OUTPUT_BYTES,
     )
+}
+
+fn bug_issue_draft_markdown_bytes_with_limits(
+    report: &SessionReport,
+    json_limit: usize,
+    markdown_limit: usize,
+) -> Result<Vec<u8>, ReporterError> {
+    let format = ReportFormat::BugIssueDraftMarkdown;
+    let draft = BugIssueDraftV1::project_report_with_limit(report, format, json_limit)?;
+    let json = encode_json_for_format(&draft, json_limit, format)?;
+    encode_markdown(&json, markdown_limit)
 }
 
 /// Validate, fully encode, and then write one JSON bug issue draft.
@@ -136,18 +148,23 @@ pub fn write_bug_issue_draft_markdown<W: Write + ?Sized>(
     report: &SessionReport,
     writer: &mut W,
 ) -> Result<(), ReporterError> {
-    validate_report(report).map_err(ReporterError::Contract)?;
-    let draft = BugIssueDraftV1::project_report(report, ReportFormat::BugIssueDraftMarkdown)?;
-    let json = encode_json(&draft, MAX_ISSUE_DRAFT_OUTPUT_BYTES)?;
-    let bytes = encode_markdown(&json, MAX_ISSUE_DRAFT_OUTPUT_BYTES)?;
-    write_encoded(ReportFormat::BugIssueDraftMarkdown, &bytes, writer)
+    write_bug_issue_draft_markdown_with_limits(
+        report,
+        writer,
+        MAX_ISSUE_DRAFT_OUTPUT_BYTES,
+        MAX_ISSUE_DRAFT_OUTPUT_BYTES,
+    )
 }
 
-fn output_too_large(max: usize) -> ReporterError {
-    ReporterError::OutputTooLarge {
-        format: ReportFormat::BugIssueDraftJson,
-        max,
-    }
+fn write_bug_issue_draft_markdown_with_limits<W: Write + ?Sized>(
+    report: &SessionReport,
+    writer: &mut W,
+    json_limit: usize,
+    markdown_limit: usize,
+) -> Result<(), ReporterError> {
+    validate_report(report).map_err(ReporterError::Contract)?;
+    let bytes = bug_issue_draft_markdown_bytes_with_limits(report, json_limit, markdown_limit)?;
+    write_encoded(ReportFormat::BugIssueDraftMarkdown, &bytes, writer)
 }
 
 fn markdown_too_large(max: usize) -> ReporterError {
@@ -253,19 +270,25 @@ fn measure_project_report(
 }
 
 fn encode_json(draft: &BugIssueDraftV1, limit: usize) -> Result<Vec<u8>, ReporterError> {
+    encode_json_for_format(draft, limit, ReportFormat::BugIssueDraftJson)
+}
+
+fn encode_json_for_format(
+    draft: &BugIssueDraftV1,
+    limit: usize,
+    format: ReportFormat,
+) -> Result<Vec<u8>, ReporterError> {
+    // Source: https://docs.rs/serde_json/1.0.150/serde_json/fn.to_writer.html.
     let mut output = BoundedBuffer::new(limit);
     match serde_json::to_writer(&mut output, draft) {
         Ok(()) => {
             output
                 .write_all(b"\n")
-                .map_err(|_| output_too_large(limit))?;
+                .map_err(|_| projection_too_large(format, limit))?;
             Ok(output.bytes)
         }
-        Err(_) if output.exceeded => Err(output_too_large(limit)),
-        Err(source) => Err(ReporterError::Encoding {
-            format: ReportFormat::BugIssueDraftJson,
-            source,
-        }),
+        Err(_) if output.exceeded => Err(projection_too_large(format, limit)),
+        Err(source) => Err(ReporterError::Encoding { format, source }),
     }
 }
 
@@ -290,9 +313,16 @@ impl BugIssueDraftV1 {
     }
 
     fn project_report(report: &SessionReport, format: ReportFormat) -> Result<Self, ReporterError> {
-        measure_project_report(report, MAX_ISSUE_DRAFT_OUTPUT_BYTES, format)?;
-        Self::project_unchecked(report)
-            .map_err(|_| projection_too_large(format, MAX_ISSUE_DRAFT_OUTPUT_BYTES))
+        Self::project_report_with_limit(report, format, MAX_ISSUE_DRAFT_OUTPUT_BYTES)
+    }
+
+    fn project_report_with_limit(
+        report: &SessionReport,
+        format: ReportFormat,
+        limit: usize,
+    ) -> Result<Self, ReporterError> {
+        measure_project_report(report, limit, format)?;
+        Self::project_unchecked(report).map_err(|_| projection_too_large(format, limit))
     }
 
     fn project_unchecked(report: &SessionReport) -> Result<Self, SanitizeError> {
@@ -689,5 +719,30 @@ mod tests {
             }
         ));
         assert_eq!(writer.0.len(), 1);
+    }
+
+    #[test]
+    fn markdown_public_apis_attribute_projection_overflow_to_markdown() {
+        let report = ValidatedSessionReport::from_json(VALID).unwrap();
+        let limit = bug_issue_draft_json_bytes(&report).unwrap().len() - 1;
+        assert!(matches!(
+            bug_issue_draft_markdown_bytes_with_limits(
+                report.as_report(),
+                limit,
+                MAX_ISSUE_DRAFT_OUTPUT_BYTES
+            ),
+            Err(ReporterError::OutputTooLarge { format: ReportFormat::BugIssueDraftMarkdown, max }) if max == limit
+        ));
+        let mut output = Vec::new();
+        assert!(matches!(
+            write_bug_issue_draft_markdown_with_limits(
+                report.as_report(),
+                &mut output,
+                limit,
+                MAX_ISSUE_DRAFT_OUTPUT_BYTES
+            ),
+            Err(ReporterError::OutputTooLarge { format: ReportFormat::BugIssueDraftMarkdown, max }) if max == limit
+        ));
+        assert!(output.is_empty());
     }
 }
