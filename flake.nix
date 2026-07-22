@@ -20,6 +20,7 @@
         "x86_64-linux"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      leanToolchain = nixpkgs.lib.removeSuffix "\n" (builtins.readFile ./lean-toolchain);
       pkgsFor =
         system:
         import nixpkgs {
@@ -42,13 +43,17 @@
               "rustfmt"
             ];
           };
+          # Keep Elan/LSP and the Nix shell on one Lean release.
+          lean =
+            assert leanToolchain == "leanprover/lean4:v${pkgs.lean4.version}";
+            pkgs.lean4;
         in
         {
           default = pkgs.mkShell {
             packages = [
               rust
+              lean
               pkgs.jq
-              pkgs.lean4
               pkgs.nixfmt
               pkgs.pyright
               pkgs.ruff

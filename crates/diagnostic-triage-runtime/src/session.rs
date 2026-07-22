@@ -26,10 +26,12 @@ pub enum ProviderSessionState {
     Complete(Box<ValidatedSession>),
     Incomplete {
         reason: String,
+        validated_session: Option<Box<ValidatedSession>>,
     },
     Unsupported {
         missing_required: Vec<Capability>,
         reason: String,
+        validated_session: Option<Box<ValidatedSession>>,
     },
 }
 
@@ -132,13 +134,17 @@ fn run_provider_session_with_handshake_timeout(
             state: ProviderSessionState::Unsupported {
                 missing_required,
                 reason,
+                validated_session: None,
             },
             manifest: Some(manifest),
             process,
             request_bytes_written,
         }),
         Some(HandshakeResult::Incomplete { manifest, reason }) => Ok(ProviderSessionOutcome {
-            state: ProviderSessionState::Incomplete { reason },
+            state: ProviderSessionState::Incomplete {
+                reason,
+                validated_session: None,
+            },
             manifest,
             process,
             request_bytes_written,
@@ -146,6 +152,7 @@ fn run_provider_session_with_handshake_timeout(
         None => Ok(ProviderSessionOutcome {
             state: ProviderSessionState::Incomplete {
                 reason: process_reason(&process),
+                validated_session: None,
             },
             manifest: None,
             process,
@@ -180,6 +187,7 @@ fn finish_accepted(
         return ProviderSessionOutcome {
             state: ProviderSessionState::Incomplete {
                 reason: stream_error.unwrap_or_else(|| process_reason(&process)),
+                validated_session: None,
             },
             manifest: Some(manifest),
             process,
@@ -191,6 +199,7 @@ fn finish_accepted(
         return ProviderSessionOutcome {
             state: ProviderSessionState::Incomplete {
                 reason: "manifest line disappeared from captured stdout".to_owned(),
+                validated_session: None,
             },
             manifest: Some(manifest),
             process,
@@ -215,6 +224,7 @@ fn finish_accepted(
             return ProviderSessionOutcome {
                 state: ProviderSessionState::Incomplete {
                     reason: format!("provider protocol is incomplete: {error}"),
+                    validated_session: None,
                 },
                 manifest: Some(manifest),
                 process,
@@ -225,21 +235,29 @@ fn finish_accepted(
     debug_assert_eq!(&session.request, request);
     let state = match session.completion.status {
         ExecutionStatus::Complete => ProviderSessionState::Complete(Box::new(session)),
-        ExecutionStatus::Incomplete => ProviderSessionState::Incomplete {
-            reason: session
+        ExecutionStatus::Incomplete => {
+            let reason = session
                 .completion
                 .message
                 .clone()
-                .unwrap_or_else(|| "provider reported INCOMPLETE".to_owned()),
-        },
-        ExecutionStatus::Unsupported => ProviderSessionState::Unsupported {
-            missing_required: Vec::new(),
-            reason: session
+                .unwrap_or_else(|| "provider reported INCOMPLETE".to_owned());
+            ProviderSessionState::Incomplete {
+                reason,
+                validated_session: Some(Box::new(session)),
+            }
+        }
+        ExecutionStatus::Unsupported => {
+            let reason = session
                 .completion
                 .message
                 .clone()
-                .unwrap_or_else(|| "provider reported UNSUPPORTED".to_owned()),
-        },
+                .unwrap_or_else(|| "provider reported UNSUPPORTED".to_owned());
+            ProviderSessionState::Unsupported {
+                missing_required: Vec::new(),
+                reason,
+                validated_session: Some(Box::new(session)),
+            }
+        }
     };
     ProviderSessionOutcome {
         state,
@@ -525,6 +543,7 @@ mod tests {
 
     use diagnostic_triage_contracts::{
         AdapterId,
+        model::ExecutionStatus,
         protocol::{ProtocolEnvelope, RequestEnvelope},
     };
     use tempfile::tempdir;
@@ -595,14 +614,23 @@ mod tests {
     }
 
     fn completion(sequence: u64) -> String {
-        serde_json::json!({
+        terminal_completion(sequence, &ExecutionStatus::Complete, None)
+    }
+
+    fn terminal_completion(
+        sequence: u64,
+        status: &ExecutionStatus,
+        message: Option<&str>,
+    ) -> String {
+        let complete = status == &ExecutionStatus::Complete;
+        let mut completion = serde_json::json!({
             "protocol_version": "diagnostic-triage.protocol/v1",
             "kind": "completion",
             "request_id": REQUEST_ID,
             "sequence": sequence,
-            "status": "COMPLETE",
-            "tool_exit_code": 0,
-            "tool_duration_ms": 1,
+            "status": status,
+            "tool_exit_code": if complete { Some(0) } else { None },
+            "tool_duration_ms": if complete { 1 } else { 37 },
             "counts": {
                 "observations": 0,
                 "evidence": 0,
@@ -610,8 +638,11 @@ mod tests {
                 "executions": 0
             },
             "evidence_bytes": 0
-        })
-        .to_string()
+        });
+        if let Some(message) = message {
+            completion["message"] = message.into();
+        }
+        completion.to_string()
     }
 
     fn evidence(sequence: u64, id: &str) -> String {
@@ -667,6 +698,48 @@ mod tests {
     }
 
     #[test]
+    fn validated_terminal_states_retain_the_session() {
+        for (status, expected_reason) in [
+            (ExecutionStatus::Incomplete, "provider stopped early"),
+            (
+                ExecutionStatus::Unsupported,
+                "provider cannot perform request",
+            ),
+        ] {
+            let request = request("diagnostic.check/v1", &[], 16_384);
+            let outcome = run_provider_session(
+                provider_script(
+                    &manifest(&["diagnostic.check/v1"]),
+                    &terminal_completion(0, &status, Some(expected_reason)),
+                ),
+                &adapter_id(),
+                ADAPTER_VERSION,
+                &request,
+            )
+            .unwrap();
+
+            let (reason, validated_session) = match outcome.state {
+                ProviderSessionState::Incomplete {
+                    reason,
+                    validated_session,
+                }
+                | ProviderSessionState::Unsupported {
+                    reason,
+                    validated_session,
+                    ..
+                } => (reason, validated_session),
+                ProviderSessionState::Complete(_) => panic!("expected terminal state"),
+            };
+            let session = validated_session.expect("validated terminal session must be retained");
+            assert_eq!(reason, expected_reason);
+            assert_eq!(session.request.request_id, request.request_id);
+            assert_eq!(session.completion.tool_duration_ms, 37);
+            assert_eq!(session.completion.tool_exit_code.0, None);
+            assert_eq!(session.completion.message.as_deref(), Some(expected_reason));
+        }
+    }
+
+    #[test]
     fn adapter_version_mismatch_is_incomplete_without_request_bytes() {
         let directory = tempdir().unwrap();
         let marker = directory.path().join("request-received");
@@ -690,8 +763,10 @@ mod tests {
 
         assert!(matches!(
             outcome.state,
-            ProviderSessionState::Incomplete { ref reason }
-                if reason == "manifest adapter version does not match configured adapter"
+            ProviderSessionState::Incomplete {
+                ref reason,
+                validated_session: None,
+            } if reason == "manifest adapter version does not match configured adapter"
         ));
         assert_eq!(outcome.request_bytes_written, 0);
         assert!(!marker.exists());
@@ -727,7 +802,10 @@ mod tests {
 
         assert!(matches!(
             outcome.state,
-            ProviderSessionState::Unsupported { .. }
+            ProviderSessionState::Unsupported {
+                validated_session: None,
+                ..
+            }
         ));
         assert_eq!(outcome.request_bytes_written, 0);
         assert!(!marker.exists());
@@ -783,7 +861,7 @@ mod tests {
 
         assert!(matches!(
             outcome.state,
-            ProviderSessionState::Incomplete { ref reason }
+            ProviderSessionState::Incomplete { ref reason, .. }
                 if reason == "manifest adapter id does not match configured adapter"
         ));
         assert_eq!(outcome.request_bytes_written, 0);
@@ -905,7 +983,7 @@ mod tests {
         assert!(outcome.process.duration < Duration::from_secs(1));
         assert!(matches!(
             outcome.state,
-            ProviderSessionState::Incomplete { ref reason }
+            ProviderSessionState::Incomplete { ref reason, .. }
                 if reason.contains("event limit")
         ));
     }
