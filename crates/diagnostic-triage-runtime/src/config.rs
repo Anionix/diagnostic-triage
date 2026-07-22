@@ -171,10 +171,9 @@ impl RuntimeConfig {
     /// adapter.
     ///
     /// The provider's program and argv are copied without parsing or joining.
-    /// This method intentionally does not resolve `repository.workspace` or
-    /// set `current_dir`: callers must resolve that validated [`RepoPath`]
-    /// beneath a trusted repository root before applying that root through
-    /// [`ProcessSpec::current_dir`].
+    /// This method intentionally does not resolve `repository.workspace`, an
+    /// explicit relative program, or `current_dir`: orchestration must resolve
+    /// those paths against a trusted repository root before process launch.
     ///
     /// # Errors
     ///
