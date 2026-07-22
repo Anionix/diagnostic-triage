@@ -5,6 +5,7 @@
 #[cfg(test)]
 std::thread_local! {
     static ASSIGNMENT_WHITESPACE_SCAN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static URL_PARSE_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 const PROVIDER_TOKEN_PREFIXES: &[(&str, usize, bool)] = &[
@@ -30,12 +31,17 @@ const PROVIDER_TOKEN_PREFIXES: &[(&str, usize, bool)] = &[
     ("npm_", 32, false),
     ("sk-", 32, false),
 ];
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SanitizationMode {
     ExternalText,
     Identifier,
     RepositoryPath,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WebUrlSpan {
+    Preserve(usize),
+    Reject(usize),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -353,8 +359,20 @@ fn redact_secret_assignments(
     let value = neutralized.as_str();
     let mut output = BoundedText::new(value.len(), max_bytes);
     let mut index = 0;
+    let mut web_url_until = 0;
+    let mut url_checked_until = 0;
     while index < value.len() {
-        if let Some((start, end)) = unquoted_secret_at_with_provenance(neutralized, index)
+        if index >= url_checked_until {
+            match web_url_span(neutralized, index) {
+                Some(WebUrlSpan::Preserve(end)) => {
+                    url_checked_until = end;
+                    web_url_until = end;
+                }
+                Some(WebUrlSpan::Reject(end)) => url_checked_until = end,
+                None => {}
+            }
+        }
+        let redaction = unquoted_secret_at_with_provenance(neutralized, index)
             .or_else(|| quoted_secret_at_with_provenance(neutralized, index))
             .or_else(|| json_quoted_secret_at(neutralized, index))
             .or_else(|| authorization_secret_at(neutralized, index))
@@ -363,9 +381,16 @@ fn redact_secret_assignments(
                 SanitizationMode::RepositoryPath => token_shape_at(value, index, false),
                 SanitizationMode::Identifier => None,
             })
-        {
+            .map(|(start, end)| (start, end, "[REDACTED_SECRET]"))
+            .or_else(|| {
+                (mode == SanitizationMode::ExternalText && index >= web_url_until)
+                    .then(|| absolute_path_end(neutralized, index))
+                    .flatten()
+                    .map(|end| (index, end, "[REDACTED_PATH]"))
+            });
+        if let Some((start, end, marker)) = redaction {
             output.push_str(&value[index..start])?;
-            output.push_str("[REDACTED_SECRET]")?;
+            output.push_str(marker)?;
             index = end;
         } else {
             let character = value[index..].chars().next().expect("UTF-8 boundary");
@@ -374,6 +399,124 @@ fn redact_secret_assignments(
         }
     }
     Ok(output.finish())
+}
+
+fn web_url_span(neutralized: &NeutralizedText, index: usize) -> Option<WebUrlSpan> {
+    path_boundary(neutralized, index).then_some(())?;
+    let value = neutralized.as_str();
+    let tail = value.get(index..)?;
+    let scheme_len = ["http://", "https://"]
+        .into_iter()
+        .find(|scheme| {
+            tail.get(..scheme.len())
+                .is_some_and(|v| v.eq_ignore_ascii_case(scheme))
+        })?
+        .len();
+    let delimiter = |c: char| c.is_whitespace() || matches!(c, '\'' | '"' | '<' | '>');
+    let mut cursor = index + scheme_len;
+    while cursor < value.len() && neutralized.marker_at(cursor).is_none() {
+        let character = value[cursor..].chars().next().expect("UTF-8 boundary");
+        if delimiter(character) {
+            break;
+        }
+        cursor += character.len_utf8();
+    }
+    let candidate = &value[index..cursor];
+    #[cfg(test)]
+    URL_PARSE_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+    Some(
+        if !candidate.contains('\\') && url::Url::parse(candidate).is_ok() {
+            WebUrlSpan::Preserve(cursor)
+        } else {
+            WebUrlSpan::Reject(cursor)
+        },
+    )
+}
+
+fn absolute_path_end(neutralized: &NeutralizedText, index: usize) -> Option<usize> {
+    path_boundary(neutralized, index).then_some(())?;
+    let value = neutralized.as_str();
+    let root_end = absolute_root_end(value, index)?;
+    let end = path_span_end(neutralized, index, root_end);
+    let cookie_root = end == root_end
+        && value
+            .get(index.saturating_sub(5)..root_end)
+            .is_some_and(|span| span.eq_ignore_ascii_case("path=/"))
+        && value.as_bytes().get(end) == Some(&b';');
+    (!cookie_root).then_some(end)
+}
+
+fn absolute_root_end(value: &str, index: usize) -> Option<usize> {
+    let mut root = index;
+    let tail = value.get(index..)?;
+    if tail.len() >= 5 && tail.as_bytes()[..5].eq_ignore_ascii_case(b"file:") {
+        root += 5;
+    }
+    let bytes = value.as_bytes();
+    if bytes.get(root).is_some_and(u8::is_ascii_alphabetic) && bytes.get(root + 1) == Some(&b':') {
+        return separator_end(value, root + 2).map(|(end, _)| end);
+    }
+    let (first, forward) = separator_end(value, root)?;
+    let malformed_web = ["http:", "https:"].into_iter().any(|scheme| {
+        index >= scheme.len() && value[index - scheme.len()..index].eq_ignore_ascii_case(scheme)
+    });
+    if root > index || forward || malformed_web {
+        return Some(first);
+    }
+    separator_end(value, first).and_then(|(end, second_forward)| (!second_forward).then_some(end))
+}
+
+fn separator_end(value: &str, index: usize) -> Option<(usize, bool)> {
+    match value.as_bytes().get(index) {
+        Some(b'/') => Some((index + 1, true)),
+        Some(b'\\') => Some((index + 1, false)),
+        _ => value.get(index..index.saturating_add(3)).and_then(|part| {
+            ["%2f", "%5c"]
+                .into_iter()
+                .position(|separator| part.eq_ignore_ascii_case(separator))
+                .map(|kind| (index + 3, kind == 0))
+        }),
+    }
+}
+
+fn path_span_end(neutralized: &NeutralizedText, start: usize, mut cursor: usize) -> usize {
+    let value = neutralized.as_str();
+    let bytes = value.as_bytes();
+    let quote = bytes
+        .get(start.wrapping_sub(1))
+        .copied()
+        .filter(|b| is_quote(*b));
+    let escaped_outer = quote.is_some_and(|_| is_escaped(bytes, 0, start - 1));
+    while cursor < value.len() && token_shape_at(value, cursor, true).is_none() {
+        if neutralized.marker_at(cursor).is_some() {
+            break;
+        }
+        if quote.is_some_and(|quote| {
+            (!escaped_outer && bytes[cursor] == quote && !is_escaped(bytes, start, cursor))
+                || (escaped_outer
+                    && bytes[cursor] == b'\\'
+                    && bytes.get(cursor + 1) == Some(&quote)
+                    && !is_escaped(bytes, start, cursor))
+        }) {
+            break;
+        }
+        let character = value[cursor..].chars().next().expect("UTF-8 boundary");
+        if quote.is_none()
+            && ((character.is_whitespace() && character != ' ')
+                || "'\"`)]},;&<>|".contains(character))
+        {
+            break;
+        }
+        cursor += character.len_utf8();
+    }
+    cursor
+}
+
+fn path_boundary(neutralized: &NeutralizedText, index: usize) -> bool {
+    // Sources: https://www.rfc-editor.org/rfc/rfc8089, https://url.spec.whatwg.org/, https://docs.rs/url/2.5.8/url/struct.Url.html#method.parse, https://learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats. LLM contract: CANDIDATE -> WEB_URL_PRESERVED | ABSOLUTE_PATH_REDACTED | RELATIVE_PRESERVED.
+    let previous = neutralized.as_str()[..index].chars().next_back();
+    neutralized.marker_ending_at(index).is_some()
+        || previous.is_none_or(|c| !c.is_alphanumeric() && !"_-.\\/%".contains(c))
 }
 
 fn token_shape_at(value: &str, index: usize, include_generic: bool) -> Option<(usize, usize)> {
@@ -1254,6 +1397,54 @@ mod tests {
             let actual = sanitize_external_text(input, 256).unwrap();
             assert_eq!(actual.as_str(), expected, "input {input:?}");
         }
+    }
+
+    #[test]
+    fn redacts_absolute_paths_without_consuming_safe_context() {
+        let redacted = "[REDACTED_PATH]";
+        let cases = [
+            (r"C:\", redacted),
+            (r"\\server\share", redacted),
+            ("%5C%5cserver%2Fshare", redacted),
+            ("file:///etc/passwd", redacted),
+            ("FILE:%2fUsers%2FA", redacted),
+            ("C:%5CUsers%2FA", redacted),
+            (r#""C:\Program Files\a""#, r#""[REDACTED_PATH]""#),
+            (r#"\"/a b\" tail"#, r#"\"[REDACTED_PATH]\" tail"#),
+            (r#""/a/with\"q/x" tail"#, r#""[REDACTED_PATH]" tail"#),
+            ("see /Users/A/My Project, then", "see [REDACTED_PATH], then"),
+            ("https:/Users/a", "https:[REDACTED_PATH]"),
+            ("https://[x]/a", "https:[REDACTED_PATH]][REDACTED_PATH]"),
+            ("https://%ZZ/Users/a", "https:[REDACTED_PATH]"),
+            ("https://%25/Users/a", "https:[REDACTED_PATH]"),
+            ("https://a:b:443/Users/a", "https:[REDACTED_PATH]"),
+            (r"https://example.test\Users\a", "https:[REDACTED_PATH]"),
+            (r"https:\Users\a", "https:[REDACTED_PATH]"),
+            ("https://x\n/a", "https://x[CONTROL-U+000A][REDACTED_PATH]"),
+            ("http://x?token=secret", "http://x?token=[REDACTED_SECRET]"),
+        ];
+        for (input, expected) in cases {
+            let actual = sanitize_external_text(input, 8_192).unwrap();
+            assert_eq!(actual.as_str(), expected, "input {input:?}");
+        }
+        let preserved = concat!(
+            "https://例え.テスト:443/Users/a?next=/etc\nhttps://https://Users/a\nhttps://%E4%BE%8B%E3%81%88.test/Users/a\nhttps://[::1]/Users/a\n",
+            "url=https://example.test/a?next=/Users/a\n<https://example.test/a>\n日本語/src.rs\nfile:src/lib.rs\n",
+            "C:relative\\file.rs\npattern \\d+\\w+",
+        );
+        for input in preserved.lines() {
+            let actual = sanitize_external_text(input, 8_192).unwrap();
+            assert_eq!(actual.as_str(), input);
+        }
+        let input = format!("/{}, safe /etc", "a".repeat(4_096));
+        let actual = sanitize_external_text(&input, input.len()).unwrap();
+        assert_eq!(actual.as_str(), "[REDACTED_PATH], safe [REDACTED_PATH]");
+        assert!(sanitize_external_text("/", redacted.len()).is_ok());
+        assert!(sanitize_external_text("/", redacted.len() - 1).is_err());
+        super::URL_PARSE_ATTEMPTS.with(|attempts| attempts.set(0));
+        let repeated = "<https://%25/a>".repeat(128);
+        sanitize_external_text(&repeated, repeated.len() * 2).unwrap();
+        assert_eq!(super::URL_PARSE_ATTEMPTS.with(std::cell::Cell::get), 128);
     }
 
     #[test]
