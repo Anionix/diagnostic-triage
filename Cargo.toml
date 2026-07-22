@@ -38,6 +38,7 @@ thiserror = "=2.0.18"
 toml = "=0.8.23"
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
+url = "=2.5.8"
 uuid = { version = "=1.24.0", features = ["serde", "v7"] }
 wait-timeout = "=0.2.1"
 
