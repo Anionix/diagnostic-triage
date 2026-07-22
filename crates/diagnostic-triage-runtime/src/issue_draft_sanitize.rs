@@ -45,6 +45,12 @@ enum WebUrlSpan {
     Reject(usize),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnquotedSpacePolicy {
+    Continue,
+    RequireFollowingSeparator,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(transparent)]
 pub(crate) struct SanitizedText(String);
@@ -363,6 +369,7 @@ fn redact_secret_assignments(
     let mut index = 0;
     let mut web_url_until = 0;
     let mut url_checked_until = 0;
+    let mut double_quote = None;
     while index < value.len() {
         if index >= url_checked_until {
             match web_url_span(neutralized, index) {
@@ -386,18 +393,21 @@ fn redact_secret_assignments(
             .map(|(start, end)| (start, end, "[REDACTED_SECRET]"))
             .or_else(|| {
                 (mode == SanitizationMode::ExternalText && index >= web_url_until)
-                    .then(|| absolute_path_end(neutralized, index))
+                    .then(|| absolute_path_end(neutralized, index, double_quote))
                     .flatten()
                     .map(|end| (index, end, "[REDACTED_PATH]"))
             });
         if let Some((start, end, marker)) = redaction {
             output.push_str(&value[index..start])?;
             output.push_str(marker)?;
+            advance_double_quote_context(value, index, end, &mut double_quote);
             index = end;
         } else {
             let character = value[index..].chars().next().expect("UTF-8 boundary");
             output.push_char(character)?;
-            index += character.len_utf8();
+            let end = index + character.len_utf8();
+            advance_double_quote_context(value, index, end, &mut double_quote);
+            index = end;
         }
     }
     Ok(output.finish())
@@ -435,11 +445,15 @@ fn web_url_span(neutralized: &NeutralizedText, index: usize) -> Option<WebUrlSpa
     )
 }
 
-fn absolute_path_end(neutralized: &NeutralizedText, index: usize) -> Option<usize> {
+fn absolute_path_end(
+    neutralized: &NeutralizedText,
+    index: usize,
+    double_quote: Option<bool>,
+) -> Option<usize> {
     path_boundary(neutralized, index).then_some(())?;
     let value = neutralized.as_str();
-    let root_end = absolute_root_end(value, index)?;
-    let end = path_span_end(neutralized, index, root_end);
+    let (root_end, policy) = absolute_root(value, index)?;
+    let end = path_span_end(neutralized, index, root_end, policy, double_quote);
     let cookie_root = end == root_end
         && value
             .get(index.saturating_sub(5)..root_end)
@@ -448,7 +462,7 @@ fn absolute_path_end(neutralized: &NeutralizedText, index: usize) -> Option<usiz
     (!cookie_root).then_some(end)
 }
 
-fn absolute_root_end(value: &str, index: usize) -> Option<usize> {
+fn absolute_root(value: &str, index: usize) -> Option<(usize, UnquotedSpacePolicy)> {
     let mut root = index;
     let tail = value.get(index..)?;
     if tail.len() >= 5 && tail.as_bytes()[..5].eq_ignore_ascii_case(b"file:") {
@@ -456,19 +470,23 @@ fn absolute_root_end(value: &str, index: usize) -> Option<usize> {
     }
     let bytes = value.as_bytes();
     if bytes.get(root).is_some_and(u8::is_ascii_alphabetic) && bytes.get(root + 1) == Some(&b':') {
-        return separator_end(value, root + 2).map(|(end, _)| end);
+        return separator_end(value, root + 2).map(|(end, _)| (end, UnquotedSpacePolicy::Continue));
     }
     let (first, forward) = separator_end(value, root)?;
     let malformed_web = ["http:", "https:"].into_iter().any(|scheme| {
         index >= scheme.len() && value[index - scheme.len()..index].eq_ignore_ascii_case(scheme)
     });
-    if root > index || forward || malformed_web {
-        return Some(first);
+    if root > index || forward {
+        return Some((first, UnquotedSpacePolicy::Continue));
+    }
+    if malformed_web {
+        return Some((first, UnquotedSpacePolicy::RequireFollowingSeparator));
     }
     if let Some((end, second_forward)) = separator_end(value, first) {
-        return (!second_forward).then_some(end);
+        return (!second_forward).then_some((end, UnquotedSpacePolicy::Continue));
     }
     single_backslash_root_end(value, root, first)
+        .map(|end| (end, UnquotedSpacePolicy::RequireFollowingSeparator))
 }
 
 fn single_backslash_root_end(
@@ -516,14 +534,17 @@ fn typed_windows_component_end(
         {
             break;
         }
-        let typed = !character.is_control() && !r#"<>:"/\|?*"#.contains(character);
-        if !typed {
+        if !is_typed_windows_component_character(character) {
             return None;
         }
         component_chars += 1;
         cursor += character.len_utf8();
     }
     (component_chars >= minimum_chars).then_some(cursor)
+}
+
+fn is_typed_windows_component_character(character: char) -> bool {
+    !character.is_control() && !r#"<>:"/\|?*"#.contains(character)
 }
 
 fn is_known_windows_root(component: &str) -> bool {
@@ -632,16 +653,53 @@ fn separator_end(value: &str, index: usize) -> Option<(usize, bool)> {
     }
 }
 
-fn path_span_end(neutralized: &NeutralizedText, start: usize, mut cursor: usize) -> usize {
+fn advance_double_quote_context(value: &str, start: usize, end: usize, active: &mut Option<bool>) {
+    // LLM contract: UNQUOTED <-> DOUBLE_QUOTED; each consumed span advances once.
+    for cursor in start..end {
+        if value.as_bytes()[cursor] == b'"' {
+            let escaped = is_escaped(value.as_bytes(), 0, cursor);
+            match *active {
+                None => *active = Some(escaped),
+                Some(kind) if kind == escaped => *active = None,
+                Some(_) => {}
+            }
+        }
+    }
+}
+
+fn path_quote_context(value: &str, start: usize, double_quote: Option<bool>) -> Option<(u8, bool)> {
+    if let Some(escaped) = double_quote {
+        return Some((b'"', escaped));
+    }
+    let subject_start = ["http:", "https:"]
+        .into_iter()
+        .find_map(|scheme| {
+            let candidate = start.checked_sub(scheme.len())?;
+            value
+                .get(candidate..start)?
+                .eq_ignore_ascii_case(scheme)
+                .then_some(candidate)
+        })
+        .unwrap_or(start);
+    let quote_index = subject_start.checked_sub(1)?;
+    let quote = *value.as_bytes().get(quote_index)?;
+    is_quote(quote).then(|| (quote, is_escaped(value.as_bytes(), 0, quote_index)))
+}
+
+fn path_span_end(
+    neutralized: &NeutralizedText,
+    start: usize,
+    mut cursor: usize,
+    unquoted_space: UnquotedSpacePolicy,
+    double_quote: Option<bool>,
+) -> usize {
     let value = neutralized.as_str();
     let bytes = value.as_bytes();
-    let stop_at_space = separator_end(value, start)
-        .is_some_and(|(first, forward)| !forward && separator_end(value, first).is_none());
-    let quote = bytes
-        .get(start.wrapping_sub(1))
-        .copied()
-        .filter(|b| is_quote(*b));
-    let escaped_outer = quote.is_some_and(|_| is_escaped(bytes, 0, start - 1));
+    let quote_context = path_quote_context(value, start, double_quote);
+    let quote = quote_context.map(|(quote, _)| quote);
+    let escaped_outer = quote_context.is_some_and(|(_, escaped)| escaped);
+    let mut pending_space = None;
+    let mut typed_after_space = false;
     while cursor < value.len() && token_shape_at(value, cursor, true).is_none() {
         if neutralized.marker_at(cursor).is_some() {
             break;
@@ -656,15 +714,46 @@ fn path_span_end(neutralized: &NeutralizedText, start: usize, mut cursor: usize)
             break;
         }
         let character = value[cursor..].chars().next().expect("UTF-8 boundary");
-        if quote.is_none()
-            && ((character.is_whitespace() && (stop_at_space || character != ' '))
-                || PATH_TERMINATORS.contains(character))
+        if unquoted_space == UnquotedSpacePolicy::RequireFollowingSeparator
+            && separator_end(value, cursor).is_none()
+            && !is_typed_windows_component_character(character)
         {
             break;
         }
+        if quote.is_none() {
+            if character.is_whitespace() {
+                if character != ' ' {
+                    break;
+                }
+                if unquoted_space == UnquotedSpacePolicy::RequireFollowingSeparator {
+                    pending_space.get_or_insert(cursor);
+                    typed_after_space = false;
+                    cursor += 1;
+                    continue;
+                }
+            }
+            if PATH_TERMINATORS.contains(character)
+                && unquoted_space == UnquotedSpacePolicy::Continue
+            {
+                break;
+            }
+            if pending_space.is_some() {
+                if separator_end(value, cursor).is_some() {
+                    if !typed_after_space {
+                        break;
+                    }
+                    pending_space = None;
+                    typed_after_space = false;
+                } else if is_typed_windows_component_character(character) {
+                    typed_after_space = true;
+                } else {
+                    break;
+                }
+            }
+        }
         cursor += character.len_utf8();
     }
-    cursor
+    pending_space.unwrap_or(cursor)
 }
 
 fn path_boundary(neutralized: &NeutralizedText, index: usize) -> bool {
@@ -1633,6 +1722,59 @@ mod tests {
         let repeated = "<https://%25/a>".repeat(128);
         sanitize_external_text(&repeated, repeated.len() * 2).unwrap();
         assert_eq!(super::URL_PARSE_ATTEMPTS.with(std::cell::Cell::get), 128);
+    }
+
+    #[test]
+    fn redacts_spaced_single_backslash_paths_without_consuming_prose() {
+        let cases = [
+            (r"https:\Users\Alice Smith\repo", "https:[REDACTED_PATH]"),
+            (r"https:\Users\O'Brien Smith\repo", "https:[REDACTED_PATH]"),
+            (r"https:\Users\R&D\repo", "https:[REDACTED_PATH]"),
+            (
+                r#"\"x https:\Users\O'Brien Smith\repo\""#,
+                r#"\"x https:[REDACTED_PATH]\""#,
+            ),
+            (
+                r"https:\Users\Alice Smith\repo safe",
+                "https:[REDACTED_PATH] safe",
+            ),
+            (
+                r"https:\Users\Alice Mary Smith\repo safe",
+                "https:[REDACTED_PATH] safe",
+            ),
+            (
+                "https:%5CUsers%5CAlice Smith%5Crepo",
+                "https:[REDACTED_PATH]",
+            ),
+            (
+                r"prefix \Users\Alice Smith\repo safe",
+                "prefix [REDACTED_PATH] safe",
+            ),
+            (
+                r"https:\Users\Alice note?\repo safe",
+                r"https:[REDACTED_PATH] note?\repo safe",
+            ),
+            (
+                r#"{"path":"https:\\Users\\Alice Smith\\repo"}"#,
+                r#"{"path":"https:[REDACTED_PATH]"}"#,
+            ),
+            (
+                r#"{"path":"https:\\Users\\O'Brien Smith\\repo"}"#,
+                r#"{"path":"https:[REDACTED_PATH]"}"#,
+            ),
+            (
+                r#"{"path":"prefix https:\\Users\\O'Brien Smith\\repo"}"#,
+                r#"{"path":"prefix https:[REDACTED_PATH]"}"#,
+            ),
+            (
+                r#"{"message":"https:\\Users\\Alice Smith\\repo* safe"}"#,
+                r#"{"message":"https:[REDACTED_PATH]* safe"}"#,
+            ),
+        ];
+        for (input, expected) in cases {
+            let actual = sanitize_external_text(input, 8_192).unwrap();
+            assert_eq!(actual.as_str(), expected, "input {input:?}");
+        }
     }
 
     #[test]
