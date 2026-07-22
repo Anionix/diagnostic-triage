@@ -51,6 +51,16 @@ enum UnquotedSpacePolicy {
     RequireFollowingSeparator,
 }
 
+const RAW_QUOTE_ESCAPE_CLASS: usize = 0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QuoteFrame {
+    delimiter: u8,
+    escape_class: usize,
+}
+
+type QuoteState = Vec<QuoteFrame>;
+
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 #[serde(transparent)]
 pub(crate) struct SanitizedText(String);
@@ -369,7 +379,7 @@ fn redact_secret_assignments(
     let mut index = 0;
     let mut web_url_until = 0;
     let mut url_checked_until = 0;
-    let mut double_quote = None;
+    let mut quote_state = QuoteState::default();
     while index < value.len() {
         if index >= url_checked_until {
             match web_url_span(neutralized, index) {
@@ -393,20 +403,20 @@ fn redact_secret_assignments(
             .map(|(start, end)| (start, end, "[REDACTED_SECRET]"))
             .or_else(|| {
                 (mode == SanitizationMode::ExternalText && index >= web_url_until)
-                    .then(|| absolute_path_end(neutralized, index, double_quote))
+                    .then(|| absolute_path_end(neutralized, index, &quote_state))
                     .flatten()
                     .map(|end| (index, end, "[REDACTED_PATH]"))
             });
         if let Some((start, end, marker)) = redaction {
             output.push_str(&value[index..start])?;
             output.push_str(marker)?;
-            advance_double_quote_context(value, index, end, &mut double_quote);
+            advance_quote_context(neutralized, index, end, &mut quote_state);
             index = end;
         } else {
             let character = value[index..].chars().next().expect("UTF-8 boundary");
             output.push_char(character)?;
             let end = index + character.len_utf8();
-            advance_double_quote_context(value, index, end, &mut double_quote);
+            advance_quote_context(neutralized, index, end, &mut quote_state);
             index = end;
         }
     }
@@ -448,12 +458,18 @@ fn web_url_span(neutralized: &NeutralizedText, index: usize) -> Option<WebUrlSpa
 fn absolute_path_end(
     neutralized: &NeutralizedText,
     index: usize,
-    double_quote: Option<bool>,
+    quote_state: &QuoteState,
 ) -> Option<usize> {
     path_boundary(neutralized, index).then_some(())?;
     let value = neutralized.as_str();
     let (root_end, policy) = absolute_root(value, index)?;
-    let end = path_span_end(neutralized, index, root_end, policy, double_quote);
+    if quote_state
+        .last()
+        .is_some_and(|frame| closes_quote(value.as_bytes(), root_end - 1, *frame))
+    {
+        return None;
+    }
+    let end = path_span_end(neutralized, index, root_end, policy, quote_state);
     let cookie_root = end == root_end
         && value
             .get(index.saturating_sub(5)..root_end)
@@ -653,24 +669,77 @@ fn separator_end(value: &str, index: usize) -> Option<(usize, bool)> {
     }
 }
 
-fn advance_double_quote_context(value: &str, start: usize, end: usize, active: &mut Option<bool>) {
-    // LLM contract: UNQUOTED <-> DOUBLE_QUOTED; each consumed span advances once.
+fn quote_frame_at(bytes: &[u8], quote_index: usize) -> Option<QuoteFrame> {
+    let delimiter = *bytes.get(quote_index)?;
+    is_quote(delimiter).then_some(())?;
+    let mut run_start = quote_index;
+    while run_start > 0 && bytes[run_start - 1] == b'\\' {
+        run_start -= 1;
+    }
+    let slash_count = quote_index - run_start;
+    let escape_class = if slash_count % 2 == 0 {
+        RAW_QUOTE_ESCAPE_CLASS
+    } else {
+        slash_count % 4
+    };
+    Some(QuoteFrame {
+        delimiter,
+        escape_class,
+    })
+}
+
+fn quote_opens_at(neutralized: &NeutralizedText, quote_index: usize) -> bool {
+    let value = neutralized.as_str();
+    let bytes = value.as_bytes();
+    let mut delimiter_start = quote_index;
+    while delimiter_start > 0 && bytes[delimiter_start - 1] == b'\\' {
+        delimiter_start -= 1;
+    }
+    neutralized
+        .marker_ending_at(delimiter_start)
+        .and_then(|marker| char::from_u32(marker.code_point))
+        .is_some_and(char::is_whitespace)
+        || value[..delimiter_start]
+            .chars()
+            .next_back()
+            .is_none_or(|character| character.is_whitespace() || "([{:=,;".contains(character))
+}
+
+fn whitespace_at(neutralized: &NeutralizedText, index: usize) -> bool {
+    neutralized
+        .marker_at(index)
+        .and_then(|marker| char::from_u32(marker.code_point))
+        .is_some_and(char::is_whitespace)
+        || neutralized.as_str()[index..]
+            .chars()
+            .next()
+            .is_some_and(char::is_whitespace)
+}
+
+fn advance_quote_context(
+    neutralized: &NeutralizedText,
+    start: usize,
+    end: usize,
+    state: &mut QuoteState,
+) {
+    // LLM contract: QUOTE_OPEN -> NESTED_QUOTE | QUOTE_CLOSED; closing an outer frame closes malformed inner frames.
+    let value = neutralized.as_str();
     for cursor in start..end {
-        if value.as_bytes()[cursor] == b'"' {
-            let escaped = is_escaped(value.as_bytes(), 0, cursor);
-            match *active {
-                None => *active = Some(escaped),
-                Some(kind) if kind == escaped => *active = None,
-                Some(_) => {}
+        if let Some(frame) = quote_frame_at(value.as_bytes(), cursor) {
+            if let Some(position) = state.iter().rposition(|active| *active == frame) {
+                state.truncate(position);
+            } else if frame.delimiter == b'"' || quote_opens_at(neutralized, cursor) {
+                state.push(frame);
             }
         }
     }
 }
 
-fn path_quote_context(value: &str, start: usize, double_quote: Option<bool>) -> Option<(u8, bool)> {
-    if let Some(escaped) = double_quote {
-        return Some((b'"', escaped));
-    }
+fn path_quote_context(
+    value: &str,
+    start: usize,
+    quote_state: &QuoteState,
+) -> Option<(QuoteFrame, bool)> {
     let subject_start = ["http:", "https:"]
         .into_iter()
         .find_map(|scheme| {
@@ -682,8 +751,19 @@ fn path_quote_context(value: &str, start: usize, double_quote: Option<bool>) -> 
         })
         .unwrap_or(start);
     let quote_index = subject_start.checked_sub(1)?;
-    let quote = *value.as_bytes().get(quote_index)?;
-    is_quote(quote).then(|| (quote, is_escaped(value.as_bytes(), 0, quote_index)))
+    let adjacent = quote_frame_at(value.as_bytes(), quote_index);
+    adjacent
+        .filter(|frame| quote_state.last() == Some(frame))
+        .map(|frame| (frame, true))
+        .or_else(|| quote_state.last().copied().map(|frame| (frame, false)))
+}
+
+fn closes_quote(bytes: &[u8], cursor: usize, frame: QuoteFrame) -> bool {
+    (frame.escape_class == RAW_QUOTE_ESCAPE_CLASS && quote_frame_at(bytes, cursor) == Some(frame))
+        || (frame.escape_class != RAW_QUOTE_ESCAPE_CLASS
+            && bytes.get(cursor) == Some(&b'\\')
+            && bytes.get(cursor + 1) == Some(&frame.delimiter)
+            && quote_frame_at(bytes, cursor + 1) == Some(frame))
 }
 
 fn path_span_end(
@@ -691,32 +771,51 @@ fn path_span_end(
     start: usize,
     mut cursor: usize,
     unquoted_space: UnquotedSpacePolicy,
-    double_quote: Option<bool>,
+    quote_state: &QuoteState,
 ) -> usize {
     let value = neutralized.as_str();
     let bytes = value.as_bytes();
-    let quote_context = path_quote_context(value, start, double_quote);
-    let quote = quote_context.map(|(quote, _)| quote);
-    let escaped_outer = quote_context.is_some_and(|(_, escaped)| escaped);
+    let quote_context = path_quote_context(value, start, quote_state);
+    let quote = quote_context.map(|(frame, _)| frame);
+    // LLM contract: QUOTE_IMMEDIATE_PATH -> QUOTED_PATH_LITERAL; PROSE_THEN_PATH -> PUNCTUATION_WHITESPACE_BOUNDARY.
+    let quoted_path_literal = quote_context.is_some_and(|(_, literal)| literal);
     let mut pending_space = None;
     let mut typed_after_space = false;
     while cursor < value.len() && token_shape_at(value, cursor, true).is_none() {
         if neutralized.marker_at(cursor).is_some() {
             break;
         }
-        if quote.is_some_and(|quote| {
-            (!escaped_outer && bytes[cursor] == quote && !is_escaped(bytes, start, cursor))
-                || (escaped_outer
-                    && bytes[cursor] == b'\\'
-                    && bytes.get(cursor + 1) == Some(&quote)
-                    && !is_escaped(bytes, start, cursor))
-        }) {
+        if quote_state
+            .iter()
+            .any(|frame| closes_quote(bytes, cursor, *frame))
+        {
             break;
         }
         let character = value[cursor..].chars().next().expect("UTF-8 boundary");
         if unquoted_space == UnquotedSpacePolicy::RequireFollowingSeparator
             && separator_end(value, cursor).is_none()
             && !is_typed_windows_component_character(character)
+        {
+            break;
+        }
+        let next = cursor + character.len_utf8();
+        let quote_end = is_quote(bytes[cursor]).then_some(next).or_else(|| {
+            (character == '\\'
+                && bytes.get(next).is_some_and(|byte| is_quote(*byte))
+                && !quote_state
+                    .iter()
+                    .any(|frame| quote_frame_at(bytes, next) == Some(*frame)))
+            .then_some(next + 1)
+        });
+        if !quoted_path_literal && quote_end.is_some_and(|end| whitespace_at(neutralized, end)) {
+            break;
+        }
+        let quoted_prose_boundary =
+            quote.is_some() && !quoted_path_literal && whitespace_at(neutralized, next);
+        if PATH_TERMINATORS.contains(character)
+            && !matches!(character, '\'' | '"')
+            && ((quote.is_none() && unquoted_space == UnquotedSpacePolicy::Continue)
+                || quoted_prose_boundary)
         {
             break;
         }
@@ -731,11 +830,6 @@ fn path_span_end(
                     cursor += 1;
                     continue;
                 }
-            }
-            if PATH_TERMINATORS.contains(character)
-                && unquoted_space == UnquotedSpacePolicy::Continue
-            {
-                break;
             }
             if pending_space.is_some() {
                 if separator_end(value, cursor).is_some() {
@@ -1722,6 +1816,40 @@ mod tests {
         let repeated = "<https://%25/a>".repeat(128);
         sanitize_external_text(&repeated, repeated.len() * 2).unwrap();
         assert_eq!(super::URL_PARSE_ATTEMPTS.with(std::cell::Cell::get), 128);
+    }
+
+    #[test]
+    fn quoted_path_boundaries_preserve_prose_and_literal_filenames() {
+        let cases = [
+            (r#""x /A, then""#, r#""x [REDACTED_PATH], then""#),
+            (
+                r#"{"message":"see /Users/A, then retry"}"#,
+                r#"{"message":"see [REDACTED_PATH], then retry"}"#,
+            ),
+            (r#"\"x:\"/A, then"#, r#"\"x:\"[REDACTED_PATH], then"#),
+            (
+                r#"{"message":"see \"/Users/A\\\"B, C.txt\" after"}"#,
+                r#"{"message":"see \"[REDACTED_PATH]\" after"}"#,
+            ),
+            (r#""\"/A, B""#, r#""\"[REDACTED_PATH]""#),
+            (r#""x '/A, B' y""#, r#""x '[REDACTED_PATH]' y""#),
+            ("don't /A/O'Brien, x", "don't [REDACTED_PATH], x"),
+            ("x /Users/A' y", "x [REDACTED_PATH]' y"),
+            (r#"x /Users/A\" y"#, r#"x [REDACTED_PATH]\" y"#),
+            (r#""x /A\\" y"#, r#""x [REDACTED_PATH]" y"#),
+            (
+                "\"see /Users/A,\nthen retry\"",
+                "\"see [REDACTED_PATH],[CONTROL-U+000A]then retry\"",
+            ),
+            (
+                r#""see \Users\A, then retry""#,
+                r#""see [REDACTED_PATH], then retry""#,
+            ),
+        ];
+        for (input, expected) in cases {
+            let actual = sanitize_external_text(input, 8_192).unwrap();
+            assert_eq!(actual.as_str(), expected, "input {input:?}");
+        }
     }
 
     #[test]
