@@ -51,6 +51,7 @@ pub enum ConfigError {
 pub struct RuntimeConfig {
     pub engine: EngineConfig,
     pub repository: RepositoryConfig,
+    #[serde(default)]
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub limits: RuntimeLimits,
@@ -63,6 +64,12 @@ pub struct RuntimeConfig {
 }
 
 impl RuntimeConfig {
+    pub(crate) fn normalized(&self) -> Result<Self, ConfigError> {
+        let mut normalized = self.clone();
+        normalized.normalize_and_validate()?;
+        Ok(normalized)
+    }
+
     /// Parse and validate one complete TOML configuration.
     ///
     /// # Errors
@@ -82,8 +89,7 @@ impl RuntimeConfig {
     /// Returns [`ConfigError`] when any configured value violates the runtime
     /// or Engine boundary.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        let mut normalized = self.clone();
-        normalized.normalize_and_validate()
+        self.normalized().map(|_| ())
     }
 
     /// Build the Engine-owned, validated policy snapshot.
@@ -92,8 +98,7 @@ impl RuntimeConfig {
     ///
     /// Returns [`ConfigError`] when runtime or policy validation fails.
     pub fn policy_snapshot(&self) -> Result<PolicySnapshot, ConfigError> {
-        let mut normalized = self.clone();
-        normalized.normalize_and_validate()?;
+        let normalized = self.normalized()?;
         Ok(PolicySnapshot::new(
             &normalized.policy.rules,
             &normalized.policy.waivers,
@@ -106,8 +111,7 @@ impl RuntimeConfig {
     ///
     /// Returns [`ConfigError`] when runtime or classification validation fails.
     pub fn classification_rules(&self) -> Result<Vec<ClassificationRule>, ConfigError> {
-        let mut normalized = self.clone();
-        normalized.normalize_and_validate()?;
+        let normalized = self.normalized()?;
         normalized
             .classification
             .rules
@@ -128,8 +132,7 @@ impl RuntimeConfig {
     pub fn request_limits(
         &self,
     ) -> Result<diagnostic_triage_contracts::protocol::RequestLimits, ConfigError> {
-        let mut normalized = self.clone();
-        normalized.normalize_and_validate()?;
+        let normalized = self.normalized()?;
         (&normalized.limits).try_into()
     }
 
@@ -162,8 +165,7 @@ impl RuntimeConfig {
     /// Returns [`ConfigError`] when runtime configuration is invalid or the
     /// requested adapter is not configured.
     pub fn process_spec(&self, adapter_id: &AdapterId) -> Result<ProcessSpec, ConfigError> {
-        let mut normalized = self.clone();
-        normalized.normalize_and_validate()?;
+        let normalized = self.normalized()?;
         let provider = normalized
             .providers
             .iter()
@@ -202,9 +204,6 @@ impl RuntimeConfig {
         }
         self.repository.targets.sort();
 
-        if self.providers.is_empty() {
-            return Err(invalid("providers", "must contain at least one provider"));
-        }
         if self.providers.len() > 64 {
             return Err(invalid("providers", "must contain at most 64 providers"));
         }
@@ -215,10 +214,10 @@ impl RuntimeConfig {
                 return Err(invalid("providers", "adapter_id must be unique"));
             }
         }
-        if !self.providers.iter().any(|provider| provider.required) {
+        if !self.providers.is_empty() && !self.providers.iter().any(|provider| provider.required) {
             return Err(invalid(
                 "providers",
-                "must contain at least one required provider",
+                "a non-empty plan must contain at least one required provider",
             ));
         }
         self.providers
@@ -257,6 +256,9 @@ pub struct RepositoryConfig {
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     pub adapter_id: AdapterId,
+    pub adapter_version: String,
+    pub tool_name: String,
+    pub tool_version: String,
     pub program: String,
     #[serde(default)]
     pub argv: Vec<String>,
@@ -269,6 +271,9 @@ pub struct ProviderConfig {
 
 impl ProviderConfig {
     fn normalize_and_validate(&mut self) -> Result<(), ConfigError> {
+        validate_text("providers.adapter_version", &self.adapter_version, 1, 64)?;
+        validate_text("providers.tool_name", &self.tool_name, 1, 64)?;
+        validate_text("providers.tool_version", &self.tool_version, 1, 64)?;
         if self.program.trim().is_empty() || self.program.trim() != self.program {
             return Err(invalid(
                 "providers.program",
@@ -656,6 +661,9 @@ targets = ["src", "tests"]
 
 [[providers]]
 adapter_id = "rust"
+adapter_version = "0.1.0"
+tool_name = "cargo"
+tool_version = "1.85.0"
 program = "cargo"
 argv = ["check"]
 required = true
@@ -675,10 +683,15 @@ required_capabilities = ["diagnostic.check/v1"]
         assert_eq!(config.limits.max_stderr_bytes, DEFAULT_MAX_STDERR_BYTES);
         assert_eq!(config.limits.max_evidence_bytes, DEFAULT_MAX_EVIDENCE_BYTES);
         assert_eq!(config.limits.max_events, DEFAULT_MAX_EVENTS);
+        assert_eq!(config.providers[0].adapter_version, "0.1.0");
+        assert_eq!(config.providers[0].tool_name, "cargo");
+        assert_eq!(config.providers[0].tool_version, "1.85.0");
         assert_eq!(config.providers[0].program, "cargo");
         assert_eq!(config.providers[0].argv, ["check"]);
         assert!(config.providers[0].required);
         assert_eq!(config.output.format, OutputFormat::Json);
+        let wire = toml::to_string(&config).expect("serialize config");
+        assert_eq!(RuntimeConfig::from_toml(&wire).unwrap(), config);
     }
 
     #[test]
@@ -713,9 +726,11 @@ required_capabilities = ["diagnostic.check/v1"]
     #[test]
     fn validates_provider_identity_capabilities_and_bounds() {
         let base = minimal_config("");
-        for invalid in [
-            base.replacen("required = true", "required = false", 1),
+        let mut invalid = vec![
             base.replacen("adapter_id = \"rust\"", "adapter_id = \"Rust\"", 1),
+            base.replacen("adapter_version = \"0.1.0\"", "adapter_version = \"\"", 1),
+            base.replacen("tool_name = \"cargo\"", "tool_name = \" cargo\"", 1),
+            base.replacen("tool_version = \"1.85.0\"", "tool_version = \"bad\\u0000version\"", 1),
             base.replacen(
                 "required_capabilities = [\"diagnostic.check/v1\"]",
                 "required_capabilities = [\"diagnostic.check/v1\", \"diagnostic.check/v1\"]",
@@ -727,11 +742,40 @@ required_capabilities = ["diagnostic.check/v1"]
                 1,
             ),
             format!(
-                "{base}\n[[providers]]\nadapter_id = \"rust\"\nprogram = \"cargo\"\nrequired = false"
+                "{base}\n[[providers]]\nadapter_id = \"rust\"\nadapter_version = \"0.1.0\"\ntool_name = \"cargo\"\ntool_version = \"1.85.0\"\nprogram = \"cargo\"\nrequired = false"
             ),
-        ] {
+        ];
+        invalid.push(base.replacen(
+            "tool_version = \"1.85.0\"",
+            &format!("tool_version = \"{}\"", "x".repeat(65)),
+            1,
+        ));
+        for invalid in invalid {
             assert!(RuntimeConfig::from_toml(&invalid).is_err(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn permits_zero_providers_but_rejects_optional_only_plans() {
+        let config = minimal_config("");
+        let without_provider = config
+            .split("[[providers]]")
+            .next()
+            .expect("provider delimiter");
+        assert!(
+            RuntimeConfig::from_toml(without_provider)
+                .expect("zero providers")
+                .providers
+                .is_empty()
+        );
+        assert!(
+            RuntimeConfig::from_toml(&minimal_config("").replacen(
+                "required = true",
+                "required = false",
+                1
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -804,7 +848,7 @@ required_capabilities = ["diagnostic.check/v1"]
                 1,
             );
         let input = format!(
-            "{input}\n[[providers]]\nadapter_id = \"python\"\nprogram = \"python-provider\"\nargv = [\"--first\", \"--second\"]\nrequired = false"
+            "{input}\n[[providers]]\nadapter_id = \"python\"\nadapter_version = \"0.1.0\"\ntool_name = \"ruff\"\ntool_version = \"0.12.4\"\nprogram = \"python-provider\"\nargv = [\"--first\", \"--second\"]\nrequired = false"
         );
 
         let config = RuntimeConfig::from_toml(&input).expect("valid config");
