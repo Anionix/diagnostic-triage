@@ -1,25 +1,38 @@
 //! Typed, deterministic bug issue-draft projection.
 
+use std::io::Write;
+
 use diagnostic_triage_contracts::{
     AdapterId, Fingerprint, Language, ObjectId, Sha256Digest,
     model::{
         AdapterKind, DecisionAction, EvidenceSource, ExecutionStatus, Finding, Location, Position,
-        Severity, Taxonomy, Tool, Verdict, WaivedAction,
+        SessionReport, Severity, Taxonomy, Tool, Verdict, WaivedAction,
     },
+    validate_report,
 };
 
 use crate::{
     issue_draft_sanitize::{
         SanitizeError, SanitizedText, sanitize_external_text, sanitize_repository_path_text,
     },
-    reporters::{MAX_REPORT_OUTPUT_BYTES, ValidatedSessionReport},
+    reporters::{
+        BoundedBuffer, MAX_REPORT_OUTPUT_BYTES, ReportFormat, Reporter, ReporterError,
+        ValidatedSessionReport, write_encoded,
+    },
 };
 
 // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
 
+/// Stable schema identity for the JSON bug issue-draft projection.
+pub const BUG_ISSUE_DRAFT_SCHEMA_VERSION: &str = "diagnostic-triage.bug-issue-draft/v1";
+/// The only label proposed by the JSON bug issue-draft projection.
+pub const BUG_ISSUE_LABEL: &str = "bug";
+/// Hard byte limit for one complete JSON bug issue draft.
+pub const MAX_ISSUE_DRAFT_OUTPUT_BYTES: usize = MAX_REPORT_OUTPUT_BYTES;
+
 macro_rules! draft_type {
     ($visibility:vis $name:ident { $($field:ident: $kind:ty),+ $(,)? }) => {
-        #[derive(Clone, Debug, Eq, PartialEq)]
+        #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
         $visibility struct $name { $( $field: $kind, )+ }
     };
 }
@@ -29,7 +42,7 @@ macro_rules! record {
     };
 }
 
-draft_type!(pub(crate) BugIssueDraftV1 { session_id: ObjectId, contract_sha256: Sha256Digest, policy_digest: Sha256Digest, verdict: Verdict, findings: Vec<BugFindingV1>, decisions: Vec<BugDecisionV1>, evidence: Vec<BugEvidenceRefV1>, executions: Vec<BugExecutionV1> });
+draft_type!(pub(crate) BugIssueDraftV1 { schema_version: &'static str, labels: [&'static str; 1], session_id: ObjectId, contract_sha256: Sha256Digest, policy_digest: Sha256Digest, verdict: Verdict, findings: Vec<BugFindingV1>, decisions: Vec<BugDecisionV1>, evidence: Vec<BugEvidenceRefV1>, executions: Vec<BugExecutionV1> });
 draft_type!(BugToolV1 { name: SanitizedText, version: SanitizedText, rule_id: Option<SanitizedText> });
 draft_type!(BugLocationV1 { path: SanitizedText, start: Position, end: Option<Position> });
 draft_type!(BugFindingV1 { finding_id: ObjectId, fingerprint: Fingerprint, observation_ids: Vec<ObjectId>, tool: BugToolV1, language: Language, severity: Severity, taxonomy: Taxonomy, message: SanitizedText, location: Option<BugLocationV1>, symbol: Option<SanitizedText>, expected: Option<SanitizedText>, observed: Option<SanitizedText>, evidence_ids: Vec<ObjectId> });
@@ -40,10 +53,79 @@ draft_type!(BugDecisionV1 { decision_id: ObjectId, finding_id: ObjectId, action:
 draft_type!(BugEvidenceRefV1 { evidence_id: ObjectId, execution_id: Option<ObjectId>, source: EvidenceSource, sha256: Sha256Digest, relative_path: Option<SanitizedText> });
 draft_type!(BugExecutionV1 { execution_id: ObjectId, adapter_id: AdapterId, adapter_kind: AdapterKind, tool: BugToolV1, required: bool, status: ExecutionStatus, exit_code: Option<u8>, message: Option<SanitizedText> });
 
+/// JSON reporter for deterministic, sanitized bug issue drafts.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BugIssueDraftJsonReporter;
+
+impl Reporter for BugIssueDraftJsonReporter {
+    fn write_report(
+        &self,
+        report: &ValidatedSessionReport,
+        writer: &mut dyn Write,
+    ) -> Result<(), ReporterError> {
+        let bytes = bug_issue_draft_json_bytes(report)?;
+        write_encoded(ReportFormat::BugIssueDraftJson, &bytes, writer)
+    }
+}
+
+/// Encode one validated report as a complete bounded JSON bug issue draft.
+///
+/// # Errors
+/// Returns a typed projection, encoding, or output-limit error.
+pub fn bug_issue_draft_json_bytes(
+    report: &ValidatedSessionReport,
+) -> Result<Vec<u8>, ReporterError> {
+    let draft = BugIssueDraftV1::project(report)
+        .map_err(|_| output_too_large(MAX_ISSUE_DRAFT_OUTPUT_BYTES))?;
+    encode_json(&draft, MAX_ISSUE_DRAFT_OUTPUT_BYTES)
+}
+
+/// Validate, fully encode, and then write one JSON bug issue draft.
+///
+/// # Errors
+/// Returns a typed contract, projection, encoding, output-limit, or writer error.
+pub fn write_bug_issue_draft_json<W: Write + ?Sized>(
+    report: &SessionReport,
+    writer: &mut W,
+) -> Result<(), ReporterError> {
+    validate_report(report).map_err(ReporterError::Contract)?;
+    let draft = BugIssueDraftV1::project_report(report)
+        .map_err(|_| output_too_large(MAX_ISSUE_DRAFT_OUTPUT_BYTES))?;
+    let bytes = encode_json(&draft, MAX_ISSUE_DRAFT_OUTPUT_BYTES)?;
+    write_encoded(ReportFormat::BugIssueDraftJson, &bytes, writer)
+}
+
+fn output_too_large(max: usize) -> ReporterError {
+    ReporterError::OutputTooLarge {
+        format: ReportFormat::BugIssueDraftJson,
+        max,
+    }
+}
+
+fn encode_json(draft: &BugIssueDraftV1, limit: usize) -> Result<Vec<u8>, ReporterError> {
+    let mut output = BoundedBuffer::new(limit);
+    match serde_json::to_writer(&mut output, draft) {
+        Ok(()) => {
+            output
+                .write_all(b"\n")
+                .map_err(|_| output_too_large(limit))?;
+            Ok(output.bytes)
+        }
+        Err(_) if output.exceeded => Err(output_too_large(limit)),
+        Err(source) => Err(ReporterError::Encoding {
+            format: ReportFormat::BugIssueDraftJson,
+            source,
+        }),
+    }
+}
+
 impl BugIssueDraftV1 {
     pub(crate) fn project(report: &ValidatedSessionReport) -> Result<Self, SanitizeError> {
+        Self::project_report(report.as_report())
+    }
+
+    fn project_report(report: &SessionReport) -> Result<Self, SanitizeError> {
         // Sources: schemas/v1/session-report.schema.json and https://doc.rust-lang.org/std/primitive.slice.html#method.sort_by.
-        let report = report.as_report();
         let mut findings = report
             .findings
             .iter()
@@ -77,7 +159,7 @@ impl BugIssueDraftV1 {
         evidence.sort_by(|a, b| a.evidence_id.cmp(&b.evidence_id));
         executions.sort_by(|a, b| a.execution_id.cmp(&b.execution_id));
         Ok(
-            record!(BugIssueDraftV1 { session_id = report.session_id.clone(), contract_sha256 = report.contract_sha256.clone(), policy_digest = report.policy_digest.clone(), verdict = report.verdict.clone(), findings = findings, decisions = decisions, evidence = evidence, executions = executions }),
+            record!(BugIssueDraftV1 { schema_version = BUG_ISSUE_DRAFT_SCHEMA_VERSION, labels = [BUG_ISSUE_LABEL], session_id = report.session_id.clone(), contract_sha256 = report.contract_sha256.clone(), policy_digest = report.policy_digest.clone(), verdict = report.verdict.clone(), findings = findings, decisions = decisions, evidence = evidence, executions = executions }),
         )
     }
 }
@@ -118,6 +200,7 @@ fn sorted_ids(value: &[ObjectId]) -> Vec<ObjectId> {
 mod tests {
     use super::*;
     use diagnostic_triage_contracts::model::{DecisionAction, ExecutionStatus, SessionReport};
+    use std::io;
 
     const VALID: &[u8] = include_bytes!("../../../tests/fixtures/v1/valid-report.json");
     const UNSUPPORTED: &[u8] =
@@ -193,5 +276,92 @@ mod tests {
         report.findings.reverse();
         report.decisions.reverse();
         assert_eq!(project(report), expected);
+    }
+
+    struct PrefixWriter(Vec<u8>);
+
+    impl Write for PrefixWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.0.is_empty() {
+                self.0.push(bytes[0]);
+                Ok(1)
+            } else {
+                Err(io::Error::other("injected writer failure"))
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn json_matches_golden_and_omits_forbidden_material() {
+        let report = ValidatedSessionReport::from_json(VALID).unwrap();
+        let bytes = bug_issue_draft_json_bytes(&report).unwrap();
+        assert_eq!(
+            bytes,
+            include_bytes!("../tests/golden/valid-report.issue.json")
+        );
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["schema_version"], BUG_ISSUE_DRAFT_SCHEMA_VERSION);
+        assert_eq!(value["labels"], serde_json::json!([BUG_ISSUE_LABEL]));
+        let text = String::from_utf8(bytes).unwrap();
+        for forbidden in [
+            "\"content\"",
+            "environment",
+            "/Users/",
+            "posting",
+            "api.github",
+        ] {
+            assert!(!text.contains(forbidden), "leaked {forbidden}");
+        }
+    }
+
+    #[test]
+    fn exact_limit_succeeds_and_one_byte_over_is_typed() {
+        let report = ValidatedSessionReport::from_json(VALID).unwrap();
+        let draft = BugIssueDraftV1::project(&report).unwrap();
+        let bytes = encode_json(&draft, MAX_ISSUE_DRAFT_OUTPUT_BYTES).unwrap();
+        assert_eq!(encode_json(&draft, bytes.len()).unwrap(), bytes);
+        let limit = bytes.len() - 1;
+        assert!(
+            matches!(encode_json(&draft, limit), Err(ReporterError::OutputTooLarge { format: ReportFormat::BugIssueDraftJson, max }) if max == limit)
+        );
+    }
+
+    #[test]
+    fn bytes_are_stable_when_evidence_order_changes() {
+        let mut report = report(VERIFIED);
+        let expected =
+            bug_issue_draft_json_bytes(&ValidatedSessionReport::new(report.clone()).unwrap())
+                .unwrap();
+        report.evidence.reverse();
+        assert_eq!(
+            bug_issue_draft_json_bytes(&ValidatedSessionReport::new(report).unwrap()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn invalid_input_writes_nothing_and_writer_failure_keeps_prefix() {
+        let mut invalid = report(VALID);
+        invalid.decisions.clear();
+        let mut output = Vec::new();
+        assert!(matches!(
+            write_bug_issue_draft_json(&invalid, &mut output),
+            Err(ReporterError::Contract(_))
+        ));
+        assert!(output.is_empty());
+        let mut writer = PrefixWriter(Vec::new());
+        let error = write_bug_issue_draft_json(&report(VALID), &mut writer).unwrap_err();
+        assert!(matches!(
+            error,
+            ReporterError::Io {
+                format: ReportFormat::BugIssueDraftJson,
+                ..
+            }
+        ));
+        assert_eq!(writer.0.len(), 1);
     }
 }

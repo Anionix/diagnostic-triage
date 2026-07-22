@@ -120,6 +120,8 @@ pub enum ReportFormat {
     Tsv,
     /// GitHub workflow-command annotations for policy decisions.
     GitHubAnnotations,
+    /// A sanitized, deterministic JSON bug issue draft.
+    BugIssueDraftJson,
 }
 
 impl fmt::Display for ReportFormat {
@@ -129,6 +131,7 @@ impl fmt::Display for ReportFormat {
             Self::Sarif => "SARIF",
             Self::Tsv => "TSV",
             Self::GitHubAnnotations => "GitHub annotations",
+            Self::BugIssueDraftJson => "bug issue-draft JSON",
         })
     }
 }

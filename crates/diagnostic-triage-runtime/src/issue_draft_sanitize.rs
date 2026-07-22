@@ -44,7 +44,8 @@ enum WebUrlSpan {
     Reject(usize),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+#[serde(transparent)]
 pub(crate) struct SanitizedText(String);
 
 impl SanitizedText {

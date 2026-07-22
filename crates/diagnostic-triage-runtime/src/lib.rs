@@ -1,6 +1,5 @@
 //! Runtime configuration, bounded process orchestration, and deterministic output boundaries for Diagnostic Triage.
 
-#[allow(dead_code, reason = "consumed by follow-up issue-draft reporters")]
 mod issue_draft;
 #[allow(
     dead_code,
@@ -32,6 +31,10 @@ pub mod session;
 pub use config::{ConfigError, RuntimeConfig};
 pub use github_annotations::{
     GitHubAnnotationReporter, github_annotations_bytes, write_github_annotations,
+};
+pub use issue_draft::{
+    BUG_ISSUE_DRAFT_SCHEMA_VERSION, BUG_ISSUE_LABEL, BugIssueDraftJsonReporter,
+    MAX_ISSUE_DRAFT_OUTPUT_BYTES, bug_issue_draft_json_bytes, write_bug_issue_draft_json,
 };
 pub use reporters::{
     CanonicalJsonReporter, MAX_REPORT_OUTPUT_BYTES, ReportFormat, Reporter, ReporterError,
