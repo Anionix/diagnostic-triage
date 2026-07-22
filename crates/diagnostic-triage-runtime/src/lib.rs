@@ -6,6 +6,8 @@ mod issue_draft;
     reason = "private kernel consumed by follow-up issue-draft reporter slices"
 )]
 mod issue_draft_sanitize;
+#[allow(dead_code, reason = "planning kernel consumed by #77 orchestration")]
+mod orchestration;
 mod ruff_fix;
 mod scratch;
 
