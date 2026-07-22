@@ -5,8 +5,9 @@ use std::io::Write;
 use diagnostic_triage_contracts::{
     AdapterId, Fingerprint, Language, ObjectId, Sha256Digest,
     model::{
-        AdapterKind, DecisionAction, EvidenceSource, ExecutionStatus, Finding, Location, Position,
-        SessionReport, Severity, Taxonomy, Tool, Verdict, WaivedAction,
+        AdapterKind, Decision, DecisionAction, Evidence, EvidenceSource, Execution,
+        ExecutionStatus, Finding, Location, Position, SessionReport, Severity, Taxonomy, Tool,
+        Verdict, WaivedAction,
     },
     validate_report,
 };
@@ -30,6 +31,11 @@ pub const BUG_ISSUE_LABEL: &str = "bug";
 /// Hard byte limit for one complete bug issue-draft representation.
 pub const MAX_ISSUE_DRAFT_OUTPUT_BYTES: usize = MAX_REPORT_OUTPUT_BYTES;
 const MARKDOWN_HEADER: &[u8] = b"# Diagnostic Triage bug issue draft\n\n> Draft only: no issue was posted.\n\n## Typed projection\n\n";
+
+#[cfg(test)]
+std::thread_local! {
+    static EXECUTION_PROJECTION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 macro_rules! draft_type {
     ($visibility:vis $name:ident { $($field:ident: $kind:ty),+ $(,)? }) => {
@@ -91,8 +97,7 @@ impl Reporter for BugIssueDraftMarkdownReporter {
 pub fn bug_issue_draft_json_bytes(
     report: &ValidatedSessionReport,
 ) -> Result<Vec<u8>, ReporterError> {
-    let draft = BugIssueDraftV1::project(report)
-        .map_err(|_| output_too_large(MAX_ISSUE_DRAFT_OUTPUT_BYTES))?;
+    let draft = BugIssueDraftV1::project(report)?;
     encode_json(&draft, MAX_ISSUE_DRAFT_OUTPUT_BYTES)
 }
 
@@ -118,8 +123,7 @@ pub fn write_bug_issue_draft_json<W: Write + ?Sized>(
     writer: &mut W,
 ) -> Result<(), ReporterError> {
     validate_report(report).map_err(ReporterError::Contract)?;
-    let draft = BugIssueDraftV1::project_report(report)
-        .map_err(|_| output_too_large(MAX_ISSUE_DRAFT_OUTPUT_BYTES))?;
+    let draft = BugIssueDraftV1::project_report(report, ReportFormat::BugIssueDraftJson)?;
     let bytes = encode_json(&draft, MAX_ISSUE_DRAFT_OUTPUT_BYTES)?;
     write_encoded(ReportFormat::BugIssueDraftJson, &bytes, writer)
 }
@@ -133,8 +137,7 @@ pub fn write_bug_issue_draft_markdown<W: Write + ?Sized>(
     writer: &mut W,
 ) -> Result<(), ReporterError> {
     validate_report(report).map_err(ReporterError::Contract)?;
-    let draft = BugIssueDraftV1::project_report(report)
-        .map_err(|_| markdown_too_large(MAX_ISSUE_DRAFT_OUTPUT_BYTES))?;
+    let draft = BugIssueDraftV1::project_report(report, ReportFormat::BugIssueDraftMarkdown)?;
     let json = encode_json(&draft, MAX_ISSUE_DRAFT_OUTPUT_BYTES)?;
     let bytes = encode_markdown(&json, MAX_ISSUE_DRAFT_OUTPUT_BYTES)?;
     write_encoded(ReportFormat::BugIssueDraftMarkdown, &bytes, writer)
@@ -152,6 +155,101 @@ fn markdown_too_large(max: usize) -> ReporterError {
         format: ReportFormat::BugIssueDraftMarkdown,
         max,
     }
+}
+
+fn projection_too_large(format: ReportFormat, max: usize) -> ReporterError {
+    ReporterError::OutputTooLarge { format, max }
+}
+
+struct ProjectionCounter {
+    bytes: Option<usize>,
+    limit: usize,
+}
+
+impl ProjectionCounter {
+    const fn new(limit: usize) -> Self {
+        Self {
+            bytes: Some(0),
+            limit,
+        }
+    }
+
+    fn measure<T: serde::Serialize>(
+        &mut self,
+        value: &T,
+        format: ReportFormat,
+    ) -> Result<(), ReporterError> {
+        // Sources: https://docs.rs/serde_json/1.0.150/serde_json/fn.to_writer.html
+        // and https://doc.rust-lang.org/std/io/trait.Write.html.
+        serde_json::to_writer(&mut *self, value)
+            .map_err(|source| ReporterError::Encoding { format, source })?;
+        self.counted(format).map(drop)
+    }
+
+    fn charge(&mut self, bytes: usize, format: ReportFormat) -> Result<(), ReporterError> {
+        self.record(bytes);
+        self.counted(format).map(drop)
+    }
+
+    fn record(&mut self, bytes: usize) {
+        self.bytes = self
+            .bytes
+            .and_then(|total| total.checked_add(bytes))
+            .filter(|total| *total <= self.limit);
+    }
+
+    fn counted(&self, format: ReportFormat) -> Result<usize, ReporterError> {
+        self.bytes
+            .ok_or_else(|| projection_too_large(format, self.limit))
+    }
+}
+
+impl Write for ProjectionCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.record(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn measure_collection<T: serde::Serialize>(
+    counter: &mut ProjectionCounter,
+    format: ReportFormat,
+    values: impl Iterator<Item = Result<T, SanitizeError>>,
+) -> Result<(), ReporterError> {
+    for (index, value) in values.enumerate() {
+        counter.charge(usize::from(index > 0), format)?;
+        counter.measure(
+            &value.map_err(|_| projection_too_large(format, counter.limit))?,
+            format,
+        )?;
+    }
+    Ok(())
+}
+
+fn measure_project_report(
+    report: &SessionReport,
+    limit: usize,
+    format: ReportFormat,
+) -> Result<usize, ReporterError> {
+    // Own at most one projected item; build aggregate Vecs only after this exact JSON count fits.
+    let empty = record!(BugIssueDraftV1 { schema_version = BUG_ISSUE_DRAFT_SCHEMA_VERSION, labels = [BUG_ISSUE_LABEL], session_id = report.session_id.clone(), contract_sha256 = report.contract_sha256.clone(), policy_digest = report.policy_digest.clone(), verdict = report.verdict.clone(), findings = Vec::new(), decisions = Vec::new(), evidence = Vec::new(), executions = Vec::new() });
+    let mut counter = ProjectionCounter::new(limit);
+    counter.measure(&empty, format)?;
+    counter.charge(1, format)?; // The encoder appends one newline.
+    macro_rules! measure {
+        ($values:expr) => {
+            measure_collection(&mut counter, format, $values)?
+        };
+    }
+    measure!(report.findings.iter().map(project_finding));
+    measure!(report.decisions.iter().map(project_decision));
+    measure!(report.evidence.iter().map(project_evidence));
+    measure!(report.executions.iter().map(project_execution));
+    counter.counted(format)
 }
 
 fn encode_json(draft: &BugIssueDraftV1, limit: usize) -> Result<Vec<u8>, ReporterError> {
@@ -187,11 +285,17 @@ fn encode_markdown(json: &[u8], limit: usize) -> Result<Vec<u8>, ReporterError> 
 }
 
 impl BugIssueDraftV1 {
-    pub(crate) fn project(report: &ValidatedSessionReport) -> Result<Self, SanitizeError> {
-        Self::project_report(report.as_report())
+    pub(crate) fn project(report: &ValidatedSessionReport) -> Result<Self, ReporterError> {
+        Self::project_report(report.as_report(), ReportFormat::BugIssueDraftJson)
     }
 
-    fn project_report(report: &SessionReport) -> Result<Self, SanitizeError> {
+    fn project_report(report: &SessionReport, format: ReportFormat) -> Result<Self, ReporterError> {
+        measure_project_report(report, MAX_ISSUE_DRAFT_OUTPUT_BYTES, format)?;
+        Self::project_unchecked(report)
+            .map_err(|_| projection_too_large(format, MAX_ISSUE_DRAFT_OUTPUT_BYTES))
+    }
+
+    fn project_unchecked(report: &SessionReport) -> Result<Self, SanitizeError> {
         // Sources: schemas/v1/session-report.schema.json and https://doc.rust-lang.org/std/primitive.slice.html#method.sort_by.
         let mut findings = report
             .findings
@@ -201,17 +305,17 @@ impl BugIssueDraftV1 {
         let mut decisions = report
             .decisions
             .iter()
-            .map(|value| Ok(record!(BugDecisionV1 { decision_id = value.decision_id.clone(), finding_id = value.finding_id.clone(), action = value.action.clone(), evaluated_at = text(&value.evaluated_at)?, matched_rule_id = text(&value.matched_rule_id)?, waiver = value.waiver.as_ref().map(|waiver| Ok(record!(BugWaiverV1 { fingerprint = waiver.fingerprint.clone(), waived_action = waiver.waived_action.clone(), reason = text(&waiver.reason)?, owner = text(&waiver.owner)?, expires_at = text(&waiver.expires_at)? }))).transpose()? })))
+            .map(project_decision)
             .collect::<Result<Vec<_>, SanitizeError>>()?;
         let mut evidence = report
             .evidence
             .iter()
-            .map(|value| Ok(record!(BugEvidenceRefV1 { evidence_id = value.evidence_id.clone(), execution_id = value.execution_id.clone(), source = value.source.clone(), sha256 = value.sha256.clone(), relative_path = value.relative_path.as_ref().map(|path| sanitize_repository_path_text(path, MAX_REPORT_OUTPUT_BYTES)).transpose()? })))
+            .map(project_evidence)
             .collect::<Result<Vec<_>, SanitizeError>>()?;
         let mut executions = report
             .executions
             .iter()
-            .map(|value| Ok(record!(BugExecutionV1 { execution_id = value.execution_id.clone(), adapter_id = value.adapter_id.clone(), adapter_kind = value.adapter_kind.clone(), tool = project_tool(&value.tool)?, required = value.required, status = value.status.clone(), exit_code = value.exit_code.0, message = optional_text(value.message.as_deref())? })))
+            .map(project_execution)
             .collect::<Result<Vec<_>, SanitizeError>>()?;
         findings.sort_by(|a, b| {
             a.fingerprint
@@ -229,6 +333,19 @@ impl BugIssueDraftV1 {
             record!(BugIssueDraftV1 { schema_version = BUG_ISSUE_DRAFT_SCHEMA_VERSION, labels = [BUG_ISSUE_LABEL], session_id = report.session_id.clone(), contract_sha256 = report.contract_sha256.clone(), policy_digest = report.policy_digest.clone(), verdict = report.verdict.clone(), findings = findings, decisions = decisions, evidence = evidence, executions = executions }),
         )
     }
+}
+
+#[rustfmt::skip]
+fn project_decision(value: &Decision) -> Result<BugDecisionV1, SanitizeError> { Ok(record!(BugDecisionV1 { decision_id = value.decision_id.clone(), finding_id = value.finding_id.clone(), action = value.action.clone(), evaluated_at = text(&value.evaluated_at)?, matched_rule_id = text(&value.matched_rule_id)?, waiver = value.waiver.as_ref().map(|waiver| Ok(record!(BugWaiverV1 { fingerprint = waiver.fingerprint.clone(), waived_action = waiver.waived_action.clone(), reason = text(&waiver.reason)?, owner = text(&waiver.owner)?, expires_at = text(&waiver.expires_at)? }))).transpose()? })) }
+
+#[rustfmt::skip]
+fn project_evidence(value: &Evidence) -> Result<BugEvidenceRefV1, SanitizeError> { Ok(record!(BugEvidenceRefV1 { evidence_id = value.evidence_id.clone(), execution_id = value.execution_id.clone(), source = value.source.clone(), sha256 = value.sha256.clone(), relative_path = value.relative_path.as_ref().map(|path| sanitize_repository_path_text(path, MAX_REPORT_OUTPUT_BYTES)).transpose()? })) }
+
+#[rustfmt::skip]
+fn project_execution(value: &Execution) -> Result<BugExecutionV1, SanitizeError> {
+    #[cfg(test)]
+    EXECUTION_PROJECTION_CALLS.with(|calls| calls.set(calls.get() + 1));
+    Ok(record!(BugExecutionV1 { execution_id = value.execution_id.clone(), adapter_id = value.adapter_id.clone(), adapter_kind = value.adapter_kind.clone(), tool = project_tool(&value.tool)?, required = value.required, status = value.status.clone(), exit_code = value.exit_code.0, message = optional_text(value.message.as_deref())? }))
 }
 
 fn project_finding(value: &Finding) -> Result<BugFindingV1, SanitizeError> {
@@ -403,6 +520,43 @@ mod tests {
         assert!(
             matches!(encode_json(&draft, limit), Err(ReporterError::OutputTooLarge { format: ReportFormat::BugIssueDraftJson, max }) if max == limit)
         );
+    }
+
+    #[test]
+    fn projection_preflight_counts_aggregate_expansion_before_collection() {
+        let mut input = report(VALID);
+        for suffix in 0x190..=0x191 {
+            let mut execution = input.executions[0].clone();
+            execution.execution_id = format!("019f7e95-0000-7000-8000-{suffix:012x}")
+                .parse()
+                .unwrap();
+            execution.message = Some("\0".repeat(64));
+            input.executions.push(execution);
+        }
+        let report = ValidatedSessionReport::new(input).unwrap();
+        let draft = BugIssueDraftV1::project_unchecked(report.as_report()).unwrap();
+        let exact = encode_json(&draft, MAX_ISSUE_DRAFT_OUTPUT_BYTES)
+            .unwrap()
+            .len();
+        assert_eq!(
+            measure_project_report(report.as_report(), exact, ReportFormat::BugIssueDraftJson)
+                .unwrap(),
+            exact
+        );
+        let mut prefix = report.as_report().clone();
+        prefix.executions.truncate(2);
+        let second_execution_end =
+            measure_project_report(&prefix, usize::MAX, ReportFormat::BugIssueDraftJson).unwrap();
+        EXECUTION_PROJECTION_CALLS.with(|calls| calls.set(0));
+        assert!(matches!(
+            measure_project_report(
+                report.as_report(),
+                second_execution_end - 1,
+                ReportFormat::BugIssueDraftJson
+            ),
+            Err(ReporterError::OutputTooLarge { format: ReportFormat::BugIssueDraftJson, max }) if max == second_execution_end - 1
+        ));
+        EXECUTION_PROJECTION_CALLS.with(|calls| assert_eq!(calls.get(), 2));
     }
 
     #[test]
