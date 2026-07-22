@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeSet,
     fs, io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use diagnostic_triage_contracts::protocol::{
@@ -39,8 +39,12 @@ pub(crate) struct PlannedProvider {
 }
 
 impl PlannedProvider {
-    fn run(self, workspace: &ResolvedWorkspace) -> Result<ExecutedProvider, ReadOnlyRunError> {
-        let spec = ProcessSpec::new(self.config.program.clone())
+    fn run(
+        self,
+        workspace: &ResolvedWorkspace,
+        program: PathBuf,
+    ) -> Result<ExecutedProvider, ReadOnlyRunError> {
+        let spec = ProcessSpec::new(program)
             .args(self.config.argv.clone())
             .current_dir(workspace.repository_root());
         let outcome = run_provider_session(
@@ -121,6 +125,19 @@ pub(crate) enum ReadOnlyRunError {
         workspace: PathBuf,
         repository_root: PathBuf,
     },
+    #[error("failed to resolve provider program {program}")]
+    ProviderProgramIo {
+        program: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("provider program {program} escapes trusted repository root {repository_root}")]
+    ProviderProgramEscape {
+        program: PathBuf,
+        repository_root: PathBuf,
+    },
+    #[error("provider program path form is unsupported: {program}")]
+    ProviderProgramUnsupported { program: PathBuf },
     #[error("provider session failed for {adapter_id}")]
     Provider {
         adapter_id: AdapterId,
@@ -190,9 +207,15 @@ pub(crate) fn execute_read_only_plan(
     let plan = build_read_only_plan(config, repository_digest, mode)?;
     let workspace = resolve_workspace(repository_root, &config.repository.workspace)?;
     let ReadOnlyPlan { plan_id, providers } = plan;
+    let programs = providers
+        .iter()
+        .map(|provider| {
+            resolve_provider_program(workspace.repository_root(), &provider.config.program)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     let mut executed = Vec::with_capacity(providers.len());
-    for planned in providers {
-        executed.push(planned.run(&workspace)?);
+    for (planned, program) in providers.into_iter().zip(programs) {
+        executed.push(planned.run(&workspace, program)?);
     }
     Ok(ExecutedReadOnlyPlan {
         plan_id,
@@ -232,11 +255,51 @@ fn resolve_workspace(
     })
 }
 
+fn resolve_provider_program(
+    repository_root: &Path,
+    configured: &str,
+) -> Result<PathBuf, ReadOnlyRunError> {
+    let program = Path::new(configured);
+    if program.is_absolute() || is_bare_program_name(program) {
+        return Ok(program.to_path_buf());
+    }
+    if program.has_root()
+        || matches!(program.components().next(), Some(Component::Prefix(_)))
+        || !configured.chars().any(std::path::is_separator)
+    {
+        return Err(ReadOnlyRunError::ProviderProgramUnsupported {
+            program: program.to_path_buf(),
+        });
+    }
+
+    let candidate = repository_root.join(program);
+    let resolved =
+        fs::canonicalize(&candidate).map_err(|source| ReadOnlyRunError::ProviderProgramIo {
+            program: candidate,
+            source,
+        })?;
+    if !resolved.starts_with(repository_root) {
+        return Err(ReadOnlyRunError::ProviderProgramEscape {
+            program: resolved,
+            repository_root: repository_root.to_path_buf(),
+        });
+    }
+    Ok(resolved)
+}
+
+fn is_bare_program_name(program: &Path) -> bool {
+    let mut components = program.components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{env, fs};
 
-    use super::{ReadOnlyMode, build_read_only_plan, execute_read_only_plan, resolve_workspace};
+    use super::{
+        ReadOnlyMode, build_read_only_plan, execute_read_only_plan, resolve_provider_program,
+        resolve_workspace,
+    };
     use crate::{RuntimeConfig, session::ProviderSessionState};
     use diagnostic_triage_contracts::{Sha256Digest, protocol::Operation};
     use tempfile::tempdir;
@@ -255,7 +318,7 @@ mod tests {
     }
 
     #[test]
-    fn executes_canonical_provider_plan_under_trusted_workspace() {
+    fn executes_absolute_provider_under_trusted_repository_root() {
         let repository = tempdir().unwrap();
         let mut config = config("src");
         fs::create_dir(repository.path().join("workspace")).unwrap();
@@ -282,6 +345,108 @@ mod tests {
         );
         let state = &executed.providers[0].outcome.state;
         assert!(matches!(state, ProviderSessionState::Incomplete { .. }));
+    }
+
+    #[test]
+    fn resolves_only_explicit_relative_programs_against_repository_root() {
+        let repository = tempdir().unwrap();
+        let repository_root = fs::canonicalize(repository.path()).unwrap();
+        fs::create_dir(repository.path().join("bin")).unwrap();
+        let provider = repository.path().join("bin/provider");
+        fs::write(&provider, b"provider").unwrap();
+
+        assert_eq!(
+            resolve_provider_program(&repository_root, "./bin/provider").unwrap(),
+            fs::canonicalize(&provider).unwrap()
+        );
+        assert_eq!(
+            resolve_provider_program(&repository_root, "provider").unwrap(),
+            std::path::PathBuf::from("provider")
+        );
+        let absolute = env::current_exe().unwrap();
+        assert_eq!(
+            resolve_provider_program(&repository_root, absolute.to_str().unwrap()).unwrap(),
+            absolute
+        );
+    }
+
+    #[test]
+    fn launches_repo_relative_provider_from_outside_repository() {
+        let repository = tempdir().unwrap();
+        fs::create_dir(repository.path().join("bin")).unwrap();
+        let program = format!("provider{}", env::consts::EXE_SUFFIX);
+        fs::copy(
+            env::current_exe().unwrap(),
+            repository.path().join("bin").join(&program),
+        )
+        .unwrap();
+        assert!(!env::current_dir().unwrap().starts_with(repository.path()));
+
+        let mut config = config("src");
+        config.providers.truncate(1);
+        config.providers[0].program = format!("./bin/{program}");
+        config.providers[0].argv = vec!["--exact".to_owned(), "__no_such_test__".to_owned()];
+        let executed = execute_read_only_plan(
+            &config,
+            repository.path(),
+            &Sha256Digest::compute(b"repository"),
+            ReadOnlyMode::Check,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            executed.providers[0].outcome.state,
+            ProviderSessionState::Incomplete { .. }
+        ));
+    }
+
+    #[test]
+    fn preflights_every_provider_program_before_first_launch() {
+        let root = tempdir().unwrap();
+        let repository = root.path().join("repository");
+        fs::create_dir(&repository).unwrap();
+        fs::write(root.path().join("outside-provider"), b"outside").unwrap();
+        let mut config = config("src");
+        config.providers[0].program = repository
+            .join("missing-first-provider")
+            .to_str()
+            .unwrap()
+            .to_owned();
+        config.providers[1].program = "../outside-provider".to_owned();
+
+        let error = execute_read_only_plan(
+            &config,
+            &repository,
+            &Sha256Digest::compute(b"repository"),
+            ReadOnlyMode::Check,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::ReadOnlyRunError::ProviderProgramEscape { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_provider_program_symlink_escape_before_launch() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempdir().unwrap();
+        let repository = root.path().join("repository");
+        let outside = root.path().join("outside-provider");
+        fs::create_dir(&repository).unwrap();
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, repository.join("provider")).unwrap();
+        let repository_root = fs::canonicalize(&repository).unwrap();
+
+        let error = resolve_provider_program(&repository_root, "./provider").unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::ReadOnlyRunError::ProviderProgramEscape { .. }
+        ));
     }
 
     #[cfg(unix)]
