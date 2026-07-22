@@ -27,8 +27,9 @@ use crate::{
 pub const BUG_ISSUE_DRAFT_SCHEMA_VERSION: &str = "diagnostic-triage.bug-issue-draft/v1";
 /// The only label proposed by the JSON bug issue-draft projection.
 pub const BUG_ISSUE_LABEL: &str = "bug";
-/// Hard byte limit for one complete JSON bug issue draft.
+/// Hard byte limit for one complete bug issue-draft representation.
 pub const MAX_ISSUE_DRAFT_OUTPUT_BYTES: usize = MAX_REPORT_OUTPUT_BYTES;
+const MARKDOWN_HEADER: &[u8] = b"# Diagnostic Triage bug issue draft\n\n> Draft only: no issue was posted.\n\n## Typed projection\n\n";
 
 macro_rules! draft_type {
     ($visibility:vis $name:ident { $($field:ident: $kind:ty),+ $(,)? }) => {
@@ -57,6 +58,10 @@ draft_type!(BugExecutionV1 { execution_id: ObjectId, adapter_id: AdapterId, adap
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BugIssueDraftJsonReporter;
 
+/// Markdown reporter for the same typed bug issue-draft projection.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BugIssueDraftMarkdownReporter;
+
 impl Reporter for BugIssueDraftJsonReporter {
     fn write_report(
         &self,
@@ -65,6 +70,17 @@ impl Reporter for BugIssueDraftJsonReporter {
     ) -> Result<(), ReporterError> {
         let bytes = bug_issue_draft_json_bytes(report)?;
         write_encoded(ReportFormat::BugIssueDraftJson, &bytes, writer)
+    }
+}
+
+impl Reporter for BugIssueDraftMarkdownReporter {
+    fn write_report(
+        &self,
+        report: &ValidatedSessionReport,
+        writer: &mut dyn Write,
+    ) -> Result<(), ReporterError> {
+        let bytes = bug_issue_draft_markdown_bytes(report)?;
+        write_encoded(ReportFormat::BugIssueDraftMarkdown, &bytes, writer)
     }
 }
 
@@ -78,6 +94,19 @@ pub fn bug_issue_draft_json_bytes(
     let draft = BugIssueDraftV1::project(report)
         .map_err(|_| output_too_large(MAX_ISSUE_DRAFT_OUTPUT_BYTES))?;
     encode_json(&draft, MAX_ISSUE_DRAFT_OUTPUT_BYTES)
+}
+
+/// Encode the typed JSON projection as a deterministic Markdown draft.
+///
+/// # Errors
+/// Returns a typed projection, encoding, or output-limit error.
+pub fn bug_issue_draft_markdown_bytes(
+    report: &ValidatedSessionReport,
+) -> Result<Vec<u8>, ReporterError> {
+    encode_markdown(
+        &bug_issue_draft_json_bytes(report)?,
+        MAX_ISSUE_DRAFT_OUTPUT_BYTES,
+    )
 }
 
 /// Validate, fully encode, and then write one JSON bug issue draft.
@@ -95,9 +124,32 @@ pub fn write_bug_issue_draft_json<W: Write + ?Sized>(
     write_encoded(ReportFormat::BugIssueDraftJson, &bytes, writer)
 }
 
+/// Validate, fully encode, and then write one Markdown bug issue draft.
+///
+/// # Errors
+/// Returns a typed contract, projection, encoding, output-limit, or writer error.
+pub fn write_bug_issue_draft_markdown<W: Write + ?Sized>(
+    report: &SessionReport,
+    writer: &mut W,
+) -> Result<(), ReporterError> {
+    validate_report(report).map_err(ReporterError::Contract)?;
+    let draft = BugIssueDraftV1::project_report(report)
+        .map_err(|_| markdown_too_large(MAX_ISSUE_DRAFT_OUTPUT_BYTES))?;
+    let json = encode_json(&draft, MAX_ISSUE_DRAFT_OUTPUT_BYTES)?;
+    let bytes = encode_markdown(&json, MAX_ISSUE_DRAFT_OUTPUT_BYTES)?;
+    write_encoded(ReportFormat::BugIssueDraftMarkdown, &bytes, writer)
+}
+
 fn output_too_large(max: usize) -> ReporterError {
     ReporterError::OutputTooLarge {
         format: ReportFormat::BugIssueDraftJson,
+        max,
+    }
+}
+
+fn markdown_too_large(max: usize) -> ReporterError {
+    ReporterError::OutputTooLarge {
+        format: ReportFormat::BugIssueDraftMarkdown,
         max,
     }
 }
@@ -117,6 +169,21 @@ fn encode_json(draft: &BugIssueDraftV1, limit: usize) -> Result<Vec<u8>, Reporte
             source,
         }),
     }
+}
+
+fn encode_markdown(json: &[u8], limit: usize) -> Result<Vec<u8>, ReporterError> {
+    // Source: https://spec.commonmark.org/current/#indented-code-blocks — four-space-indented lines are literal code.
+    let mut output = BoundedBuffer::new(limit);
+    output
+        .write_all(MARKDOWN_HEADER)
+        .map_err(|_| markdown_too_large(limit))?;
+    for line in json.split_inclusive(|byte| *byte == b'\n') {
+        output
+            .write_all(b"    ")
+            .and_then(|()| output.write_all(line))
+            .map_err(|_| markdown_too_large(limit))?;
+    }
+    Ok(output.bytes)
 }
 
 impl BugIssueDraftV1 {
@@ -273,8 +340,16 @@ mod tests {
         report.findings.push(finding);
         report.decisions.push(decision);
         let expected = project(report.clone());
+        let expected_markdown =
+            bug_issue_draft_markdown_bytes(&ValidatedSessionReport::new(report.clone()).unwrap())
+                .unwrap();
         report.findings.reverse();
         report.decisions.reverse();
+        assert_eq!(
+            bug_issue_draft_markdown_bytes(&ValidatedSessionReport::new(report.clone()).unwrap())
+                .unwrap(),
+            expected_markdown
+        );
         assert_eq!(project(report), expected);
     }
 
@@ -359,6 +434,103 @@ mod tests {
             error,
             ReporterError::Io {
                 format: ReportFormat::BugIssueDraftJson,
+                ..
+            }
+        ));
+        assert_eq!(writer.0.len(), 1);
+    }
+
+    #[test]
+    fn markdown_matches_golden_and_embeds_the_same_projection() {
+        let report = ValidatedSessionReport::from_json(VALID).unwrap();
+        let json = bug_issue_draft_json_bytes(&report).unwrap();
+        let markdown = bug_issue_draft_markdown_bytes(&report).unwrap();
+        assert_eq!(
+            markdown,
+            include_bytes!("../tests/golden/valid-report.issue.md")
+        );
+        assert_eq!(&markdown[MARKDOWN_HEADER.len() + 4..], json);
+        assert!(
+            MARKDOWN_HEADER
+                .windows(19)
+                .any(|part| part == b"no issue was posted")
+        );
+    }
+
+    #[test]
+    fn markdown_isolates_unicode_control_secret_path_and_delimiters() {
+        let mut report = report(VALID);
+        let payload = "日本語 **bold** `code` token=ghp_abcdefghijklmnopqrst /Users/st\n\u{202e}";
+        report.observations[0].message = payload.into();
+        report.findings[0].message = payload.into();
+        report.observations[0].location = None;
+        report.findings[0].location = None;
+        let validated = ValidatedSessionReport::new(report).unwrap();
+        let markdown =
+            String::from_utf8(bug_issue_draft_markdown_bytes(&validated).unwrap()).unwrap();
+        for expected in [
+            "日本語",
+            "[REDACTED_SECRET]",
+            "[REDACTED_PATH]",
+            "[CONTROL-U+000A]",
+            "[BIDI-U+202E]",
+            "\"location\":null",
+        ] {
+            assert!(markdown.contains(expected), "missing {expected}");
+        }
+        assert!(!markdown.contains("ghp_abcdefghijklmnopqrst") && !markdown.contains("/Users/st"));
+        assert!(
+            markdown[MARKDOWN_HEADER.len()..]
+                .lines()
+                .all(|line| line.starts_with("    "))
+        );
+    }
+
+    #[test]
+    fn markdown_represents_every_verdict_without_inference() {
+        let mut pass = report(VALID);
+        pass.decisions[0].action = DecisionAction::Warn;
+        pass.verdict = Verdict::Pass;
+        let mut incomplete = report(UNSUPPORTED);
+        incomplete.executions[0].status = ExecutionStatus::Incomplete;
+        incomplete.verdict = Verdict::Incomplete;
+        for (report, verdict) in [
+            (pass, "PASS"),
+            (report(VALID), "POLICY_FAIL"),
+            (incomplete, "INCOMPLETE"),
+            (report(UNSUPPORTED), "UNSUPPORTED"),
+        ] {
+            let report = ValidatedSessionReport::new(report).unwrap();
+            let markdown =
+                String::from_utf8(bug_issue_draft_markdown_bytes(&report).unwrap()).unwrap();
+            assert!(markdown.contains(&format!("\"verdict\":\"{verdict}\"")));
+        }
+    }
+
+    #[test]
+    fn markdown_limit_and_writer_boundaries_are_typed() {
+        let validated = ValidatedSessionReport::from_json(VALID).unwrap();
+        let json = bug_issue_draft_json_bytes(&validated).unwrap();
+        let bytes = encode_markdown(&json, MAX_ISSUE_DRAFT_OUTPUT_BYTES).unwrap();
+        assert_eq!(encode_markdown(&json, bytes.len()).unwrap(), bytes);
+        let limit = bytes.len() - 1;
+        assert!(
+            matches!(encode_markdown(&json, limit), Err(ReporterError::OutputTooLarge { format: ReportFormat::BugIssueDraftMarkdown, max }) if max == limit)
+        );
+        let mut invalid = report(VALID);
+        invalid.decisions.clear();
+        let mut output = Vec::new();
+        assert!(matches!(
+            write_bug_issue_draft_markdown(&invalid, &mut output),
+            Err(ReporterError::Contract(_))
+        ));
+        assert!(output.is_empty());
+        let mut writer = PrefixWriter(Vec::new());
+        let error = write_bug_issue_draft_markdown(&report(VALID), &mut writer).unwrap_err();
+        assert!(matches!(
+            error,
+            ReporterError::Io {
+                format: ReportFormat::BugIssueDraftMarkdown,
                 ..
             }
         ));
