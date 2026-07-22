@@ -31,10 +31,13 @@ pub const BUG_ISSUE_LABEL: &str = "bug";
 /// Hard byte limit for one complete bug issue-draft representation.
 pub const MAX_ISSUE_DRAFT_OUTPUT_BYTES: usize = MAX_REPORT_OUTPUT_BYTES;
 const MARKDOWN_HEADER: &[u8] = b"# Diagnostic Triage bug issue draft\n\n> Draft only: no issue was posted.\n\n## Typed projection\n\n";
+const MARKDOWN_INDENT: &[u8] = b"    ";
+const MARKDOWN_COMPACT_JSON_OVERHEAD_BYTES: usize = MARKDOWN_HEADER.len() + MARKDOWN_INDENT.len();
 
 #[cfg(test)]
 std::thread_local! {
     static EXECUTION_PROJECTION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PROJECT_UNCHECKED_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 macro_rules! draft_type {
@@ -121,7 +124,8 @@ fn bug_issue_draft_markdown_bytes_with_limits(
     markdown_limit: usize,
 ) -> Result<Vec<u8>, ReporterError> {
     let format = ReportFormat::BugIssueDraftMarkdown;
-    let draft = BugIssueDraftV1::project_report_with_limit(report, format, json_limit)?;
+    let budget = ProjectionBudget::markdown(json_limit, markdown_limit)?;
+    let draft = BugIssueDraftV1::project_report_with_budget(report, format, budget)?;
     let json = encode_json_for_format(&draft, json_limit, format)?;
     encode_markdown(&json, markdown_limit)
 }
@@ -178,16 +182,48 @@ fn projection_too_large(format: ReportFormat, max: usize) -> ReporterError {
     ReporterError::OutputTooLarge { format, max }
 }
 
+#[derive(Clone, Copy)]
+struct ProjectionBudget {
+    measured_max: usize,
+    reported_max: usize,
+}
+
+impl ProjectionBudget {
+    const fn exact(max: usize) -> Self {
+        Self {
+            measured_max: max,
+            reported_max: max,
+        }
+    }
+
+    fn markdown(json_max: usize, markdown_max: usize) -> Result<Self, ReporterError> {
+        // `to_writer` emits compact JSON and the encoder appends one LF, so one indent is exact.
+        // Sources: https://docs.rs/serde_json/1.0.150/serde_json/fn.to_writer.html
+        // and https://spec.commonmark.org/current/#indented-code-blocks.
+        let markdown_json_max = markdown_max
+            .checked_sub(MARKDOWN_COMPACT_JSON_OVERHEAD_BYTES)
+            .ok_or_else(|| markdown_too_large(markdown_max))?;
+        Ok(if json_max <= markdown_json_max {
+            Self::exact(json_max)
+        } else {
+            Self {
+                measured_max: markdown_json_max,
+                reported_max: markdown_max,
+            }
+        })
+    }
+}
+
 struct ProjectionCounter {
     bytes: Option<usize>,
-    limit: usize,
+    budget: ProjectionBudget,
 }
 
 impl ProjectionCounter {
-    const fn new(limit: usize) -> Self {
+    const fn new(budget: ProjectionBudget) -> Self {
         Self {
             bytes: Some(0),
-            limit,
+            budget,
         }
     }
 
@@ -212,12 +248,12 @@ impl ProjectionCounter {
         self.bytes = self
             .bytes
             .and_then(|total| total.checked_add(bytes))
-            .filter(|total| *total <= self.limit);
+            .filter(|total| *total <= self.budget.measured_max);
     }
 
     fn counted(&self, format: ReportFormat) -> Result<usize, ReporterError> {
         self.bytes
-            .ok_or_else(|| projection_too_large(format, self.limit))
+            .ok_or_else(|| projection_too_large(format, self.budget.reported_max))
     }
 }
 
@@ -240,21 +276,30 @@ fn measure_collection<T: serde::Serialize>(
     for (index, value) in values.enumerate() {
         counter.charge(usize::from(index > 0), format)?;
         counter.measure(
-            &value.map_err(|_| projection_too_large(format, counter.limit))?,
+            &value.map_err(|_| projection_too_large(format, counter.budget.reported_max))?,
             format,
         )?;
     }
     Ok(())
 }
 
+#[cfg(test)]
 fn measure_project_report(
     report: &SessionReport,
     limit: usize,
     format: ReportFormat,
 ) -> Result<usize, ReporterError> {
+    measure_project_report_with_budget(report, ProjectionBudget::exact(limit), format)
+}
+
+fn measure_project_report_with_budget(
+    report: &SessionReport,
+    budget: ProjectionBudget,
+    format: ReportFormat,
+) -> Result<usize, ReporterError> {
     // Own at most one projected item; build aggregate Vecs only after this exact JSON count fits.
     let empty = record!(BugIssueDraftV1 { schema_version = BUG_ISSUE_DRAFT_SCHEMA_VERSION, labels = [BUG_ISSUE_LABEL], session_id = report.session_id.clone(), contract_sha256 = report.contract_sha256.clone(), policy_digest = report.policy_digest.clone(), verdict = report.verdict.clone(), findings = Vec::new(), decisions = Vec::new(), evidence = Vec::new(), executions = Vec::new() });
-    let mut counter = ProjectionCounter::new(limit);
+    let mut counter = ProjectionCounter::new(budget);
     counter.measure(&empty, format)?;
     counter.charge(1, format)?; // The encoder appends one newline.
     macro_rules! measure {
@@ -300,7 +345,7 @@ fn encode_markdown(json: &[u8], limit: usize) -> Result<Vec<u8>, ReporterError> 
         .map_err(|_| markdown_too_large(limit))?;
     for line in json.split_inclusive(|byte| *byte == b'\n') {
         output
-            .write_all(b"    ")
+            .write_all(MARKDOWN_INDENT)
             .and_then(|()| output.write_all(line))
             .map_err(|_| markdown_too_large(limit))?;
     }
@@ -321,11 +366,22 @@ impl BugIssueDraftV1 {
         format: ReportFormat,
         limit: usize,
     ) -> Result<Self, ReporterError> {
-        measure_project_report(report, limit, format)?;
-        Self::project_unchecked(report).map_err(|_| projection_too_large(format, limit))
+        Self::project_report_with_budget(report, format, ProjectionBudget::exact(limit))
+    }
+
+    fn project_report_with_budget(
+        report: &SessionReport,
+        format: ReportFormat,
+        budget: ProjectionBudget,
+    ) -> Result<Self, ReporterError> {
+        measure_project_report_with_budget(report, budget, format)?;
+        Self::project_unchecked(report)
+            .map_err(|_| projection_too_large(format, budget.reported_max))
     }
 
     fn project_unchecked(report: &SessionReport) -> Result<Self, SanitizeError> {
+        #[cfg(test)]
+        PROJECT_UNCHECKED_CALLS.with(|calls| calls.set(calls.get() + 1));
         // Sources: schemas/v1/session-report.schema.json and https://doc.rust-lang.org/std/primitive.slice.html#method.sort_by.
         let mut findings = report
             .findings
@@ -743,6 +799,75 @@ mod tests {
             ),
             Err(ReporterError::OutputTooLarge { format: ReportFormat::BugIssueDraftMarkdown, max }) if max == limit
         ));
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn markdown_preflight_charges_wrapper_before_collection() {
+        let report = ValidatedSessionReport::from_json(VALID).unwrap();
+        let draft = BugIssueDraftV1::project_unchecked(report.as_report()).unwrap();
+        let json_limit = encode_json(&draft, MAX_ISSUE_DRAFT_OUTPUT_BYTES)
+            .unwrap()
+            .len();
+        assert!(encode_json(&draft, json_limit).is_ok());
+        let markdown_limit = json_limit
+            .checked_add(MARKDOWN_COMPACT_JSON_OVERHEAD_BYTES)
+            .unwrap();
+        assert_eq!(
+            bug_issue_draft_markdown_bytes_with_limits(
+                report.as_report(),
+                json_limit,
+                markdown_limit
+            )
+            .unwrap()
+            .len(),
+            markdown_limit
+        );
+        let rejected_limit = markdown_limit - 1;
+
+        let wrapper_underflow_limit = MARKDOWN_COMPACT_JSON_OVERHEAD_BYTES - 1;
+        EXECUTION_PROJECTION_CALLS.with(|calls| calls.set(0));
+        PROJECT_UNCHECKED_CALLS.with(|calls| calls.set(0));
+        assert!(matches!(
+            bug_issue_draft_markdown_bytes_with_limits(
+                report.as_report(),
+                json_limit,
+                wrapper_underflow_limit
+            ),
+            Err(ReporterError::OutputTooLarge { format: ReportFormat::BugIssueDraftMarkdown, max }) if max == wrapper_underflow_limit
+        ));
+        EXECUTION_PROJECTION_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+        PROJECT_UNCHECKED_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+
+        EXECUTION_PROJECTION_CALLS.with(|calls| calls.set(0));
+        PROJECT_UNCHECKED_CALLS.with(|calls| calls.set(0));
+        assert!(matches!(
+            bug_issue_draft_markdown_bytes_with_limits(
+                report.as_report(),
+                json_limit,
+                rejected_limit
+            ),
+            Err(ReporterError::OutputTooLarge { format: ReportFormat::BugIssueDraftMarkdown, max }) if max == rejected_limit
+        ));
+        EXECUTION_PROJECTION_CALLS
+            .with(|calls| assert_eq!(calls.get(), report.as_report().executions.len()));
+        PROJECT_UNCHECKED_CALLS.with(|calls| assert_eq!(calls.get(), 0));
+
+        EXECUTION_PROJECTION_CALLS.with(|calls| calls.set(0));
+        PROJECT_UNCHECKED_CALLS.with(|calls| calls.set(0));
+        let mut output = Vec::new();
+        assert!(matches!(
+            write_bug_issue_draft_markdown_with_limits(
+                report.as_report(),
+                &mut output,
+                json_limit,
+                rejected_limit
+            ),
+            Err(ReporterError::OutputTooLarge { format: ReportFormat::BugIssueDraftMarkdown, max }) if max == rejected_limit
+        ));
+        EXECUTION_PROJECTION_CALLS
+            .with(|calls| assert_eq!(calls.get(), report.as_report().executions.len()));
+        PROJECT_UNCHECKED_CALLS.with(|calls| assert_eq!(calls.get(), 0));
         assert!(output.is_empty());
     }
 }
