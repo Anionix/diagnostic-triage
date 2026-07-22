@@ -1,5 +1,10 @@
 //! Runtime configuration, bounded process orchestration, and deterministic output boundaries for Diagnostic Triage.
 
+#[allow(
+    dead_code,
+    reason = "typed constructor consumed by #223 runtime projection"
+)]
+mod execution;
 mod issue_draft;
 #[allow(
     dead_code,
