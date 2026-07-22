@@ -28,6 +28,14 @@ pub const DEFAULT_MAX_EVIDENCE_BYTES: u64 = 1024 * 1024;
 /// The v1 provider event ceiling and default.
 pub const DEFAULT_MAX_EVENTS: u64 = 10_000;
 
+/// Provider identity fields required by the current pre-alpha config shape.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProviderIdentityField {
+    AdapterVersion,
+    ToolName,
+    ToolVersion,
+}
+
 /// Errors raised while parsing or validating runtime configuration.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -35,6 +43,13 @@ pub enum ConfigError {
     Parse(#[from] toml::de::Error),
     #[error("invalid configuration field {field}: {reason}")]
     Invalid { field: String, reason: String },
+    #[error(
+        "provider {adapter_id} uses a legacy pre-alpha shape; add every explicit identity field (missing {missing_fields:?})"
+    )]
+    LegacyProviderIdentity {
+        adapter_id: AdapterId,
+        missing_fields: Vec<ProviderIdentityField>,
+    },
     #[error("classification rule {rule_id} is invalid: {reason}")]
     InvalidClassificationRule { rule_id: String, reason: String },
     #[error("configuration taxonomy is invalid")]
@@ -46,7 +61,7 @@ pub enum ConfigError {
 }
 
 /// Complete runtime configuration loaded from `diagnostic-triage.toml`.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeConfig {
     pub engine: EngineConfig,
@@ -77,7 +92,8 @@ impl RuntimeConfig {
     /// Returns [`ConfigError`] when TOML is malformed or any configured value
     /// violates the runtime or Engine boundary.
     pub fn from_toml(input: &str) -> Result<Self, ConfigError> {
-        let mut config = toml::from_str::<Self>(input)?;
+        let wire = toml::from_str::<RuntimeConfigWire>(input)?;
+        let mut config = Self::try_from(wire)?;
         config.normalize_and_validate()?;
         Ok(config)
     }
@@ -252,7 +268,7 @@ pub struct RepositoryConfig {
 
 /// An executable invocation. `program` is passed directly to `Command`; it is
 /// never parsed as a shell command and `argv` is never joined into a string.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     pub adapter_id: AdapterId,
@@ -316,6 +332,96 @@ impl ProviderConfig {
         self.required_capabilities.sort();
         self.optional_capabilities.sort();
         Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RuntimeConfigWire {
+    engine: EngineConfig,
+    repository: RepositoryConfig,
+    #[serde(default)]
+    providers: Vec<ProviderConfigWire>,
+    #[serde(default)]
+    limits: RuntimeLimits,
+    #[serde(default)]
+    classification: ClassificationConfig,
+    #[serde(default)]
+    policy: PolicyConfig,
+    #[serde(default)]
+    output: OutputConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderConfigWire {
+    adapter_id: AdapterId,
+    adapter_version: Option<String>,
+    tool_name: Option<String>,
+    tool_version: Option<String>,
+    program: String,
+    #[serde(default)]
+    argv: Vec<String>,
+    required: bool,
+    #[serde(default)]
+    required_capabilities: Vec<Capability>,
+    #[serde(default)]
+    optional_capabilities: Vec<Capability>,
+}
+
+impl TryFrom<RuntimeConfigWire> for RuntimeConfig {
+    type Error = ConfigError;
+
+    fn try_from(wire: RuntimeConfigWire) -> Result<Self, Self::Error> {
+        Ok(Self {
+            engine: wire.engine,
+            repository: wire.repository,
+            providers: wire
+                .providers
+                .into_iter()
+                .map(ProviderConfig::try_from)
+                .collect::<Result<_, _>>()?,
+            limits: wire.limits,
+            classification: wire.classification,
+            policy: wire.policy,
+            output: wire.output,
+        })
+    }
+}
+
+impl TryFrom<ProviderConfigWire> for ProviderConfig {
+    type Error = ConfigError;
+
+    fn try_from(wire: ProviderConfigWire) -> Result<Self, Self::Error> {
+        let mut missing_fields = Vec::with_capacity(3);
+        if wire.adapter_version.is_none() {
+            missing_fields.push(ProviderIdentityField::AdapterVersion);
+        }
+        if wire.tool_name.is_none() {
+            missing_fields.push(ProviderIdentityField::ToolName);
+        }
+        if wire.tool_version.is_none() {
+            missing_fields.push(ProviderIdentityField::ToolVersion);
+        }
+        let (Some(adapter_version), Some(tool_name), Some(tool_version)) =
+            (wire.adapter_version, wire.tool_name, wire.tool_version)
+        else {
+            return Err(ConfigError::LegacyProviderIdentity {
+                adapter_id: wire.adapter_id,
+                missing_fields,
+            });
+        };
+        Ok(Self {
+            adapter_id: wire.adapter_id,
+            adapter_version,
+            tool_name,
+            tool_version,
+            program: wire.program,
+            argv: wire.argv,
+            required: wire.required,
+            required_capabilities: wire.required_capabilities,
+            optional_capabilities: wire.optional_capabilities,
+        })
     }
 }
 
@@ -640,8 +746,9 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        DEFAULT_MAX_EVENTS, DEFAULT_MAX_EVIDENCE_BYTES, DEFAULT_MAX_STDERR_BYTES,
-        DEFAULT_MAX_STDOUT_BYTES, DEFAULT_TIMEOUT_MS, OutputFormat, RuntimeConfig,
+        ConfigError, DEFAULT_MAX_EVENTS, DEFAULT_MAX_EVIDENCE_BYTES, DEFAULT_MAX_STDERR_BYTES,
+        DEFAULT_MAX_STDOUT_BYTES, DEFAULT_TIMEOUT_MS, OutputFormat, ProviderIdentityField,
+        RuntimeConfig,
     };
     use crate::process::{ProcessState, run_bounded};
     use diagnostic_triage_contracts::AdapterId;
@@ -692,6 +799,57 @@ required_capabilities = ["diagnostic.check/v1"]
         assert_eq!(config.output.format, OutputFormat::Json);
         let wire = toml::to_string(&config).expect("serialize config");
         assert_eq!(RuntimeConfig::from_toml(&wire).unwrap(), config);
+    }
+
+    #[test]
+    fn rejects_legacy_provider_shape_with_typed_migration_error() {
+        for (line, expected) in [
+            (
+                "adapter_version = \"0.1.0\"\n",
+                ProviderIdentityField::AdapterVersion,
+            ),
+            ("tool_name = \"cargo\"\n", ProviderIdentityField::ToolName),
+            (
+                "tool_version = \"1.85.0\"\n",
+                ProviderIdentityField::ToolVersion,
+            ),
+        ] {
+            let legacy = minimal_config("").replacen(line, "", 1);
+            let error = RuntimeConfig::from_toml(&legacy).expect_err("legacy provider shape");
+            match error {
+                ConfigError::LegacyProviderIdentity {
+                    adapter_id,
+                    missing_fields,
+                } => {
+                    assert_eq!(adapter_id.as_str(), "rust");
+                    assert_eq!(missing_fields, [expected]);
+                }
+                other => panic!("unexpected migration error: {other}"),
+            }
+        }
+
+        let previous_shape = minimal_config("")
+            .replace("adapter_version = \"0.1.0\"\n", "")
+            .replace("tool_name = \"cargo\"\n", "")
+            .replace("tool_version = \"1.85.0\"\n", "");
+        assert!(matches!(
+            RuntimeConfig::from_toml(&previous_shape),
+            Err(ConfigError::LegacyProviderIdentity {
+                missing_fields,
+                ..
+            }) if missing_fields == [
+                ProviderIdentityField::AdapterVersion,
+                ProviderIdentityField::ToolName,
+                ProviderIdentityField::ToolVersion,
+            ]
+        ));
+
+        let explicit_empty =
+            minimal_config("").replacen("adapter_version = \"0.1.0\"", "adapter_version = \"\"", 1);
+        assert!(matches!(
+            RuntimeConfig::from_toml(&explicit_empty),
+            Err(ConfigError::Invalid { field, .. }) if field == "providers.adapter_version"
+        ));
     }
 
     #[test]
