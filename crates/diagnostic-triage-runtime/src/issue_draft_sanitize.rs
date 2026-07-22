@@ -31,6 +31,7 @@ const PROVIDER_TOKEN_PREFIXES: &[(&str, usize, bool)] = &[
     ("npm_", 32, false),
     ("sk-", 32, false),
 ];
+const PATH_TERMINATORS: &str = "'\"`)]},;&<>|";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SanitizationMode {
     ExternalText,
@@ -464,7 +465,158 @@ fn absolute_root_end(value: &str, index: usize) -> Option<usize> {
     if root > index || forward || malformed_web {
         return Some(first);
     }
-    separator_end(value, first).and_then(|(end, second_forward)| (!second_forward).then_some(end))
+    if let Some((end, second_forward)) = separator_end(value, first) {
+        return (!second_forward).then_some(end);
+    }
+    single_backslash_root_end(value, root, first)
+}
+
+fn single_backslash_root_end(
+    value: &str,
+    root_start: usize,
+    component_start: usize,
+) -> Option<usize> {
+    // Sources: https://learn.microsoft.com/en-us/dotnet/standard/io/file-path-formats, https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file.
+    // LLM contract: SINGLE_BACKSLASH -> TWO_TYPED_COMPONENTS -> ROOTED_PATH | ESCAPE_PRESERVED.
+    let quote = value
+        .as_bytes()
+        .get(root_start.wrapping_sub(1))
+        .copied()
+        .filter(|byte| is_quote(*byte));
+    let first_end = typed_windows_component_end(value, component_start, 1, quote)?;
+    let (second_start, _) = separator_end(value, first_end)?;
+    let second_end = typed_windows_component_end(value, second_start, 1, quote)?;
+    let first = value.get(component_start..first_end)?;
+    let second = value.get(second_start..second_end)?;
+    if !is_known_windows_root(first)
+        && looks_like_escape_sequence(first, second)
+        && separator_end(value, second_end).is_none()
+    {
+        return None;
+    }
+    Some(component_start)
+}
+
+fn typed_windows_component_end(
+    value: &str,
+    start: usize,
+    minimum_chars: usize,
+    quote: Option<u8>,
+) -> Option<usize> {
+    let mut cursor = start;
+    let mut component_chars = 0usize;
+    while cursor < value.len() {
+        if separator_end(value, cursor).is_some() {
+            break;
+        }
+        let character = value[cursor..].chars().next().expect("UTF-8 boundary");
+        if quote.is_some_and(|quote| character == char::from(quote))
+            || quote.is_none()
+                && (character.is_whitespace() || PATH_TERMINATORS.contains(character))
+        {
+            break;
+        }
+        let typed = !character.is_control() && !r#"<>:"/\|?*"#.contains(character);
+        if !typed {
+            return None;
+        }
+        component_chars += 1;
+        cursor += character.len_utf8();
+    }
+    (component_chars >= minimum_chars).then_some(cursor)
+}
+
+fn is_known_windows_root(component: &str) -> bool {
+    ["Users", "Windows"]
+        .into_iter()
+        .any(|root| component.eq_ignore_ascii_case(root))
+}
+
+fn looks_like_escape_sequence(first: &str, second: &str) -> bool {
+    (starts_compound_escape(first) || first.chars().next().is_some_and(is_single_escape_head))
+        && (is_escape_component(second) || starts_compound_escape(second))
+        || first.starts_with('Q') && second.starts_with('E')
+        || [first, second].into_iter().all(starts_octal_escape)
+}
+
+fn is_escape_component(component: &str) -> bool {
+    let mut characters = component.chars();
+    let Some(head) = characters.next() else {
+        return false;
+    };
+    let tail = characters.as_str();
+    if tail.is_empty() || tail == "+" {
+        return is_single_escape_head(head);
+    }
+    is_compound_escape_component(component)
+}
+
+fn starts_octal_escape(component: &str) -> bool {
+    matches!(component.as_bytes().first(), Some(b'0'..=b'7'))
+}
+
+fn is_single_escape_head(head: char) -> bool {
+    matches!(
+        head,
+        '0' | 'A'
+            | 'a'
+            | 'b'
+            | 'B'
+            | 'd'
+            | 'D'
+            | 'e'
+            | 'E'
+            | 'f'
+            | 'G'
+            | 'n'
+            | 'Q'
+            | 'r'
+            | 's'
+            | 'S'
+            | 't'
+            | 'v'
+            | 'w'
+            | 'W'
+            | 'z'
+            | 'Z'
+    )
+}
+
+fn is_compound_escape_component(component: &str) -> bool {
+    let mut characters = component.chars();
+    let Some(head) = characters.next() else {
+        return false;
+    };
+    let tail = characters.as_str();
+    match head {
+        'x' | 'X' => tail.len() == 2 && tail.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        'u' | 'U' => {
+            matches!(tail.len(), 4 | 8) && tail.bytes().all(|byte| byte.is_ascii_hexdigit())
+        }
+        'c' | 'C' => tail.len() == 1 && tail.bytes().all(|byte| byte.is_ascii_alphabetic()),
+        'p' | 'P' => tail.len() <= 3 && tail.chars().all(char::is_alphabetic),
+        _ => false,
+    }
+}
+
+fn starts_compound_escape(component: &str) -> bool {
+    let bytes = component.as_bytes();
+    match bytes.first() {
+        Some(b'x' | b'X') => bytes
+            .get(1..3)
+            .is_some_and(|tail| tail.iter().all(u8::is_ascii_hexdigit)),
+        Some(b'u') => bytes
+            .get(1..5)
+            .is_some_and(|tail| tail.iter().all(u8::is_ascii_hexdigit)),
+        Some(b'U') => bytes
+            .get(1..9)
+            .is_some_and(|tail| tail.iter().all(u8::is_ascii_hexdigit)),
+        Some(b'p' | b'P') => bytes
+            .get(1)
+            .is_some_and(|category| b"LMNPSZC".contains(category)),
+        Some(b'c' | b'C') => bytes.get(1).is_some_and(u8::is_ascii_alphabetic),
+        _ => false,
+    }
 }
 
 fn separator_end(value: &str, index: usize) -> Option<(usize, bool)> {
@@ -483,6 +635,8 @@ fn separator_end(value: &str, index: usize) -> Option<(usize, bool)> {
 fn path_span_end(neutralized: &NeutralizedText, start: usize, mut cursor: usize) -> usize {
     let value = neutralized.as_str();
     let bytes = value.as_bytes();
+    let stop_at_space = separator_end(value, start)
+        .is_some_and(|(first, forward)| !forward && separator_end(value, first).is_none());
     let quote = bytes
         .get(start.wrapping_sub(1))
         .copied()
@@ -503,8 +657,8 @@ fn path_span_end(neutralized: &NeutralizedText, start: usize, mut cursor: usize)
         }
         let character = value[cursor..].chars().next().expect("UTF-8 boundary");
         if quote.is_none()
-            && ((character.is_whitespace() && character != ' ')
-                || "'\"`)]},;&<>|".contains(character))
+            && ((character.is_whitespace() && (stop_at_space || character != ' '))
+                || PATH_TERMINATORS.contains(character))
         {
             break;
         }
@@ -1406,6 +1560,21 @@ mod tests {
         let cases = [
             (r"C:\", redacted),
             (r"\\server\share", redacted),
+            (r"\Users\alice+dev=qa@host#1$^(!%done\repo", redacted),
+            ("prefix \\Users\\a safe", "prefix [REDACTED_PATH] safe"),
+            ("prefix %5CUsers%5CA safe", "prefix [REDACTED_PATH] safe"),
+            (r"\Windows\System32", redacted),
+            (r"\Windows\n", redacted),
+            (r"\A\Data", redacted),
+            (r"\x64data\secret.txt", redacted),
+            (r"\x64data\n\secret.txt", redacted),
+            (r"\101foo\102bar\secret", redacted),
+            ("\\Cafe\u{301}\\Docs", redacted),
+            (r#""\O'Brien Program\secret.txt""#, r#""[REDACTED_PATH]""#),
+            (
+                r#""%5CO'Brien Program%5Csecret.txt""#,
+                r#""[REDACTED_PATH]""#,
+            ),
             ("%5C%5cserver%2Fshare", redacted),
             ("file:///etc/passwd", redacted),
             ("FILE:%2fUsers%2FA", redacted),
@@ -1431,12 +1600,30 @@ mod tests {
         let preserved = concat!(
             "https://例え.テスト:443/Users/a?next=/etc\nhttps://https://Users/a\nhttps://%E4%BE%8B%E3%81%88.test/Users/a\nhttps://[::1]/Users/a\n",
             "url=https://example.test/a?next=/Users/a\n<https://example.test/a>\n日本語/src.rs\nfile:src/lib.rs\n",
-            "C:relative\\file.rs\npattern \\d+\\w+",
+            "C:relative\\file.rs\npattern \\d+\\w+\nliteral \\n\\t and regex \\p{Letter}+\\s*\nanchors \\bword\\b and \\Afoo\\z\nescapes \\x20\\u00A0, \\x41\\x42, \\u0041\\u0042, \\pL\\pN, \\cA\\cB, \\123\\234, and \\101foo\\102bar\nquoted \\Qfoo\\Ebar and suffixed \\nfoo\\t\ncompound suffixes \\u0041foo\\n, \\x41foo\\n, \\pLfoo\\n, and reversed \\n\\u0041foo",
         );
         for input in preserved.lines() {
             let actual = sanitize_external_text(input, 8_192).unwrap();
             assert_eq!(actual.as_str(), input);
         }
+        let mixed = r#"path="\Users\alice\repo"; regex=\d+\w+"#;
+        assert_eq!(
+            sanitize_external_text(mixed, 8_192).unwrap().as_str(),
+            r#"path="[REDACTED_PATH]"; regex=\d+\w+"#
+        );
+        let rooted = r"\Windows\n";
+        assert_eq!(
+            sanitize_external_text(rooted, redacted.len())
+                .unwrap()
+                .as_str(),
+            redacted
+        );
+        assert_eq!(
+            sanitize_external_text(rooted, redacted.len() - 1),
+            Err(SanitizeError::OutputLimitExceeded {
+                max_bytes: redacted.len() - 1,
+            })
+        );
         let input = format!("/{}, safe /etc", "a".repeat(4_096));
         let actual = sanitize_external_text(&input, input.len()).unwrap();
         assert_eq!(actual.as_str(), "[REDACTED_PATH], safe [REDACTED_PATH]");
