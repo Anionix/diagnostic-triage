@@ -122,6 +122,8 @@ pub enum ReportFormat {
     GitHubAnnotations,
     /// A sanitized, deterministic JSON bug issue draft.
     BugIssueDraftJson,
+    /// A sanitized, deterministic Markdown bug issue draft.
+    BugIssueDraftMarkdown,
 }
 
 impl fmt::Display for ReportFormat {
@@ -132,6 +134,7 @@ impl fmt::Display for ReportFormat {
             Self::Tsv => "TSV",
             Self::GitHubAnnotations => "GitHub annotations",
             Self::BugIssueDraftJson => "bug issue-draft JSON",
+            Self::BugIssueDraftMarkdown => "bug issue-draft Markdown",
         })
     }
 }

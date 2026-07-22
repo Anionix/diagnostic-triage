@@ -34,7 +34,8 @@ pub use github_annotations::{
 };
 pub use issue_draft::{
     BUG_ISSUE_DRAFT_SCHEMA_VERSION, BUG_ISSUE_LABEL, BugIssueDraftJsonReporter,
-    MAX_ISSUE_DRAFT_OUTPUT_BYTES, bug_issue_draft_json_bytes, write_bug_issue_draft_json,
+    BugIssueDraftMarkdownReporter, MAX_ISSUE_DRAFT_OUTPUT_BYTES, bug_issue_draft_json_bytes,
+    bug_issue_draft_markdown_bytes, write_bug_issue_draft_json, write_bug_issue_draft_markdown,
 };
 pub use reporters::{
     CanonicalJsonReporter, MAX_REPORT_OUTPUT_BYTES, ReportFormat, Reporter, ReporterError,
