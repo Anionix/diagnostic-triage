@@ -14,6 +14,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 from jsonschema.exceptions import ValidationError
 from jsonschema.protocols import Validator
 from referencing import Registry, Resource
+from referencing.jsonschema import DRAFT202012
 
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_DIR = ROOT / "schemas" / "diagnostic-triage" / "v1"
@@ -93,7 +94,10 @@ class ContractSchemas:
             path.name: load_json(path) for path in sorted(SCHEMA_DIR.glob("*.json"))
         }
         resources: list[tuple[str, Resource[Any]]] = [
-            (cast(str, schema["$id"]), Resource.from_contents(schema))
+            (
+                cast(str, schema["$id"]),
+                Resource(contents=schema, specification=DRAFT202012),
+            )
             for schema in self.schemas.values()
         ]
         self.registry = Registry[Any]().with_resources(resources)
