@@ -807,7 +807,16 @@ fn path_span_end(
                     .any(|frame| quote_frame_at(bytes, next) == Some(*frame)))
             .then_some(next + 1)
         });
-        if !quoted_path_literal && quote_end.is_some_and(|end| whitespace_at(neutralized, end)) {
+        if !quoted_path_literal
+            && quote_end.is_some_and(|end| {
+                end == value.len()
+                    || whitespace_at(neutralized, end)
+                    || value[end..]
+                        .chars()
+                        .next()
+                        .is_some_and(|character| PATH_TERMINATORS.contains(character))
+            })
+        {
             break;
         }
         let quoted_prose_boundary =
@@ -1836,6 +1845,10 @@ mod tests {
             ("don't /A/O'Brien, x", "don't [REDACTED_PATH], x"),
             ("x /Users/A' y", "x [REDACTED_PATH]' y"),
             (r#"x /Users/A\" y"#, r#"x [REDACTED_PATH]\" y"#),
+            ("see /Users/alice\"", "see [REDACTED_PATH]\""),
+            ("see /Users/alice\\\"", "see [REDACTED_PATH]\\\""),
+            ("see /Users/alice\"), x", "see [REDACTED_PATH]\"), x"),
+            ("see /Users/a\"b.txt", "see [REDACTED_PATH]"),
             (r#""x /A\\" y"#, r#""x [REDACTED_PATH]" y"#),
             (
                 "\"see /Users/A,\nthen retry\"",
