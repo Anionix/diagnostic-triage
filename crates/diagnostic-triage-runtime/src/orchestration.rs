@@ -9,7 +9,7 @@ use std::{
 use diagnostic_triage_contracts::protocol::{
     EnvelopeKind, Operation, ProtocolEnvelope, ProtocolVersion, RequestEnvelope, RequestLimits,
 };
-use diagnostic_triage_contracts::{AdapterId, ContractError, ObjectId, Sha256Digest};
+use diagnostic_triage_contracts::{AdapterId, ContractError, ObjectId, RepoPath, Sha256Digest};
 use diagnostic_triage_engine::{EngineError, deterministic_object_id};
 use thiserror::Error;
 
@@ -67,6 +67,7 @@ impl PlannedProvider {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReadOnlyPlan {
     plan_id: ObjectId,
+    targets: Vec<RepoPath>,
     providers: Vec<PlannedProvider>,
 }
 
@@ -138,6 +139,17 @@ pub(crate) enum ReadOnlyRunError {
     },
     #[error("provider program path form is unsupported: {program}")]
     ProviderProgramUnsupported { program: PathBuf },
+    #[error("failed to resolve provider target {target}")]
+    ProviderTargetIo {
+        target: RepoPath,
+        #[source]
+        source: io::Error,
+    },
+    #[error("provider target {target} escapes trusted workspace {workspace}")]
+    ProviderTargetEscape {
+        target: RepoPath,
+        workspace: PathBuf,
+    },
     #[error("provider session failed for {adapter_id}")]
     Provider {
         adapter_id: AdapterId,
@@ -164,6 +176,7 @@ pub(crate) fn build_read_only_plan(
     )?;
     // RFC 9562 section 5.8: UUIDv8 uniqueness is implementation-specific; reject duplicates.
     let mut object_ids = BTreeSet::from([plan_id.clone()]);
+    let targets = config.repository.targets;
     let mut providers = Vec::with_capacity(config.providers.len());
     for provider in config.providers {
         let request_id = deterministic_object_id(
@@ -183,7 +196,7 @@ pub(crate) fn build_read_only_plan(
             request_id,
             operation: Operation::Check,
             workspace: config.repository.workspace.clone(),
-            targets: config.repository.targets.clone(),
+            targets: targets.clone(),
             required_capabilities: provider.required_capabilities.clone(),
             optional_capabilities: provider.optional_capabilities.clone(),
             limits: limits.clone(),
@@ -195,7 +208,11 @@ pub(crate) fn build_read_only_plan(
             execution_id,
         });
     }
-    Ok(ReadOnlyPlan { plan_id, providers })
+    Ok(ReadOnlyPlan {
+        plan_id,
+        targets,
+        providers,
+    })
 }
 
 pub(crate) fn execute_read_only_plan(
@@ -206,7 +223,13 @@ pub(crate) fn execute_read_only_plan(
 ) -> Result<ExecutedReadOnlyPlan, ReadOnlyRunError> {
     let plan = build_read_only_plan(config, repository_digest, mode)?;
     let workspace = resolve_workspace(repository_root, &config.repository.workspace)?;
-    let ReadOnlyPlan { plan_id, providers } = plan;
+    let ReadOnlyPlan {
+        plan_id,
+        targets,
+        providers,
+    } = plan;
+    // LLM contract: PLANNED -> TARGETS_PREFLIGHTED -> PROGRAMS_PREFLIGHTED -> PROVIDER_STARTED; target rejection -> zero Provider launches.
+    validate_provider_targets(&workspace, &targets)?;
     let programs = providers
         .iter()
         .map(|provider| {
@@ -221,6 +244,60 @@ pub(crate) fn execute_read_only_plan(
         plan_id,
         providers: executed,
     })
+}
+
+fn validate_provider_targets(
+    workspace: &ResolvedWorkspace,
+    targets: &[RepoPath],
+) -> Result<(), ReadOnlyRunError> {
+    // All planned Providers receive this same normalized target list. Validate the
+    // complete list before resolving or launching the first Provider process.
+    for target in targets {
+        let candidate = workspace.repository_root.join(target.as_str());
+        let resolved = canonical_existing_ancestor(&candidate, target, &workspace.workspace_root)?;
+        if !resolved.starts_with(&workspace.workspace_root) {
+            return Err(ReadOnlyRunError::ProviderTargetEscape {
+                target: target.clone(),
+                workspace: workspace.workspace_root.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn canonical_existing_ancestor(
+    candidate: &Path,
+    target: &RepoPath,
+    workspace_root: &Path,
+) -> Result<PathBuf, ReadOnlyRunError> {
+    let mut current = candidate;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(_) => {
+                return fs::canonicalize(current).map_err(|source| {
+                    ReadOnlyRunError::ProviderTargetIo {
+                        target: target.clone(),
+                        source,
+                    }
+                });
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                current =
+                    current
+                        .parent()
+                        .ok_or_else(|| ReadOnlyRunError::ProviderTargetEscape {
+                            target: target.clone(),
+                            workspace: workspace_root.to_path_buf(),
+                        })?;
+            }
+            Err(source) => {
+                return Err(ReadOnlyRunError::ProviderTargetIo {
+                    target: target.clone(),
+                    source,
+                });
+            }
+        }
+    }
 }
 
 fn resolve_workspace(
@@ -323,6 +400,7 @@ mod tests {
         let mut config = config("src");
         fs::create_dir(repository.path().join("workspace")).unwrap();
         config.repository.workspace = "workspace".parse().unwrap();
+        config.repository.targets = vec!["workspace".parse().unwrap()];
         config.providers.truncate(1);
         config.providers[0].program = env::current_exe().unwrap().to_str().unwrap().to_owned();
         config.providers[0].argv = vec!["--exact".to_owned(), "__no_such_test__".to_owned()];
@@ -426,6 +504,61 @@ mod tests {
             error,
             super::ReadOnlyRunError::ProviderProgramEscape { .. }
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_target_symlink_escape_before_provider_launch() {
+        use std::os::unix::fs::symlink;
+
+        let repository = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::create_dir(repository.path().join("workspace")).unwrap();
+        fs::write(repository.path().join("enable-launch-probe"), b"").unwrap();
+        symlink(outside.path(), repository.path().join("workspace/link")).unwrap();
+        let mut config = config("workspace/link/missing.py");
+        config.repository.workspace = "workspace".parse().unwrap();
+        config.repository.targets = vec!["workspace/missing.py".parse().unwrap()];
+        config.providers.truncate(1);
+        config.providers[0].program = env::current_exe().unwrap().to_str().unwrap().to_owned();
+        config.providers[0].argv = vec![
+            "--ignored".to_owned(),
+            "--exact".to_owned(),
+            "orchestration::tests::provider_launch_probe".to_owned(),
+        ];
+
+        execute_read_only_plan(
+            &config,
+            repository.path(),
+            &Sha256Digest::compute(b"repository"),
+            ReadOnlyMode::Check,
+        )
+        .unwrap();
+        assert!(repository.path().join("provider-launched").is_file());
+        fs::remove_file(repository.path().join("provider-launched")).unwrap();
+
+        config.repository.targets = vec!["workspace/link/missing.py".parse().unwrap()];
+        let error = execute_read_only_plan(
+            &config,
+            repository.path(),
+            &Sha256Digest::compute(b"repository"),
+            ReadOnlyMode::Check,
+        )
+        .unwrap_err();
+
+        assert!(!repository.path().join("provider-launched").exists());
+        assert!(matches!(
+            error,
+            super::ReadOnlyRunError::ProviderTargetEscape { .. }
+        ));
+    }
+
+    #[test]
+    #[ignore = "invoked only as an isolated child-process launch probe"]
+    fn provider_launch_probe() {
+        if std::path::Path::new("enable-launch-probe").is_file() {
+            fs::write("provider-launched", b"launched").unwrap();
+        }
     }
 
     #[cfg(unix)]
