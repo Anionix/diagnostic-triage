@@ -1,15 +1,23 @@
 //! Pure, deterministic planning for read-only runtime sessions.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 use diagnostic_triage_contracts::protocol::{
     EnvelopeKind, Operation, ProtocolEnvelope, ProtocolVersion, RequestEnvelope, RequestLimits,
 };
-use diagnostic_triage_contracts::{ContractError, ObjectId, Sha256Digest};
+use diagnostic_triage_contracts::{AdapterId, ContractError, ObjectId, Sha256Digest};
 use diagnostic_triage_engine::{EngineError, deterministic_object_id};
 use thiserror::Error;
 
-use crate::config::{ConfigError, ProviderConfig, RuntimeConfig};
+use crate::{
+    config::{ConfigError, ProviderConfig, RuntimeConfig},
+    process::ProcessSpec,
+    session::{ProviderSessionError, ProviderSessionOutcome, run_provider_session},
+};
 
 // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
 
@@ -30,10 +38,55 @@ pub(crate) struct PlannedProvider {
     execution_id: ObjectId,
 }
 
+impl PlannedProvider {
+    fn run(self, workspace: &ResolvedWorkspace) -> Result<ExecutedProvider, ReadOnlyRunError> {
+        let spec = ProcessSpec::new(self.config.program.clone())
+            .args(self.config.argv.clone())
+            .current_dir(workspace.repository_root());
+        let outcome = run_provider_session(
+            spec,
+            &self.config.adapter_id,
+            &self.config.adapter_version,
+            &self.request,
+        )
+        .map_err(|source| ReadOnlyRunError::Provider {
+            adapter_id: self.config.adapter_id.clone(),
+            source,
+        })?;
+        Ok(ExecutedProvider {
+            planned: self,
+            outcome,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReadOnlyPlan {
     plan_id: ObjectId,
     providers: Vec<PlannedProvider>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExecutedProvider {
+    planned: PlannedProvider,
+    outcome: ProviderSessionOutcome,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExecutedReadOnlyPlan {
+    plan_id: ObjectId,
+    providers: Vec<ExecutedProvider>,
+}
+
+struct ResolvedWorkspace {
+    repository_root: PathBuf,
+    workspace_root: PathBuf,
+}
+
+impl ResolvedWorkspace {
+    fn repository_root(&self) -> &Path {
+        &self.repository_root
+    }
 }
 
 #[derive(Debug, Error)]
@@ -48,6 +101,32 @@ pub(crate) enum ReadOnlyPlanError {
     Contract(#[from] ContractError),
     #[error("planned object identifiers collided")]
     IdentityCollision,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ReadOnlyRunError {
+    #[error(transparent)]
+    Plan(#[from] ReadOnlyPlanError),
+    #[error("failed to {operation} at {path}")]
+    WorkspaceIo {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("workspace is not a directory: {path}")]
+    WorkspaceNotDirectory { path: PathBuf },
+    #[error("workspace {workspace} escapes trusted repository root {repository_root}")]
+    WorkspaceEscape {
+        workspace: PathBuf,
+        repository_root: PathBuf,
+    },
+    #[error("provider session failed for {adapter_id}")]
+    Provider {
+        adapter_id: AdapterId,
+        #[source]
+        source: ProviderSessionError,
+    },
 }
 
 pub(crate) fn build_read_only_plan(
@@ -102,11 +181,65 @@ pub(crate) fn build_read_only_plan(
     Ok(ReadOnlyPlan { plan_id, providers })
 }
 
+pub(crate) fn execute_read_only_plan(
+    config: &RuntimeConfig,
+    repository_root: &Path,
+    repository_digest: &Sha256Digest,
+    mode: ReadOnlyMode,
+) -> Result<ExecutedReadOnlyPlan, ReadOnlyRunError> {
+    let plan = build_read_only_plan(config, repository_digest, mode)?;
+    let workspace = resolve_workspace(repository_root, &config.repository.workspace)?;
+    let ReadOnlyPlan { plan_id, providers } = plan;
+    let mut executed = Vec::with_capacity(providers.len());
+    for planned in providers {
+        executed.push(planned.run(&workspace)?);
+    }
+    Ok(ExecutedReadOnlyPlan {
+        plan_id,
+        providers: executed,
+    })
+}
+
+fn resolve_workspace(
+    repository_root: &Path,
+    workspace: &diagnostic_triage_contracts::RepoPath,
+) -> Result<ResolvedWorkspace, ReadOnlyRunError> {
+    let repository_root =
+        fs::canonicalize(repository_root).map_err(|source| ReadOnlyRunError::WorkspaceIo {
+            operation: "canonicalize repository root",
+            path: repository_root.to_path_buf(),
+            source,
+        })?;
+    let candidate = repository_root.join(workspace.as_str());
+    let resolved =
+        fs::canonicalize(&candidate).map_err(|source| ReadOnlyRunError::WorkspaceIo {
+            operation: "canonicalize workspace",
+            path: candidate,
+            source,
+        })?;
+    if !resolved.starts_with(&repository_root) {
+        return Err(ReadOnlyRunError::WorkspaceEscape {
+            workspace: resolved,
+            repository_root,
+        });
+    }
+    if !resolved.is_dir() {
+        return Err(ReadOnlyRunError::WorkspaceNotDirectory { path: resolved });
+    }
+    Ok(ResolvedWorkspace {
+        repository_root,
+        workspace_root: resolved,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ReadOnlyMode, build_read_only_plan};
-    use crate::RuntimeConfig;
+    use std::{env, fs};
+
+    use super::{ReadOnlyMode, build_read_only_plan, execute_read_only_plan, resolve_workspace};
+    use crate::{RuntimeConfig, session::ProviderSessionState};
     use diagnostic_triage_contracts::{Sha256Digest, protocol::Operation};
+    use tempfile::tempdir;
 
     const REVISION: &str = "a12b34c56d78e90f1234567890abcdef12345678";
     const ALPHA: &str = "[[providers]]\nadapter_id=\"alpha\"\nadapter_version=\"1\"\ntool_name=\"ruff\"\ntool_version=\"0.12\"\nprogram=\"provider\"\nargv=[\"--stdio\"]\nrequired=true\nrequired_capabilities=[\"diagnostic.fix/v1\",\"diagnostic.check/v1\"]\noptional_capabilities=[\"diagnostic.metadata/v1\"]";
@@ -119,6 +252,61 @@ mod tests {
              [limits]\ntimeout_ms=1234\nmax_stdout_bytes=321\nmax_stderr_bytes=654\nmax_evidence_bytes=777\nmax_events=8"
         ))
         .expect("valid plan config")
+    }
+
+    #[test]
+    fn executes_canonical_provider_plan_under_trusted_workspace() {
+        let repository = tempdir().unwrap();
+        let mut config = config("src");
+        fs::create_dir(repository.path().join("workspace")).unwrap();
+        config.repository.workspace = "workspace".parse().unwrap();
+        config.providers.truncate(1);
+        config.providers[0].program = env::current_exe().unwrap().to_str().unwrap().to_owned();
+        config.providers[0].argv = vec!["--exact".to_owned(), "__no_such_test__".to_owned()];
+        let executed = execute_read_only_plan(
+            &config,
+            repository.path(),
+            &Sha256Digest::compute(b"repository"),
+            ReadOnlyMode::Check,
+        )
+        .unwrap();
+
+        let resolved = resolve_workspace(repository.path(), &config.repository.workspace).unwrap();
+        assert_eq!(
+            resolved.repository_root,
+            fs::canonicalize(repository.path()).unwrap()
+        );
+        assert_eq!(
+            resolved.workspace_root,
+            fs::canonicalize(repository.path().join("workspace")).unwrap()
+        );
+        let state = &executed.providers[0].outcome.state;
+        assert!(matches!(state, ProviderSessionState::Incomplete { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_workspace_symlink_escape_before_provider_execution() {
+        use std::os::unix::fs::symlink;
+
+        let repository = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        symlink(outside.path(), repository.path().join("escape")).unwrap();
+        let mut config = config("src");
+        config.repository.workspace = "escape".parse().unwrap();
+
+        let error = execute_read_only_plan(
+            &config,
+            repository.path(),
+            &Sha256Digest::compute(b"repository"),
+            ReadOnlyMode::Check,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            super::ReadOnlyRunError::WorkspaceEscape { .. }
+        ));
     }
 
     #[test]

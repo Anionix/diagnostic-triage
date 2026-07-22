@@ -173,7 +173,7 @@ impl RuntimeConfig {
     /// The provider's program and argv are copied without parsing or joining.
     /// This method intentionally does not resolve `repository.workspace` or
     /// set `current_dir`: callers must resolve that validated [`RepoPath`]
-    /// beneath a trusted repository root before applying
+    /// beneath a trusted repository root before applying that root through
     /// [`ProcessSpec::current_dir`].
     ///
     /// # Errors
