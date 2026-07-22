@@ -73,6 +73,7 @@ EVENT_IDENTIFIERS = {
 }
 RESULT_EVIDENCE_SOURCES = {"STDOUT", "DIAGNOSTIC", "ARTIFACT"}
 SNAPSHOT_MEDIA_TYPE = "application/vnd.diagnostic-triage.snapshot+json"
+DRAFT202012_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -96,7 +97,7 @@ class ContractSchemas:
         resources: list[tuple[str, Resource[Any]]] = [
             (
                 cast(str, schema["$id"]),
-                Resource(contents=schema, specification=DRAFT202012),
+                schema_resource(schema),
             )
             for schema in self.schemas.values()
         ]
@@ -113,6 +114,15 @@ class ContractSchemas:
 
 class ContractError(ValueError):
     pass
+
+
+def schema_resource(schema: dict[str, Any]) -> Resource[Any]:
+    # Sources: https://json-schema.org/draft/2020-12/json-schema-core#section-8.1.1,
+    # https://referencing.readthedocs.io/en/stable/api/#referencing.Specification.create_resource.
+    # LLM contract: LOADED -> DIALECT_VERIFIED -> REGISTERED | REJECTED.
+    if schema.get("$schema") != DRAFT202012_DIALECT:
+        raise ContractError("schema dialect must be Draft 2020-12")
+    return DRAFT202012.create_resource(schema)
 
 
 class SessionError(ContractError):
@@ -745,6 +755,22 @@ class ContractTest(unittest.TestCase):
             Draft202012Validator.check_schema(schema)
             identifiers.append(cast(str, schema["$id"]))
         self.assertEqual(len(identifiers), len(set(identifiers)))
+
+    def test_schema_dialect_is_required_and_exact(self) -> None:
+        canonical = self.contracts.schemas["common.schema.json"]
+        invalid_dialects = (
+            ("missing", None),
+            ("mistyped", "https://json-schema.org/draft/2020-12/scheme"),
+            ("different draft", "https://json-schema.org/draft/2019-09/schema"),
+        )
+        for name, dialect in invalid_dialects:
+            schema = copy.deepcopy(canonical)
+            if dialect is None:
+                del schema["$schema"]
+            else:
+                schema["$schema"] = dialect
+            with self.subTest(name=name), self.assertRaises(ContractError):
+                schema_resource(schema)
 
     def test_valid_sessions(self) -> None:
         actual = {path.name for path in FIXTURE_DIR.glob("valid-*.jsonl")}
