@@ -1,0 +1,3 @@
+# LLM contract: DISCOVERED -> TYPECHECKED -> LSP_DIAGNOSED -> VERIFIED.
+name = "diagnosticTriageProofs"
+version = "0.1.0"
