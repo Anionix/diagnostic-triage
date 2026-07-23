@@ -1238,6 +1238,8 @@ pub(crate) fn assemble_verified_report(
         executions,
         ..
     } = projection;
+    let evidence =
+        verification_report_evidence(&observations, &findings, &candidate, &executions, evidence);
     preflight_projection_collections(observations.len(), evidence.len(), 1, executions.len())?;
     let policy = config.policy_snapshot()?;
     Ok(assemble_session_report(
@@ -1256,6 +1258,36 @@ pub(crate) fn assemble_verified_report(
         },
         &policy,
     )?)
+}
+
+fn verification_report_evidence(
+    observations: &[Observation],
+    findings: &[Finding],
+    candidate: &FixCandidate,
+    executions: &[Execution],
+    evidence: Vec<Evidence>,
+) -> Vec<Evidence> {
+    let mut referenced = observations
+        .iter()
+        .flat_map(|observation| observation.evidence_ids.iter().cloned())
+        .chain(
+            findings
+                .iter()
+                .flat_map(|finding| finding.evidence_ids.iter().cloned()),
+        )
+        .collect::<BTreeSet<_>>();
+    referenced.insert(candidate.patch_evidence_id.clone());
+    for verification in executions
+        .iter()
+        .filter_map(|execution| execution.verification.as_ref())
+    {
+        referenced.insert(verification.base_snapshot_evidence_id.clone());
+        referenced.insert(verification.result_evidence_id.clone());
+    }
+    evidence
+        .into_iter()
+        .filter(|item| referenced.contains(&item.evidence_id))
+        .collect()
 }
 
 fn classify_projection(
@@ -1476,7 +1508,11 @@ mod tests {
         let mut unrelated = report_before.observations[0].clone();
         unrelated.observation_id = "019f7e95-0000-7000-8000-000000000397".parse().unwrap();
         unrelated.message = "unrelated baseline finding".to_owned();
+        let mut unrelated_evidence = report_before.evidence[0].clone();
+        unrelated_evidence.evidence_id = "019f7e95-0000-7000-8000-000000000396".parse().unwrap();
+        unrelated.evidence_ids = vec![unrelated_evidence.evidence_id.clone()];
         report_before.observations.push(unrelated);
+        report_before.evidence.push(unrelated_evidence.clone());
         let report = assemble_verified_report(
             authorize_canonical_ruff_verification(
                 scratch,
@@ -1493,6 +1529,12 @@ mod tests {
         assert_eq!(report.fix_candidates.len(), 1);
         assert_eq!(report.findings.len(), 1);
         assert_eq!(report.observations.len(), 1);
+        assert!(
+            !report
+                .evidence
+                .iter()
+                .any(|evidence| evidence.evidence_id == unrelated_evidence.evidence_id)
+        );
         let authorized = authorize_canonical_ruff_verification(
             scratch,
             canonical,
