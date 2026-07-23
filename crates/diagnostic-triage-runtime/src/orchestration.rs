@@ -28,6 +28,7 @@ use diagnostic_triage_engine::{
         ReportAssemblyError, ReportAssemblyInput, assemble_session_report,
         validate_report_collection_count,
     },
+    verification::{PatchApplication, SafeFixComparisonInput},
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -37,7 +38,8 @@ use crate::{
     execution::{ProviderExecutionInput, validated_provider_execution},
     execution_identity as identity,
     process::{ProcessError, ProcessLimits, ProcessSpec, ProcessState, run_bounded},
-    scratch::{ScratchError, ScratchPatch, ScratchWorkspace},
+    ruff_fix::CanonicalRuffFix,
+    scratch::{SafeFixAuthorization, ScratchError, ScratchPatch, ScratchWorkspace},
     session::{
         ProviderSessionError, ProviderSessionOutcome, ProviderSessionState, run_provider_session,
     },
@@ -133,6 +135,11 @@ pub(crate) struct PatchVerificationProjection {
     pub(crate) target_fingerprints: Vec<diagnostic_triage_contracts::Fingerprint>,
     pub(crate) before_findings: Vec<Finding>,
     pub(crate) after_findings: Vec<Finding>,
+}
+
+pub(crate) struct AuthorizedPatchVerification {
+    pub(crate) projection: PatchVerificationProjection,
+    pub(crate) authorization: SafeFixAuthorization,
 }
 struct ResolvedWorkspace {
     repository_root: PathBuf,
@@ -251,6 +258,8 @@ pub(crate) enum ReadOnlyReportError {
 
 #[derive(Debug, Error)]
 pub(crate) enum PatchVerificationError {
+    #[error("canonical Ruff Evidence lineage does not match the Provider projection")]
+    RuffLineageMismatch,
     #[error(transparent)]
     Report(#[from] ReadOnlyReportError),
     #[error(transparent)]
@@ -871,6 +880,49 @@ pub(crate) fn project_patch_verification(
     })
 }
 
+pub(crate) fn authorize_canonical_ruff_verification(
+    scratch: &ScratchWorkspace,
+    canonical: &CanonicalRuffFix,
+    candidate: &FixCandidate,
+    patch_application: &PatchApplication,
+    before: ReadOnlyRuntimeProjection,
+    after: ReadOnlyRuntimeProjection,
+) -> Result<AuthorizedPatchVerification, PatchVerificationError> {
+    // LLM contract: SOURCE_BOUND -> CANONICAL_PATCH_BOUND -> VERIFIED -> AUTHORIZED;
+    // any competing source, patch, or mapping -> REJECTED without minting authority.
+    let mapping = canonical.evidence_mapping();
+    let source_matches = before.evidence.contains(&mapping.source_evidence);
+    if candidate != &mapping.candidate
+        || candidate.patch_evidence_id != mapping.source_evidence.evidence_id
+        || canonical.patch_evidence.evidence_id != mapping.canonical_evidence_id
+        || canonical.patch_evidence.sha256 != mapping.canonical_sha256
+        || !source_matches
+    {
+        return Err(PatchVerificationError::RuffLineageMismatch);
+    }
+    let projection = project_patch_verification(
+        scratch,
+        &canonical.patch,
+        candidate,
+        canonical.patch_evidence.clone(),
+        before,
+        after,
+    )?;
+    let authorization = scratch.authorize_safe_fix(SafeFixComparisonInput {
+        candidate: &projection.candidate,
+        target_fingerprints: &projection.target_fingerprints,
+        evidence: &projection.evidence,
+        executions: &projection.executions,
+        patch_application,
+        before_findings: &projection.before_findings,
+        after_findings: &projection.after_findings,
+    })?;
+    Ok(AuthorizedPatchVerification {
+        projection,
+        authorization,
+    })
+}
+
 fn classify_projection(
     projection: &ReadOnlyRuntimeProjection,
 ) -> Result<Vec<Finding>, ReadOnlyReportError> {
@@ -1035,20 +1087,22 @@ mod tests {
     use std::{env, fs, path::Path};
 
     use super::{
-        PlannedProvider, ReadOnlyMode, ReadOnlyReportError, RuntimeProjectionError,
-        assemble_read_only_report, build_read_only_plan, execute_patch_verification,
-        execute_read_only_plan, preflight_projection_collections, project_patch_verification,
-        project_provider_states, resolve_provider_program, resolve_workspace, synthesize_execution,
+        PatchVerificationError, PlannedProvider, ReadOnlyMode, ReadOnlyReportError,
+        RuntimeProjectionError, assemble_read_only_report, authorize_canonical_ruff_verification,
+        build_read_only_plan, execute_patch_verification, execute_read_only_plan,
+        preflight_projection_collections, project_patch_verification, project_provider_states,
+        resolve_provider_program, resolve_workspace, synthesize_execution,
     };
     use crate::{
-        RuntimeConfig, ScratchChange, ScratchError, ScratchLimits, ScratchPatch, ScratchWorkspace,
+        CanonicalRuffFix, RUFF_FIX_MEDIA_TYPE, RuffFixLimits, RuntimeConfig, ScratchChange,
+        ScratchError, ScratchLimits, ScratchPatch, ScratchWorkspace, canonicalize_ruff_fix,
         session::ProviderSessionState,
     };
     use diagnostic_triage_contracts::{
         ObjectId, Sha256Digest, ValidatedSession,
         model::{
-            AdapterKind, Category, Execution, ExecutionStatus, MicroCategory, PhaseDuration,
-            Verdict,
+            AdapterKind, Category, Execution, ExecutionStatus, FixCandidate, Location,
+            MicroCategory, PhaseDuration, Position, Verdict,
         },
         protocol::{Operation, ProtocolEnvelope},
         validate_session_jsonl,
@@ -1301,7 +1355,14 @@ mod tests {
         out_of_line.content = None;
         let mut digest_mismatch = patch_evidence.clone();
         digest_mismatch.sha256 = Sha256Digest::compute(b"competing patch");
-        for invalid in [truncated, out_of_line, digest_mismatch] {
+        let mut malformed = after.clone();
+        malformed.observations = before.observations.clone();
+        malformed.observations[0].message.clear();
+        assert!(matches!(
+            attempt(&candidate, truncated, malformed),
+            Err(PatchVerificationError::Scratch(_))
+        ));
+        for invalid in [out_of_line, digest_mismatch] {
             assert!(attempt(&candidate, invalid, after.clone()).is_err());
         }
         let mut forged = candidate.clone();
@@ -1321,6 +1382,93 @@ mod tests {
         assert!(projected.executions[1].verification.is_none());
         let verified = attempt(&candidate, patch_evidence, after).unwrap();
         assert!(verified.executions[1].verification.is_some());
+        scratch.cleanup().unwrap();
+    }
+
+    #[test]
+    fn canonical_ruff_lineage_is_required_before_authorization() {
+        let repository = tempdir().unwrap();
+        fs::create_dir(repository.path().join("src")).unwrap();
+        fs::write(repository.path().join("src/example.py"), b"unused\n").unwrap();
+        let mut scratch =
+            ScratchWorkspace::stage(repository.path(), &["."], ScratchLimits::default()).unwrap();
+        let (planned, session) = aggregate_fixture("alpha", 311, true);
+        let mut before = project_provider_states(
+            config("src"),
+            "019f7e95-0000-7000-8000-000000000310".parse().unwrap(),
+            vec![(planned, ProviderSessionState::Complete(Box::new(session)))],
+        )
+        .unwrap();
+        before.observations[0].location = Some(Location {
+            path: "src/example.py".parse().unwrap(),
+            start: Position { line: 1, column: 1 },
+            end: None,
+        });
+        let source = r#"{"version":"0.12.4","filename":"src/example.py","rule_id":"F401","fix":{"applicability":"safe","edits":[{"content":"","location":{"row":1,"column":1},"end_location":{"row":1,"column":7}}],"message":"remove unused"}}"#;
+        let source_bytes = u64::try_from(source.len()).unwrap();
+        before.evidence[0].media_type = RUFF_FIX_MEDIA_TYPE.to_owned();
+        before.evidence[0].retained_bytes = source_bytes;
+        before.evidence[0].observed_bytes = source_bytes;
+        before.evidence[0].sha256 = Sha256Digest::compute(source.as_bytes());
+        before.evidence[0].content = Some(source.to_owned());
+        let candidate = before.fix_candidates[0].clone();
+        let canonical = canonicalize_ruff_fix(
+            &scratch,
+            &before.observations[0],
+            &candidate,
+            &before.evidence[0],
+            RuffFixLimits::default(),
+        )
+        .unwrap();
+        let application = scratch.apply_for_verification(&canonical.patch).unwrap();
+        let mut after = before.clone();
+        after.observations.clear();
+        after.evidence.clear();
+        after.fix_candidates.clear();
+        after.executions[0].execution_id = after.plan_id.clone();
+        let authorized = authorize_canonical_ruff_verification(
+            &scratch,
+            &canonical,
+            &candidate,
+            &application,
+            before.clone(),
+            after.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            authorized.authorization.candidate_id(),
+            &candidate.fix_candidate_id
+        );
+        let rejects = |canonical: &CanonicalRuffFix, candidate: &FixCandidate, before| {
+            matches!(
+                authorize_canonical_ruff_verification(
+                    &scratch,
+                    canonical,
+                    candidate,
+                    &application,
+                    before,
+                    after.clone(),
+                ),
+                Err(PatchVerificationError::RuffLineageMismatch)
+            )
+        };
+
+        let mut competing_id = candidate.clone();
+        competing_id.fix_candidate_id = "019f7e95-0000-7000-8000-000000000398".parse().unwrap();
+        let mut competing_scope = candidate.clone();
+        competing_scope.observation_ids[0] = after.plan_id.clone();
+        for competing_candidate in [competing_id, competing_scope] {
+            let mut competing_before = before.clone();
+            competing_before.fix_candidates[0] = competing_candidate.clone();
+            assert!(rejects(&canonical, &competing_candidate, competing_before));
+        }
+        let mut competing = canonical.clone();
+        competing.patch_evidence.evidence_id =
+            "019f7e95-0000-7000-8000-000000000399".parse().unwrap();
+        assert!(rejects(&competing, &candidate, before.clone()));
+        let mut competing_source = before;
+        competing_source.evidence[0].execution_id = Some(after.plan_id.clone());
+        assert!(rejects(&canonical, &candidate, competing_source));
         scratch.cleanup().unwrap();
     }
 
