@@ -115,11 +115,23 @@ class ReleaseContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseContractError, "artifact changed"):
             self.verify()
 
+    def test_unmanifested_directory_files_are_rejected_in_both_phases(self) -> None:
+        unexpected = self.artifact_dir / "stale-release.tar.gz"
+        unexpected.write_bytes(b"unattested\n")
+        with self.assertRaisesRegex(ReleaseContractError, "does not match"):
+            self.create()
+
+        unexpected.unlink()
+        self.create()
+        unexpected.write_bytes(b"unattested\n")
+        with self.assertRaisesRegex(ReleaseContractError, "does not match"):
+            self.verify()
+
     def test_symlink_artifact_and_duplicate_manifest_key_are_rejected(self) -> None:
         target = self.artifact_dir / self.matrix.artifacts[0].archive
         target.unlink()
         target.symlink_to(self.source_name)
-        with self.assertRaisesRegex(ReleaseContractError, "artifact is missing"):
+        with self.assertRaisesRegex(ReleaseContractError, "does not match"):
             self.create()
 
         target.unlink()

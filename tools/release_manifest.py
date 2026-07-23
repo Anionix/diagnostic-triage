@@ -5,6 +5,7 @@ import hashlib
 import json
 import re
 import sys
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -193,6 +194,31 @@ def _lock_digests(repository_root: Path) -> dict[str, str]:
     }
 
 
+def _require_release_directory(
+    artifact_dir: Path,
+    *,
+    required: set[str],
+    permitted_outputs: AbstractSet[str] = frozenset(),
+) -> None:
+    try:
+        entries = list(artifact_dir.iterdir())
+    except OSError as error:
+        raise ReleaseContractError(
+            f"cannot inspect release artifact directory: {error}"
+        ) from error
+    invalid = sorted(
+        entry.name for entry in entries if entry.is_symlink() or not entry.is_file()
+    )
+    observed = {entry.name for entry in entries}
+    missing = sorted(required - observed)
+    unexpected = sorted(observed - required - permitted_outputs)
+    if invalid or missing or unexpected:
+        raise ReleaseContractError(
+            "release artifact directory does not match the contract: "
+            f"missing={missing}, invalid={invalid}, unexpected={unexpected}"
+        )
+
+
 def create_release_manifest(
     *,
     repository_root: Path,
@@ -203,8 +229,9 @@ def create_release_manifest(
     manifest_path: Path,
     checksums_path: Path,
 ) -> dict[str, object]:
-    # LLM contract: SOURCE_PINNED -> MATRIX_VALIDATED -> ARTIFACTS_HASHED ->
-    # MANIFESTED -> CHECKSUMMED; missing, mutable, or mismatched input -> FAILED.
+    # LLM contract: SOURCE_PINNED -> MATRIX_VALIDATED -> DIRECTORY_BOUND ->
+    # ARTIFACTS_HASHED -> MANIFESTED -> CHECKSUMMED; missing, mutable,
+    # unmanifested, or mismatched input -> FAILED.
     matrix = load_matrix(matrix_path)
     if tag != f"v{matrix.version}":
         raise ReleaseContractError(
@@ -213,6 +240,13 @@ def create_release_manifest(
     if REVISION_PATTERN.fullmatch(revision) is None:
         raise ReleaseContractError("source revision must be 40 lowercase hex digits")
 
+    source_name = f"diagnostic-triage-v{matrix.version}-source.tar.gz"
+    required_names = {spec.archive for spec in matrix.artifacts} | {source_name}
+    _require_release_directory(
+        artifact_dir,
+        required=required_names,
+        permitted_outputs={manifest_path.name, checksums_path.name},
+    )
     artifact_records = [
         _artifact_record(
             artifact_dir,
@@ -224,7 +258,6 @@ def create_release_manifest(
         )
         for spec in matrix.artifacts
     ]
-    source_name = f"diagnostic-triage-v{matrix.version}-source.tar.gz"
     artifact_records.append(
         _artifact_record(artifact_dir, source_name, kind="source-archive")
     )
@@ -299,6 +332,14 @@ def verify_release(
         raise ReleaseContractError(
             "expected source revision must be 40 lowercase hex digits"
         )
+    source_name = f"diagnostic-triage-v{matrix.version}-source.tar.gz"
+    required_names = {
+        *(spec.archive for spec in matrix.artifacts),
+        source_name,
+        manifest_path.name,
+        checksums_path.name,
+    }
+    _require_release_directory(artifact_dir, required=required_names)
     raw = _object_record(_load_json(manifest_path), "release manifest")
     _require_fields(
         raw,
@@ -341,7 +382,6 @@ def verify_release(
         }
         for spec in matrix.artifacts
     }
-    source_name = f"diagnostic-triage-v{matrix.version}-source.tar.gz"
     expected_records[source_name] = {
         "name": source_name,
         "kind": "source-archive",
