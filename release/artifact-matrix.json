@@ -1,0 +1,30 @@
+{
+  "schema_version": "diagnostic-triage.release-matrix/v1",
+  "release_version": "0.1.0-alpha.1",
+  "artifacts": [
+    {
+      "system": "aarch64-darwin",
+      "runner": "macos-15",
+      "rust_target": "aarch64-apple-darwin",
+      "archive": "diagnostic-triage-v0.1.0-alpha.1-aarch64-apple-darwin.tar.gz"
+    },
+    {
+      "system": "aarch64-linux",
+      "runner": "ubuntu-24.04-arm",
+      "rust_target": "aarch64-unknown-linux-musl",
+      "archive": "diagnostic-triage-v0.1.0-alpha.1-aarch64-unknown-linux-musl.tar.gz"
+    },
+    {
+      "system": "x86_64-darwin",
+      "runner": "macos-15-intel",
+      "rust_target": "x86_64-apple-darwin",
+      "archive": "diagnostic-triage-v0.1.0-alpha.1-x86_64-apple-darwin.tar.gz"
+    },
+    {
+      "system": "x86_64-linux",
+      "runner": "ubuntu-24.04",
+      "rust_target": "x86_64-unknown-linux-musl",
+      "archive": "diagnostic-triage-v0.1.0-alpha.1-x86_64-unknown-linux-musl.tar.gz"
+    }
+  ]
+}
