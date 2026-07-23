@@ -23,6 +23,27 @@ and [ADR 0001](docs/adr/0001-standalone-canonical-engine.md).
 
 ## Running from source
 
+The public command surface is:
+
+```text
+diagnostic-triage check
+diagnostic-triage ci
+diagnostic-triage fix
+diagnostic-triage fix --apply-safe
+diagnostic-triage verify --patch <repo-relative-path>
+diagnostic-triage observe --source github-actions --input <repo-relative-path>
+diagnostic-triage issue-draft --input <repo-relative-path>
+```
+
+`fix` writes a patch to stdout and leaves the repository unchanged.
+`fix --apply-safe` is the only source-writing command; it applies only one
+canonical Ruff SAFE candidate for an existing regular file after isolated
+before/after verification succeeds. The v1 publication path supports Linux and
+macOS. The verified patch is written and flushed before descriptor-bound source
+publication, so output failure leaves source untouched. A post-publication
+cleanup or final-state failure exits 2 with the patch already available on
+stdout and an explicit applied-state error.
+
 `observe --source github-actions` requires the first-party
 `diagnostic-triage-observer-github-actions` binary. Release archives place it
 beside `diagnostic-triage`; source installs must install both packages to the

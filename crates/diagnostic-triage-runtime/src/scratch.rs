@@ -16,7 +16,11 @@ use diagnostic_triage_engine::verification::{
     compare_safe_fix,
 };
 #[cfg(unix)]
-use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, Stat, fstat, open, openat, statat};
+use rustix::fs::{
+    AtFlags, Dir, FileType, Mode, OFlags, Stat, fstat, open, openat, statat, unlinkat,
+};
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+use rustix::fs::{RenameFlags, renameat_with};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -30,7 +34,7 @@ use uuid::Uuid;
 #[cfg(all(test, unix))]
 use std::cell::{Cell, RefCell};
 #[cfg(unix)]
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 
 // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
 
@@ -50,6 +54,8 @@ const DEFAULT_MAX_EVIDENCE_BYTES: u32 = 1_048_576;
 const MAX_REPO_PATH_CHARS: usize = 4_096;
 const MAX_REPO_PATH_BYTES: usize = MAX_REPO_PATH_CHARS * 4;
 const MAX_TRAVERSAL_DEPTH: usize = 256;
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+const MAX_SOURCE_RECOVERY_EXCHANGES: usize = 8;
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
 const SAFE_CREATE_MODE: u32 = 0o600;
@@ -65,6 +71,8 @@ thread_local! {
     static PATCH_ENCODE_CALLED: Cell<bool> = const { Cell::new(false) };
     static SNAPSHOT_ENCODE_CALLED: Cell<bool> = const { Cell::new(false) };
     static REPLACED_WORKSPACE_CLEANUP_FAILURE: Cell<bool> = const { Cell::new(false) };
+    static SOURCE_PUBLICATION_RACE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static SOURCE_PUBLICATION_SECOND_RACE_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
 /// Bounds applied to source copies, scratch snapshots, and patch application.
@@ -310,6 +318,8 @@ pub struct ScratchWorkspace {
     base: Evidence,
     applied: Option<AppliedScratchState>,
     limits: ScratchLimits,
+    #[cfg(unix)]
+    source_identities: BTreeMap<String, SourceIdentity>,
 }
 
 impl ScratchWorkspace {
@@ -356,7 +366,10 @@ impl ScratchWorkspace {
         normalized_paths.sort();
         normalized_paths.dedup();
         prune_nested_paths(&mut normalized_paths);
-        let source_files = collect_selected_files(&repo_root, &normalized_paths, limits)?.files;
+        let collected = collect_selected_files(&repo_root, &normalized_paths, limits)?;
+        let source_files = collected.files;
+        #[cfg(unix)]
+        let source_identities = collected.identities;
 
         let tempdir = create_safe_tempdir("diagnostic-triage-scratch-", &repo_root)?;
         let staged = (|| {
@@ -400,6 +413,8 @@ impl ScratchWorkspace {
             base,
             applied: None,
             limits,
+            #[cfg(unix)]
+            source_identities,
         })
     }
 
@@ -453,7 +468,8 @@ impl ScratchWorkspace {
                 max_entries: self.limits.max_entries,
                 max_files: self.limits.max_files,
             };
-            let (opened, _) = open_relative_entry(&root.file, self.path(), &relative, &mut budget)?;
+            let (opened, _, _) =
+                open_relative_entry(&root.file, self.path(), &relative, &mut budget)?;
             if opened.file_type != FileType::RegularFile {
                 return Err(ScratchError::UnsupportedEntry {
                     path: self.path().join(relative_to_path(&relative)),
@@ -515,8 +531,7 @@ impl ScratchWorkspace {
             })?;
             let final_type = FileType::from_raw_mode(final_stat.st_mode);
             if final_type != FileType::RegularFile
-                || final_stat.st_dev != opened.device
-                || final_stat.st_ino != opened.inode
+                || SourceIdentity::from_stat(&final_stat) != opened.identity
                 || permission_mode(&final_stat) != mode
                 || actual != expected.bytes
                 || mode != expected.mode
@@ -799,6 +814,161 @@ impl ScratchWorkspace {
         result
     }
 
+    /// Consume one verified authorization and atomically exchange its single-file result into the
+    /// source repository.
+    ///
+    /// The replacement is prepared beside the target, the current target is exchanged atomically,
+    /// and the displaced file is checked against the immutable base before the exchange is
+    /// committed. A stale target is exchanged back, so a concurrent edit that wins before the
+    /// commit point is preserved rather than overwritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when authorization fails, the patch is not one existing regular-file
+    /// write, the source changed, the platform lacks atomic exchange, or rollback/cleanup fails.
+    pub fn publish_verified_to_source(
+        &mut self,
+        candidate: &FixCandidate,
+        patch: &ScratchPatch,
+        patch_evidence: &Evidence,
+        authorization: SafeFixAuthorization,
+    ) -> Result<PatchApplication, ScratchError> {
+        // LLM contract: VERIFIED -> AUTH_CONSUMED -> REPLACEMENT_STAGED -> ATOMIC_EXCHANGED ->
+        // BASE_CONFIRMED -> PUBLISHED; stale source -> EXCHANGED_BACK without overwrite.
+        let application = self.apply_verified(candidate, patch, patch_evidence, authorization)?;
+        self.exchange_verified_source(patch, application)
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    fn exchange_verified_source(
+        &self,
+        patch: &ScratchPatch,
+        application: PatchApplication,
+    ) -> Result<PatchApplication, ScratchError> {
+        let [ScratchChange::Write { path, contents }] = patch.changes() else {
+            return Err(ScratchError::SourcePublicationUnsupported);
+        };
+        let expected = self.base_snapshot_file(path)?;
+        let expected_identity = *self
+            .source_identities
+            .get(path)
+            .ok_or(ScratchError::SourcePublicationConflict)?;
+        if expected_identity.links != 1 {
+            return Err(ScratchError::SourcePublicationUnsupported);
+        }
+        let expected_state = PublicationFileState::from_snapshot(expected_identity, &expected);
+        let root = open_root_directory(&self.repo_root)?;
+        let (parent, name) = open_source_parent(
+            &root.file,
+            &self.repo_root,
+            path,
+            self.limits,
+            &self.source_identities,
+        )?;
+        let source_path = self.repo_root.join(relative_to_path(path));
+        let current_state = open_publication_state(
+            &parent,
+            OsStr::new(name),
+            &source_path,
+            path,
+            self.limits.max_bytes,
+        )?;
+        if current_state != expected_state {
+            return Err(ScratchError::SourcePublicationConflict);
+        }
+
+        let parent_path = source_path
+            .parent()
+            .ok_or(ScratchError::SourcePublicationUnsupported)?
+            .to_path_buf();
+        let PublicationReplacement {
+            file: _replacement_file,
+            name: replacement_name,
+            state: replacement_state,
+        } = create_publication_replacement(&parent, &parent_path, contents, expected.mode)?;
+
+        #[cfg(all(test, unix))]
+        run_source_publication_race_hook();
+
+        exchange_publication_entry(&parent, &replacement_name, OsStr::new(name))?;
+
+        let replacement_path = parent_path.join(&replacement_name);
+        let displaced = open_publication_state(
+            &parent,
+            &replacement_name,
+            &replacement_path,
+            path,
+            self.limits.max_bytes,
+        );
+        if self.published_target_matches(path, &replacement_state)
+            && displaced
+                .as_ref()
+                .is_ok_and(|state| *state == expected_state)
+        {
+            unlink_publication_entry(&parent, &replacement_name).map_err(|source| {
+                ScratchError::SourcePublishedCleanupIncomplete {
+                    application: application.clone(),
+                    source,
+                }
+            })?;
+        } else {
+            let recovery =
+                displaced.map_err(|source| ScratchError::SourcePublicationRollbackIncomplete {
+                    application: application.clone(),
+                    source: io::Error::other(source.to_string()),
+                })?;
+            recover_latest_source(
+                SourceRecovery {
+                    parent: &parent,
+                    replacement_name: &replacement_name,
+                    target_name: OsStr::new(name),
+                    display_path: &replacement_path,
+                    relative: path,
+                    max_bytes: self.limits.max_bytes,
+                },
+                replacement_state,
+                recovery,
+            )
+            .map_err(|source| ScratchError::SourcePublicationRollbackIncomplete {
+                application,
+                source,
+            })?;
+            return Err(ScratchError::SourcePublicationConflict);
+        }
+        Ok(application)
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    fn published_target_matches(&self, path: &str, expected: &PublicationFileState) -> bool {
+        let check = (|| {
+            let root = open_root_directory(&self.repo_root)?;
+            let (parent, name) = open_source_parent(
+                &root.file,
+                &self.repo_root,
+                path,
+                self.limits,
+                &self.source_identities,
+            )?;
+            open_publication_state(
+                &parent,
+                OsStr::new(name),
+                &self.repo_root.join(relative_to_path(path)),
+                path,
+                self.limits.max_bytes,
+            )
+        })();
+        check.is_ok_and(|actual| actual == *expected)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    fn exchange_verified_source(
+        &self,
+        _patch: &ScratchPatch,
+        _application: PatchApplication,
+    ) -> Result<PatchApplication, ScratchError> {
+        Err(ScratchError::NoFollowUnsupported)
+    }
+
     fn apply_to_private_workspace(
         &mut self,
         patch: &ScratchPatch,
@@ -925,6 +1095,22 @@ pub enum ScratchError {
     PatchAlreadyApplied,
     #[error("the verified safe-fix authorization was already consumed")]
     AuthorizationAlreadyConsumed,
+    #[error("source publication supports exactly one existing regular-file write")]
+    SourcePublicationUnsupported,
+    #[error("source changed before the verified replacement could be committed")]
+    SourcePublicationConflict,
+    #[error("safe patch publication rollback failed after the source changed: {source}")]
+    SourcePublicationRollbackIncomplete {
+        application: PatchApplication,
+        #[source]
+        source: io::Error,
+    },
+    #[error("safe patch was applied to source, but displaced-file cleanup failed: {source}")]
+    SourcePublishedCleanupIncomplete {
+        application: PatchApplication,
+        #[source]
+        source: io::Error,
+    },
     #[error("the private workspace has no applied patch to verify")]
     PatchNotApplied,
     #[error("candidate patch evidence is not complete inline PATCH evidence")]
@@ -964,7 +1150,9 @@ impl ScratchError {
     #[must_use]
     pub fn published_application(&self) -> Option<&PatchApplication> {
         match self {
-            Self::PublishedCleanupIncomplete { application, .. } => Some(application),
+            Self::PublishedCleanupIncomplete { application, .. }
+            | Self::SourcePublicationRollbackIncomplete { application, .. }
+            | Self::SourcePublishedCleanupIncomplete { application, .. } => Some(application),
             _ => None,
         }
     }
@@ -1356,6 +1544,76 @@ struct OpenedRegularFile {
 struct CollectedFiles {
     files: BTreeMap<String, OpenedRegularFile>,
     entry_count: usize,
+    #[cfg(unix)]
+    identities: BTreeMap<String, SourceIdentity>,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct SourceIdentity {
+    device: u128,
+    inode: u128,
+    links: u128,
+}
+
+#[cfg(unix)]
+impl PartialEq for SourceIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.device == other.device && self.inode == other.inode
+    }
+}
+
+#[cfg(unix)]
+impl Eq for SourceIdentity {}
+
+#[cfg(unix)]
+impl SourceIdentity {
+    // rustix exposes signed `dev_t` on Apple and unsigned `dev_t` on Linux.
+    #[allow(clippy::unnecessary_fallible_conversions)]
+    fn from_stat(stat: &Stat) -> Self {
+        Self {
+            device: u128::try_from(stat.st_dev).unwrap_or(u128::MAX),
+            inode: u128::from(stat.st_ino),
+            links: u128::from(stat.st_nlink),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PublicationFileState {
+    identity: SourceIdentity,
+    links: u128,
+    bytes: u64,
+    mode: u32,
+    sha256: Sha256Digest,
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+impl PublicationFileState {
+    fn from_snapshot(identity: SourceIdentity, snapshot: &SnapshotFile) -> Self {
+        Self {
+            identity,
+            links: identity.links,
+            bytes: snapshot.bytes,
+            mode: snapshot.mode,
+            sha256: snapshot.sha256.clone(),
+        }
+    }
+
+    fn from_contents(file: &File, contents: &[u8]) -> Result<Self, ScratchError> {
+        let stat = fstat(file).map_err(|source| ScratchError::Io {
+            operation: "inspect source publication replacement descriptor",
+            source: io::Error::from_raw_os_error(source.raw_os_error()),
+        })?;
+        Ok(Self {
+            identity: SourceIdentity::from_stat(&stat),
+            links: u128::from(stat.st_nlink),
+            bytes: u64::try_from(contents.len()).unwrap_or(u64::MAX),
+            mode: permission_mode(&stat),
+            sha256: Sha256Digest::compute(contents),
+        })
+    }
 }
 
 #[cfg(unix)]
@@ -1364,11 +1622,11 @@ struct OpenedEntry {
     file: File,
     file_type: FileType,
     mode: u32,
-    #[cfg(unix)]
-    device: i32,
-    #[cfg(unix)]
-    inode: u64,
+    identity: SourceIdentity,
 }
+
+#[cfg(unix)]
+type OpenedRelativeEntry = (OpenedEntry, usize, Vec<(String, SourceIdentity)>);
 
 #[cfg(unix)]
 struct TraversalBudget {
@@ -1409,14 +1667,19 @@ fn collect_selected_files(
     let mut collected = CollectedFiles {
         files: BTreeMap::new(),
         entry_count: 0,
+        #[cfg(unix)]
+        identities: BTreeMap::new(),
     };
+    collected
+        .identities
+        .insert(".".to_owned(), root_entry.identity);
     let mut budget = TraversalBudget {
         entries: 0,
         max_entries: limits.max_entries,
         max_files: limits.max_files,
     };
     for relative in selected_paths {
-        let (entry, depth, already_charged) = if relative == "." {
+        let (entry, depth, already_charged, identities) = if relative == "." {
             (
                 OpenedEntry {
                     file: root_entry
@@ -1428,17 +1691,20 @@ fn collect_selected_files(
                         })?,
                     file_type: root_entry.file_type,
                     mode: root_entry.mode,
-                    device: root_entry.device,
-                    inode: root_entry.inode,
+                    identity: root_entry.identity,
                 },
                 0,
                 false,
+                Vec::new(),
             )
         } else {
-            let (entry, depth) =
+            let (entry, depth, identities) =
                 open_relative_entry(&root_entry.file, root, relative, &mut budget)?;
-            (entry, depth, true)
+            (entry, depth, true, identities)
         };
+        for (path, identity) in identities {
+            collected.identities.insert(path, identity);
+        }
         collect_open_entry(
             root,
             relative,
@@ -1488,8 +1754,7 @@ fn open_root_directory(path: &Path) -> Result<OpenedEntry, ScratchError> {
         file,
         file_type,
         mode: permission_mode(&stat),
-        device: stat.st_dev,
-        inode: stat.st_ino,
+        identity: SourceIdentity::from_stat(&stat),
     })
 }
 
@@ -1499,7 +1764,7 @@ fn open_relative_entry(
     root: &Path,
     relative: &str,
     budget: &mut TraversalBudget,
-) -> Result<(OpenedEntry, usize), ScratchError> {
+) -> Result<OpenedRelativeEntry, ScratchError> {
     let mut parent = root_descriptor
         .try_clone()
         .map_err(|source| ScratchError::Io {
@@ -1507,6 +1772,7 @@ fn open_relative_entry(
             source,
         })?;
     let component_count = relative.split('/').count();
+    let mut identities = Vec::with_capacity(component_count);
     if component_count > MAX_TRAVERSAL_DEPTH {
         return Err(ScratchError::BoundExceeded {
             resource: "traversal depth",
@@ -1528,8 +1794,9 @@ fn open_relative_entry(
             &display_path,
             &component_relative,
         )?;
+        identities.push((component_relative.clone(), opened.identity));
         if index + 1 == component_count {
-            return Ok((opened, component_count));
+            return Ok((opened, component_count, identities));
         }
         if opened.file_type != FileType::Directory {
             return Err(ScratchError::NotDirectory { path: display_path });
@@ -1611,14 +1878,294 @@ fn open_entry_no_follow(
         file,
         file_type: opened_type,
         mode: permission_mode(&opened),
-        device: opened.st_dev,
-        inode: opened.st_ino,
+        identity: SourceIdentity::from_stat(&opened),
     })
 }
 
 #[cfg(unix)]
 fn permission_mode(stat: &Stat) -> u32 {
     u32::from(stat.st_mode) & PERMISSION_MODE_MASK
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn open_source_parent<'a>(
+    root: &File,
+    root_path: &Path,
+    relative: &'a str,
+    limits: ScratchLimits,
+    identities: &BTreeMap<String, SourceIdentity>,
+) -> Result<(File, &'a str), ScratchError> {
+    if !identities
+        .get(".")
+        .is_some_and(|identity| descriptor_matches_identity(root, identity))
+    {
+        return Err(ScratchError::SourcePublicationConflict);
+    }
+    let (parent, name) = relative
+        .rsplit_once('/')
+        .map_or((".", relative), |(parent, name)| (parent, name));
+    if parent == "." {
+        return Ok((
+            root.try_clone().map_err(|source| ScratchError::Io {
+                operation: "duplicate source repository root descriptor",
+                source,
+            })?,
+            name,
+        ));
+    }
+    let mut budget = TraversalBudget {
+        entries: 0,
+        max_entries: limits.max_entries,
+        max_files: limits.max_files,
+    };
+    let (opened, _, observed) = open_relative_entry(root, root_path, parent, &mut budget)?;
+    if observed
+        .iter()
+        .any(|(path, identity)| identities.get(path) != Some(identity))
+    {
+        return Err(ScratchError::SourcePublicationConflict);
+    }
+    if opened.file_type != FileType::Directory {
+        return Err(ScratchError::NotDirectory {
+            path: root_path.join(relative_to_path(parent)),
+        });
+    }
+    Ok((opened.file, name))
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn descriptor_matches_identity(file: &File, expected: &SourceIdentity) -> bool {
+    fstat(file).is_ok_and(|actual| SourceIdentity::from_stat(&actual) == *expected)
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn publication_state_from_opened(
+    opened: OpenedEntry,
+    max_bytes: u64,
+) -> Result<PublicationFileState, ScratchError> {
+    if opened.file_type != FileType::RegularFile {
+        return Err(ScratchError::SourcePublicationConflict);
+    }
+    let identity = opened.identity;
+    let digested = digest_file(
+        OpenedRegularFile {
+            file: opened.file,
+            mode: opened.mode,
+        },
+        max_bytes,
+    )?;
+    Ok(PublicationFileState {
+        identity,
+        links: identity.links,
+        bytes: digested.bytes,
+        mode: digested.mode,
+        sha256: digested.sha256,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn open_publication_state(
+    parent: &File,
+    name: &OsStr,
+    display_path: &Path,
+    relative: &str,
+    max_bytes: u64,
+) -> Result<PublicationFileState, ScratchError> {
+    let opened = open_entry_no_follow(parent, name, display_path, relative)?;
+    publication_state_from_opened(opened, max_bytes)
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn validate_named_temp_entry(parent: &File, name: &OsStr, file: &File) -> Result<(), ScratchError> {
+    let path_stat =
+        statat(parent, name, AtFlags::SYMLINK_NOFOLLOW).map_err(|source| ScratchError::Io {
+            operation: "inspect source publication replacement path",
+            source: io::Error::from_raw_os_error(source.raw_os_error()),
+        })?;
+    let file_stat = fstat(file).map_err(|source| ScratchError::Io {
+        operation: "inspect source publication replacement descriptor",
+        source: io::Error::from_raw_os_error(source.raw_os_error()),
+    })?;
+    if FileType::from_raw_mode(path_stat.st_mode) != FileType::RegularFile
+        || path_stat.st_dev != file_stat.st_dev
+        || path_stat.st_ino != file_stat.st_ino
+    {
+        return Err(ScratchError::SourcePublicationConflict);
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+struct PublicationReplacement {
+    file: File,
+    name: OsString,
+    state: PublicationFileState,
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn create_publication_replacement(
+    parent: &File,
+    parent_path: &Path,
+    contents: &[u8],
+    mode: u32,
+) -> Result<PublicationReplacement, ScratchError> {
+    let mut builder = Builder::new();
+    builder
+        .prefix(".diagnostic-triage-publish-")
+        .disable_cleanup(true);
+    let mut replacement = builder
+        .make_in(parent_path, |generated_path| {
+            let name = generated_path.file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "publication replacement has no file name",
+                )
+            })?;
+            openat(
+                parent,
+                name,
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::from_raw_mode(0o600),
+            )
+            .map(File::from)
+            .map_err(|source| io::Error::from_raw_os_error(source.raw_os_error()))
+        })
+        .map_err(|source| ScratchError::Io {
+            operation: "create descriptor-relative source publication replacement",
+            source,
+        })?;
+    let name = replacement
+        .path()
+        .file_name()
+        .expect("tempfile builder always appends a random file name")
+        .to_os_string();
+    let prepared = (|| {
+        replacement
+            .as_file_mut()
+            .write_all(contents)
+            .map_err(|source| ScratchError::Io {
+                operation: "write source publication replacement",
+                source,
+            })?;
+        replacement
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(mode))
+            .map_err(|source| ScratchError::Io {
+                operation: "set source publication replacement mode",
+                source,
+            })?;
+        replacement
+            .as_file()
+            .sync_all()
+            .map_err(|source| ScratchError::Io {
+                operation: "sync source publication replacement",
+                source,
+            })?;
+        validate_named_temp_entry(parent, &name, replacement.as_file())?;
+        PublicationFileState::from_contents(replacement.as_file(), contents)
+    })();
+    let state = match prepared {
+        Ok(state) => state,
+        Err(operation) => {
+            if let Err(cleanup) = unlink_publication_entry(parent, &name) {
+                return Err(ScratchError::OperationalIncomplete {
+                    operation: "prepare and cleanup source publication replacement",
+                    details: format!("{operation}; cleanup failed: {cleanup}"),
+                });
+            }
+            return Err(operation);
+        }
+    };
+    Ok(PublicationReplacement {
+        file: replacement.into_file(),
+        name,
+        state,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn unlink_publication_entry(parent: &File, name: &OsStr) -> io::Result<()> {
+    unlinkat(parent, name, AtFlags::empty())
+        .map_err(|source| io::Error::from_raw_os_error(source.raw_os_error()))
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn exchange_publication_entry(
+    parent: &File,
+    replacement_name: &OsStr,
+    target_name: &OsStr,
+) -> Result<(), ScratchError> {
+    let Err(source) = renameat_with(
+        parent,
+        replacement_name,
+        parent,
+        target_name,
+        RenameFlags::EXCHANGE,
+    ) else {
+        return Ok(());
+    };
+    let exchange = io::Error::from_raw_os_error(source.raw_os_error());
+    if let Err(cleanup) = unlink_publication_entry(parent, replacement_name) {
+        return Err(ScratchError::OperationalIncomplete {
+            operation: "exchange and cleanup source publication replacement",
+            details: format!("{exchange}; cleanup failed: {cleanup}"),
+        });
+    }
+    Err(ScratchError::Io {
+        operation: "atomically exchange verified source replacement",
+        source: exchange,
+    })
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+#[derive(Clone, Copy)]
+struct SourceRecovery<'a> {
+    parent: &'a File,
+    replacement_name: &'a OsStr,
+    target_name: &'a OsStr,
+    display_path: &'a Path,
+    relative: &'a str,
+    max_bytes: u64,
+}
+
+#[cfg(any(target_os = "linux", target_vendor = "apple"))]
+fn recover_latest_source(
+    context: SourceRecovery<'_>,
+    mut expected_target: PublicationFileState,
+    mut recovery: PublicationFileState,
+) -> io::Result<()> {
+    // LLM contract: STALE_DISPLACED -> RECOVERY_EXCHANGED -> LATEST_RESTORED; each later
+    // concurrent edit becomes the next recovery candidate and unknown content is never unlinked.
+    for attempt in 0..MAX_SOURCE_RECOVERY_EXCHANGES {
+        if attempt == 0 {
+            run_source_publication_second_race_hook();
+        }
+        renameat_with(
+            context.parent,
+            context.replacement_name,
+            context.parent,
+            context.target_name,
+            RenameFlags::EXCHANGE,
+        )
+        .map_err(|source| io::Error::from_raw_os_error(source.raw_os_error()))?;
+        let displaced = open_publication_state(
+            context.parent,
+            context.replacement_name,
+            context.display_path,
+            context.relative,
+            context.max_bytes,
+        )
+        .map_err(|source| io::Error::other(source.to_string()))?;
+        if displaced == expected_target {
+            return unlink_publication_entry(context.parent, context.replacement_name);
+        }
+        expected_target = recovery;
+        recovery = displaced;
+    }
+    Err(io::Error::other(format!(
+        "source recovery exceeded {MAX_SOURCE_RECOVERY_EXCHANGES} exchanges; latest content is preserved at {}",
+        context.replacement_name.to_string_lossy()
+    )))
 }
 
 #[cfg(unix)]
@@ -1634,6 +2181,11 @@ fn collect_open_entry(
     if !already_charged {
         budget.visit()?;
     }
+    #[cfg(unix)]
+    collected
+        .identities
+        .entry(relative.to_owned())
+        .or_insert(entry.identity);
     if entry.file_type == FileType::RegularFile {
         if !collected.files.contains_key(relative) && collected.files.len() >= budget.max_files {
             return Err(ScratchError::BoundExceeded {
@@ -2063,6 +2615,7 @@ fn preflight_changes(
     let CollectedFiles {
         files: opened_files,
         mut entry_count,
+        ..
     } = collect_selected_files(root, &[".".to_owned()], limits)?;
     let mut files = opened_files.into_keys().collect::<BTreeSet<_>>();
     let mut prospective_entries = BTreeSet::new();
@@ -2277,6 +2830,20 @@ pub(crate) fn inject_open_entry_race(hook: impl FnOnce() + 'static) {
 }
 
 #[cfg(all(test, unix))]
+fn inject_source_publication_race(hook: impl FnOnce() + 'static) {
+    SOURCE_PUBLICATION_RACE_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(all(test, unix))]
+fn inject_source_publication_second_race(hook: impl FnOnce() + 'static) {
+    SOURCE_PUBLICATION_SECOND_RACE_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(Box::new(hook));
+    });
+}
+
+#[cfg(all(test, unix))]
 pub(crate) fn inject_immutable_base_read_failure() {
     IMMUTABLE_BASE_READ_FAILURE.with(|failure| failure.set(true));
 }
@@ -2298,6 +2865,25 @@ fn run_open_entry_race_hook() {
         hook();
     }
 }
+
+#[cfg(all(test, unix))]
+fn run_source_publication_race_hook() {
+    let hook = SOURCE_PUBLICATION_RACE_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(all(test, unix))]
+fn run_source_publication_second_race_hook() {
+    let hook = SOURCE_PUBLICATION_SECOND_RACE_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(not(all(test, unix)))]
+fn run_source_publication_second_race_hook() {}
 
 #[cfg(all(test, unix))]
 fn reset_patch_encode_marker() {
@@ -2467,6 +3053,18 @@ mod tests {
             max_bytes: 1024,
             max_evidence_bytes: 16_384,
         }
+    }
+
+    fn assert_no_publication_temp(path: &Path) {
+        assert!(
+            fs::read_dir(path)
+                .expect("publication directory")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".diagnostic-triage-publish-"))
+        );
     }
 
     fn verification_tool() -> Tool {
@@ -2714,7 +3312,7 @@ mod tests {
             max_entries: limits().max_entries,
             max_files: limits().max_files,
         };
-        let (parent, _) = open_relative_entry(&root.file, repo.path(), "parent", &mut budget)
+        let (parent, _, _) = open_relative_entry(&root.file, repo.path(), "parent", &mut budget)
             .expect("pinned parent descriptor");
         fs::rename(
             repo.path().join("parent"),
@@ -3418,6 +4016,391 @@ mod tests {
             !published_path.exists(),
             "published workspace must be removed"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn verified_source_publication_atomically_replaces_the_exact_base() {
+        let repo = tempdir().expect("repo");
+        let source = repo.path().join("file.txt");
+        fs::write(&source, b"before").expect("file");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o640)).expect("source mode");
+        let mut workspace =
+            ScratchWorkspace::stage(repo.path(), &["file.txt"], limits()).expect("stage");
+        let patch = ScratchPatch::new(vec![ScratchChange::Write {
+            path: "file.txt".to_owned(),
+            contents: b"after".to_vec(),
+        }])
+        .expect("patch");
+        let fixture = verification_fixture(&workspace, &patch);
+        let authorization = workspace
+            .authorize_safe_fix(fixture.input())
+            .expect("authorization");
+
+        workspace
+            .publish_verified_to_source(
+                &fixture.candidate,
+                &patch,
+                &fixture.evidence[2],
+                authorization,
+            )
+            .expect("publish");
+
+        assert_eq!(fs::read(&source).expect("published source"), b"after");
+        assert_eq!(
+            fs::metadata(&source)
+                .expect("source metadata")
+                .permissions()
+                .mode()
+                & PERMISSION_MODE_MASK,
+            0o640
+        );
+        assert!(
+            fs::read_dir(repo.path())
+                .expect("repository entries")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".diagnostic-triage-publish-"))
+        );
+        workspace.cleanup().expect("cleanup");
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn verified_source_publication_preserves_a_racing_edit() {
+        let repo = tempdir().expect("repo");
+        let source = repo.path().join("file.txt");
+        fs::write(&source, b"before").expect("file");
+        let mut workspace =
+            ScratchWorkspace::stage(repo.path(), &["file.txt"], limits()).expect("stage");
+        let patch = ScratchPatch::new(vec![ScratchChange::Write {
+            path: "file.txt".to_owned(),
+            contents: b"after".to_vec(),
+        }])
+        .expect("patch");
+        let fixture = verification_fixture(&workspace, &patch);
+        let authorization = workspace
+            .authorize_safe_fix(fixture.input())
+            .expect("authorization");
+        let raced_source = source.clone();
+        inject_source_publication_race(move || {
+            fs::write(raced_source, b"raced").expect("racing edit");
+        });
+
+        let error = workspace
+            .publish_verified_to_source(
+                &fixture.candidate,
+                &patch,
+                &fixture.evidence[2],
+                authorization,
+            )
+            .expect_err("stale source must roll back");
+
+        assert!(matches!(error, ScratchError::SourcePublicationConflict));
+        assert_eq!(fs::read(&source).expect("racing source"), b"raced");
+        assert!(
+            fs::read_dir(repo.path())
+                .expect("repository entries")
+                .all(|entry| !entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".diagnostic-triage-publish-"))
+        );
+        workspace.cleanup().expect("cleanup");
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn verified_source_publication_cleans_the_temp_when_exchange_fails() {
+        let repo = tempdir().expect("repo");
+        let source = repo.path().join("file.txt");
+        fs::write(&source, b"before").expect("file");
+        let mut workspace =
+            ScratchWorkspace::stage(repo.path(), &["file.txt"], limits()).expect("stage");
+        let patch = ScratchPatch::new(vec![ScratchChange::Write {
+            path: "file.txt".to_owned(),
+            contents: b"after".to_vec(),
+        }])
+        .expect("patch");
+        let fixture = verification_fixture(&workspace, &patch);
+        let authorization = workspace
+            .authorize_safe_fix(fixture.input())
+            .expect("authorization");
+        let removed_source = source.clone();
+        inject_source_publication_race(move || {
+            fs::remove_file(removed_source).expect("racing deletion");
+        });
+
+        let error = workspace
+            .publish_verified_to_source(
+                &fixture.candidate,
+                &patch,
+                &fixture.evidence[2],
+                authorization,
+            )
+            .expect_err("exchange without a target must fail");
+
+        assert!(matches!(
+            error,
+            ScratchError::Io {
+                operation: "atomically exchange verified source replacement",
+                ..
+            }
+        ));
+        assert!(!source.exists(), "the racing deletion must be preserved");
+        assert_no_publication_temp(repo.path());
+        workspace.cleanup().expect("cleanup");
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn verified_source_publication_preserves_a_second_racing_edit_during_recovery() {
+        let repo = tempdir().expect("repo");
+        let source = repo.path().join("file.txt");
+        fs::write(&source, b"before").expect("file");
+        let mut workspace =
+            ScratchWorkspace::stage(repo.path(), &["file.txt"], limits()).expect("stage");
+        let patch = ScratchPatch::new(vec![ScratchChange::Write {
+            path: "file.txt".to_owned(),
+            contents: b"after".to_vec(),
+        }])
+        .expect("patch");
+        let fixture = verification_fixture(&workspace, &patch);
+        let authorization = workspace
+            .authorize_safe_fix(fixture.input())
+            .expect("authorization");
+        let first_source = source.clone();
+        inject_source_publication_race(move || {
+            fs::write(first_source, b"raced-one").expect("first racing edit");
+        });
+        let second_source = source.clone();
+        inject_source_publication_second_race(move || {
+            fs::write(second_source, b"raced-two").expect("second racing edit");
+        });
+
+        let error = workspace
+            .publish_verified_to_source(
+                &fixture.candidate,
+                &patch,
+                &fixture.evidence[2],
+                authorization,
+            )
+            .expect_err("latest racing edit must win");
+
+        assert!(matches!(error, ScratchError::SourcePublicationConflict));
+        assert_eq!(
+            fs::read(&source).expect("latest racing source"),
+            b"raced-two"
+        );
+        assert_no_publication_temp(repo.path());
+        workspace.cleanup().expect("cleanup");
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn verified_source_publication_rejects_a_hard_linked_source() {
+        let repo = tempdir().expect("repo");
+        let source = repo.path().join("file.txt");
+        let alias = repo.path().join("alias.txt");
+        fs::write(&source, b"before").expect("file");
+        fs::hard_link(&source, &alias).expect("hard link");
+        let mut workspace =
+            ScratchWorkspace::stage(repo.path(), &["file.txt"], limits()).expect("stage");
+        let patch = ScratchPatch::new(vec![ScratchChange::Write {
+            path: "file.txt".to_owned(),
+            contents: b"after".to_vec(),
+        }])
+        .expect("patch");
+        let fixture = verification_fixture(&workspace, &patch);
+        let authorization = workspace
+            .authorize_safe_fix(fixture.input())
+            .expect("authorization");
+
+        let error = workspace
+            .publish_verified_to_source(
+                &fixture.candidate,
+                &patch,
+                &fixture.evidence[2],
+                authorization,
+            )
+            .expect_err("hard-link semantics cannot be preserved by replacement");
+
+        assert!(matches!(error, ScratchError::SourcePublicationUnsupported));
+        assert_eq!(fs::read(&source).expect("source"), b"before");
+        assert_eq!(fs::read(&alias).expect("hard-link alias"), b"before");
+        assert_no_publication_temp(repo.path());
+        workspace.cleanup().expect("cleanup");
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn verified_source_publication_rejects_an_identical_inode_replacement() {
+        let repo = tempdir().expect("repo");
+        let source = repo.path().join("file.txt");
+        fs::write(&source, b"before").expect("file");
+        let mut workspace =
+            ScratchWorkspace::stage(repo.path(), &["file.txt"], limits()).expect("stage");
+        let patch = ScratchPatch::new(vec![ScratchChange::Write {
+            path: "file.txt".to_owned(),
+            contents: b"after".to_vec(),
+        }])
+        .expect("patch");
+        let fixture = verification_fixture(&workspace, &patch);
+        let authorization = workspace
+            .authorize_safe_fix(fixture.input())
+            .expect("authorization");
+        let replacement = repo.path().join("replacement.txt");
+        fs::write(&replacement, b"before").expect("identical replacement");
+        fs::rename(&replacement, &source).expect("replace source inode");
+
+        let error = workspace
+            .publish_verified_to_source(
+                &fixture.candidate,
+                &patch,
+                &fixture.evidence[2],
+                authorization,
+            )
+            .expect_err("identity change must fail closed");
+
+        assert!(matches!(error, ScratchError::SourcePublicationConflict));
+        assert_eq!(fs::read(&source).expect("replacement source"), b"before");
+        assert_no_publication_temp(repo.path());
+        workspace.cleanup().expect("cleanup");
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn verified_source_publication_rejects_an_identical_parent_replacement() {
+        let repo = tempdir().expect("repo");
+        let parent = repo.path().join("src");
+        fs::create_dir(&parent).expect("source parent");
+        fs::write(parent.join("file.txt"), b"before").expect("file");
+        let mut workspace =
+            ScratchWorkspace::stage(repo.path(), &["src/file.txt"], limits()).expect("stage");
+        let patch = ScratchPatch::new(vec![ScratchChange::Write {
+            path: "src/file.txt".to_owned(),
+            contents: b"after".to_vec(),
+        }])
+        .expect("patch");
+        let fixture = verification_fixture(&workspace, &patch);
+        let authorization = workspace
+            .authorize_safe_fix(fixture.input())
+            .expect("authorization");
+        fs::rename(&parent, repo.path().join("old-src")).expect("move original parent");
+        fs::create_dir(&parent).expect("replacement parent");
+        fs::write(parent.join("file.txt"), b"before").expect("identical file");
+
+        let error = workspace
+            .publish_verified_to_source(
+                &fixture.candidate,
+                &patch,
+                &fixture.evidence[2],
+                authorization,
+            )
+            .expect_err("parent identity change must fail closed");
+
+        assert!(matches!(error, ScratchError::SourcePublicationConflict));
+        assert_eq!(
+            fs::read(parent.join("file.txt")).expect("replacement source"),
+            b"before"
+        );
+        assert_no_publication_temp(&parent);
+        workspace.cleanup().expect("cleanup");
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn verified_source_publication_never_creates_a_temp_through_a_parent_symlink() {
+        let repo = tempdir().expect("repo");
+        let outside = tempdir().expect("outside");
+        let parent = repo.path().join("src");
+        fs::create_dir(&parent).expect("source parent");
+        fs::write(parent.join("file.txt"), b"before").expect("file");
+        fs::write(outside.path().join("file.txt"), b"outside").expect("outside file");
+        let mut workspace =
+            ScratchWorkspace::stage(repo.path(), &["src/file.txt"], limits()).expect("stage");
+        let patch = ScratchPatch::new(vec![ScratchChange::Write {
+            path: "src/file.txt".to_owned(),
+            contents: b"after".to_vec(),
+        }])
+        .expect("patch");
+        let fixture = verification_fixture(&workspace, &patch);
+        let authorization = workspace
+            .authorize_safe_fix(fixture.input())
+            .expect("authorization");
+        fs::rename(&parent, repo.path().join("old-src")).expect("move original parent");
+        std::os::unix::fs::symlink(outside.path(), &parent).expect("replacement symlink");
+
+        workspace
+            .publish_verified_to_source(
+                &fixture.candidate,
+                &patch,
+                &fixture.evidence[2],
+                authorization,
+            )
+            .expect_err("parent symlink must fail closed");
+
+        assert_eq!(
+            fs::read(outside.path().join("file.txt")).expect("outside source"),
+            b"outside"
+        );
+        assert_no_publication_temp(outside.path());
+        workspace.cleanup().expect("cleanup");
+    }
+
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    #[test]
+    fn verified_source_publication_restores_a_parent_detached_during_exchange() {
+        let repo = tempdir().expect("repo");
+        let outside = tempdir().expect("outside");
+        let parent = repo.path().join("src");
+        let detached = repo.path().join("old-src");
+        fs::create_dir(&parent).expect("source parent");
+        fs::write(parent.join("file.txt"), b"before").expect("file");
+        fs::write(outside.path().join("file.txt"), b"outside").expect("outside file");
+        let mut workspace =
+            ScratchWorkspace::stage(repo.path(), &["src/file.txt"], limits()).expect("stage");
+        let patch = ScratchPatch::new(vec![ScratchChange::Write {
+            path: "src/file.txt".to_owned(),
+            contents: b"after".to_vec(),
+        }])
+        .expect("patch");
+        let fixture = verification_fixture(&workspace, &patch);
+        let authorization = workspace
+            .authorize_safe_fix(fixture.input())
+            .expect("authorization");
+        let raced_parent = parent.clone();
+        let raced_detached = detached.clone();
+        let raced_outside = outside.path().to_owned();
+        inject_source_publication_race(move || {
+            fs::rename(raced_parent, raced_detached).expect("detach opened parent");
+            std::os::unix::fs::symlink(raced_outside, parent).expect("replacement symlink");
+        });
+
+        let error = workspace
+            .publish_verified_to_source(
+                &fixture.candidate,
+                &patch,
+                &fixture.evidence[2],
+                authorization,
+            )
+            .expect_err("detached parent must roll back");
+
+        assert!(matches!(error, ScratchError::SourcePublicationConflict));
+        assert_eq!(
+            fs::read(detached.join("file.txt")).expect("detached source"),
+            b"before"
+        );
+        assert_eq!(
+            fs::read(outside.path().join("file.txt")).expect("outside source"),
+            b"outside"
+        );
+        assert_no_publication_temp(&detached);
+        assert_no_publication_temp(outside.path());
+        workspace.cleanup().expect("cleanup");
     }
 
     #[test]

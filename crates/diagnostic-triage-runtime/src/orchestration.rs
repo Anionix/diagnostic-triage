@@ -3,7 +3,7 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Component, Path, PathBuf},
     time::Duration,
@@ -28,7 +28,7 @@ use diagnostic_triage_engine::{
         ReportAssemblyError, ReportAssemblyInput, assemble_session_report,
         validate_report_collection_count,
     },
-    verification::{PatchApplication, SafeFixComparisonInput},
+    verification::{PatchApplication, SafeFixComparisonInput, VerifiedFix},
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -51,6 +51,10 @@ const PLAN_ID_DOMAIN: &str = "diagnostic-triage.runtime-plan/v1";
 const REQUEST_ID_DOMAIN: &str = "diagnostic-triage.runtime-request/v1";
 const EXECUTION_ID_DOMAIN: &str = "diagnostic-triage.runtime-execution/v1";
 const FIX_PROPOSE_CAPABILITY: &str = "fix.propose/v1";
+const RUFF_TOOL_NAME: &str = "ruff";
+const VERIFY_AFTER_OBSERVATION_ID_DOMAIN: &str =
+    "diagnostic-triage.runtime-verify-after-observation/v1";
+const VERIFY_AFTER_EVIDENCE_ID_DOMAIN: &str = "diagnostic-triage.runtime-verify-after-evidence/v1";
 const MAX_EXECUTION_MESSAGE_CHARS: usize = 8_192;
 const EMPTY_EXECUTION_MESSAGE: &str = "provider session ended without a reason";
 const REPOSITORY_STATE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -283,6 +287,10 @@ pub(crate) enum ReadOnlyReportError {
 pub(crate) enum PatchVerificationError {
     #[error("before and after verification plans used different runtime configuration")]
     ConfigMismatch,
+    #[error("verification object ID namespace collided: {0}")]
+    IdentityCollision(ObjectId),
+    #[error("verification object ID reconciliation failed")]
+    Identity(#[from] EngineError),
     #[error("canonical Ruff Evidence lineage does not match the Provider projection")]
     RuffLineageMismatch,
     #[error(transparent)]
@@ -337,6 +345,13 @@ pub(crate) fn build_read_only_plan(
             provider.required = true;
             true
         });
+    } else if operation == Operation::Verify {
+        // LLM contract: CONFIGURED -> VERIFICATION_PROVIDER_REQUIRED -> PLANNED; report config remains unchanged.
+        for provider in &mut config.providers {
+            if provider.tool_name == RUFF_TOOL_NAME {
+                provider.required = true;
+            }
+        }
     }
     let limits = RequestLimits::try_from(&config.limits)?;
     let config_json = serde_json::to_string(&config)?;
@@ -622,7 +637,7 @@ pub(crate) fn execute_patch_verification(
     run_result
 }
 
-type RepositoryState = [Vec<u8>; 4];
+pub(crate) type RepositoryState = [Vec<u8>; 4];
 
 fn repository_state_digest(state: &RepositoryState) -> Sha256Digest {
     let mut encoded = b"diagnostic-triage.repository-state/v1".to_vec();
@@ -637,7 +652,9 @@ fn repository_state_digest(state: &RepositoryState) -> Sha256Digest {
     Sha256Digest::compute(&encoded)
 }
 
-fn capture_repository_state(repository_root: &Path) -> Result<RepositoryState, ReadOnlyRunError> {
+pub(crate) fn capture_repository_state(
+    repository_root: &Path,
+) -> Result<RepositoryState, ReadOnlyRunError> {
     // LLM contract: REPOSITORY_DISCOVERED -> HEAD_BOUND -> INDEX_BOUND ->
     // TRACKED_BOUND -> UNTRACKED_BOUND; any before/after component change -> REJECTED.
     Ok([
@@ -1054,6 +1071,127 @@ fn preflight_provider_projection_collections(
     preflight_projection_collections(observations, evidence, fix_candidates, providers.len())
 }
 
+fn reconcile_verification_projection_ids(
+    before: &ReadOnlyRuntimeProjection,
+    mut after: ReadOnlyRuntimeProjection,
+) -> Result<ReadOnlyRuntimeProjection, PatchVerificationError> {
+    let before_ids = projection_object_ids(before);
+    let after_ids = projection_object_ids(&after);
+    let all_ids = before_ids
+        .union(&after_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let observation_ids = after
+        .observations
+        .iter()
+        .map(|observation| &observation.observation_id)
+        .collect::<Vec<_>>();
+    let evidence_ids = after
+        .evidence
+        .iter()
+        .map(|evidence| &evidence.evidence_id)
+        .collect::<Vec<_>>();
+    let observation_map = namespace_reused_ids(
+        VERIFY_AFTER_OBSERVATION_ID_DOMAIN,
+        &after.plan_id,
+        observation_ids,
+        &before_ids,
+        &all_ids,
+    )?;
+    let evidence_map = namespace_reused_ids(
+        VERIFY_AFTER_EVIDENCE_ID_DOMAIN,
+        &after.plan_id,
+        evidence_ids,
+        &before_ids,
+        &all_ids,
+    )?;
+    let mut generated = observation_map.values().cloned().collect::<BTreeSet<_>>();
+    if let Some(collision) = evidence_map
+        .values()
+        .find(|identifier| !generated.insert((*identifier).clone()))
+        .cloned()
+    {
+        return Err(PatchVerificationError::IdentityCollision(collision));
+    }
+
+    for observation in &mut after.observations {
+        if let Some(identifier) = observation_map.get(&observation.observation_id) {
+            observation.observation_id = identifier.clone();
+        }
+        for evidence_id in &mut observation.evidence_ids {
+            if let Some(identifier) = evidence_map.get(evidence_id) {
+                *evidence_id = identifier.clone();
+            }
+        }
+    }
+    for evidence in &mut after.evidence {
+        if let Some(identifier) = evidence_map.get(&evidence.evidence_id) {
+            evidence.evidence_id = identifier.clone();
+        }
+    }
+    for candidate in &mut after.fix_candidates {
+        for observation_id in &mut candidate.observation_ids {
+            if let Some(identifier) = observation_map.get(observation_id) {
+                *observation_id = identifier.clone();
+            }
+        }
+        if let Some(identifier) = evidence_map.get(&candidate.patch_evidence_id) {
+            candidate.patch_evidence_id = identifier.clone();
+        }
+    }
+    Ok(after)
+}
+
+fn namespace_reused_ids(
+    domain: &str,
+    plan_id: &ObjectId,
+    identifiers: Vec<&ObjectId>,
+    before_ids: &BTreeSet<ObjectId>,
+    all_ids: &BTreeSet<ObjectId>,
+) -> Result<BTreeMap<ObjectId, ObjectId>, PatchVerificationError> {
+    let mut output = BTreeMap::new();
+    for identifier in identifiers {
+        if !before_ids.contains(identifier) {
+            continue;
+        }
+        let namespaced = deterministic_object_id(domain, [plan_id.as_str(), identifier.as_str()])?;
+        if all_ids.contains(&namespaced) || output.values().any(|value| value == &namespaced) {
+            return Err(PatchVerificationError::IdentityCollision(namespaced));
+        }
+        output.insert(identifier.clone(), namespaced);
+    }
+    Ok(output)
+}
+
+fn projection_object_ids(projection: &ReadOnlyRuntimeProjection) -> BTreeSet<ObjectId> {
+    std::iter::once(projection.plan_id.clone())
+        .chain(
+            projection
+                .observations
+                .iter()
+                .map(|observation| observation.observation_id.clone()),
+        )
+        .chain(
+            projection
+                .evidence
+                .iter()
+                .map(|evidence| evidence.evidence_id.clone()),
+        )
+        .chain(
+            projection
+                .fix_candidates
+                .iter()
+                .map(|candidate| candidate.fix_candidate_id.clone()),
+        )
+        .chain(
+            projection
+                .executions
+                .iter()
+                .map(|execution| execution.execution_id.clone()),
+        )
+        .collect()
+}
+
 pub(crate) fn project_patch_verification(
     scratch: &ScratchWorkspace,
     patch: &ScratchPatch,
@@ -1070,6 +1208,7 @@ pub(crate) fn project_patch_verification(
     if before.config != after.config {
         return Err(PatchVerificationError::ConfigMismatch);
     }
+    let after = reconcile_verification_projection_ids(&before, after)?;
     scratch.validate_applied_patch_evidence(patch, &patch_evidence)?;
     preflight_projection_collections(
         before
@@ -1219,14 +1358,10 @@ pub(crate) fn authorize_canonical_ruff_verification(
 }
 
 pub(crate) fn assemble_verified_report(
-    authorized: AuthorizedPatchVerification,
+    projection: PatchVerificationProjection,
+    verified: &VerifiedFix,
     evaluation_time: Option<String>,
 ) -> Result<SessionReport, ReadOnlyReportError> {
-    let AuthorizedPatchVerification {
-        projection,
-        authorization,
-    } = authorized;
-    let verified = authorization.verified_fix();
     let mut findings = verified.verified_targets.clone();
     findings.extend(verified.post_fix_findings.clone());
     let PatchVerificationProjection {
@@ -1471,13 +1606,13 @@ mod tests {
         ObjectId, Sha256Digest, ValidatedSession,
         model::{
             AdapterKind, Category, Execution, ExecutionStatus, FixCandidate, Location,
-            MicroCategory, PhaseDuration, Position, Verdict,
+            MicroCategory, PhaseDuration, Position, Severity, Verdict,
         },
         protocol::{Operation, ProtocolEnvelope},
         validate_session_jsonl,
     };
     use diagnostic_triage_engine::report::{MAX_REPORT_COLLECTION_ITEMS, ReportAssemblyError};
-    use diagnostic_triage_engine::verification::PatchApplication;
+    use diagnostic_triage_engine::verification::{PatchApplication, SafeFixComparisonInput};
     use tempfile::tempdir;
 
     const REVISION: &str = "a12b34c56d78e90f1234567890abcdef12345678";
@@ -1513,16 +1648,18 @@ mod tests {
         unrelated.evidence_ids = vec![unrelated_evidence.evidence_id.clone()];
         report_before.observations.push(unrelated);
         report_before.evidence.push(unrelated_evidence.clone());
+        let authorized = authorize_canonical_ruff_verification(
+            scratch,
+            canonical,
+            candidate,
+            application,
+            report_before,
+            after.clone(),
+        )
+        .unwrap();
         let report = assemble_verified_report(
-            authorize_canonical_ruff_verification(
-                scratch,
-                canonical,
-                candidate,
-                application,
-                report_before,
-                after.clone(),
-            )
-            .unwrap(),
+            authorized.projection,
+            authorized.authorization.verified_fix(),
             Some("2026-07-23T00:00:00Z".to_owned()),
         )
         .unwrap();
@@ -2677,6 +2814,102 @@ mod tests {
         .unwrap();
         assert_eq!(plan.config, verify.config);
         plan.config.validate().unwrap();
+    }
+
+    #[test]
+    fn verify_plan_promotes_optional_ruff_provider_without_changing_report_config() {
+        let mut runtime_config = config("src");
+        runtime_config.providers[0].required = false;
+
+        let plan = build_read_only_plan(
+            &runtime_config,
+            &Sha256Digest::compute(b"patched repository"),
+            ReadOnlyMode::Verify,
+        )
+        .unwrap();
+
+        assert!(plan.providers[0].config.required);
+        assert_eq!(plan.providers[0].request.operation, Operation::Verify);
+        assert!(!plan.config.providers[0].required);
+        assert_eq!(plan.config, runtime_config.normalized().unwrap());
+        assert_eq!(
+            plan.config.policy_snapshot().unwrap().digest(),
+            runtime_config.policy_snapshot().unwrap().digest()
+        );
+    }
+
+    #[test]
+    fn patch_verification_reconciles_reused_observation_and_evidence_ids() {
+        let (planned, session) = aggregate_fixture("alpha", 321, true);
+        let before = project_provider_states(
+            config("src"),
+            "019f7e95-0000-7000-8000-000000000320".parse().unwrap(),
+            vec![(planned, ProviderSessionState::Complete(Box::new(session)))],
+        )
+        .unwrap();
+        let candidate = before.fix_candidates[0].clone();
+        let mut after = before.clone();
+        after.fix_candidates.clear();
+        after.observations[0].message = "post-fix observation".to_owned();
+        after.observations[0].severity = Severity::Info;
+        after.observations[0].evidence_ids = vec![after.evidence[0].evidence_id.clone()];
+        after.executions[0].execution_id = after.plan_id.clone();
+
+        let repository = tempdir().unwrap();
+        let mut scratch =
+            ScratchWorkspace::stage(repository.path(), &[] as &[&str], ScratchLimits::default())
+                .unwrap();
+        let patch = ScratchPatch::new(Vec::new()).unwrap();
+        let patch_evidence = scratch.capture(&patch, None).unwrap().patch;
+        let application = scratch.apply_for_verification(&patch).unwrap();
+        let projection = project_patch_verification(
+            &scratch,
+            &patch,
+            &candidate,
+            patch_evidence,
+            before.clone(),
+            after,
+        )
+        .unwrap();
+
+        assert_eq!(projection.observations.len(), 2);
+        assert_eq!(
+            projection.observations[0].observation_id,
+            before.observations[0].observation_id
+        );
+        assert_ne!(
+            projection.observations[1].observation_id,
+            before.observations[0].observation_id
+        );
+        assert_eq!(
+            projection.observations[0].evidence_ids,
+            before.observations[0].evidence_ids
+        );
+        assert_ne!(
+            projection.observations[1].evidence_ids[0],
+            before.evidence[0].evidence_id
+        );
+
+        let authorization = scratch
+            .authorize_safe_fix(SafeFixComparisonInput {
+                candidate: &projection.candidate,
+                target_fingerprints: &projection.target_fingerprints,
+                evidence: &projection.evidence,
+                executions: &projection.executions,
+                patch_application: &application,
+                before_findings: &projection.before_findings,
+                after_findings: &projection.after_findings,
+            })
+            .unwrap();
+        let report = assemble_verified_report(
+            projection,
+            authorization.verified_fix(),
+            Some("2026-07-23T00:00:00Z".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(report.observations.len(), 2);
+        assert!(report.validate().is_ok());
+        scratch.cleanup().unwrap();
     }
 
     #[test]

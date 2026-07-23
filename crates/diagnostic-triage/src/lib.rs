@@ -12,8 +12,8 @@ use clap::{Parser, Subcommand};
 use diagnostic_triage_runtime::{
     ConfigError, FixCommandError, ObserverCommandError, ReadOnlyCommandMode, RepoPath,
     ReporterError, RuntimeCommandError, RuntimeConfig, ValidatedSessionReport,
-    config::OutputFormat, run_fix_command, run_github_actions_observer, run_read_only_command,
-    run_verify_patch_command, verdict_exit_code, write_bug_issue_draft_json,
+    config::OutputFormat, run_apply_safe_command, run_fix_command, run_github_actions_observer,
+    run_read_only_command, run_verify_patch_command, verdict_exit_code, write_bug_issue_draft_json,
     write_bug_issue_draft_markdown, write_canonical_json, write_tsv,
 };
 use thiserror::Error;
@@ -45,8 +45,12 @@ enum CliCommand {
     Check,
     /// Run reproducible configured CI diagnostics.
     Ci,
-    /// Generate one authoritative SAFE patch without modifying the repository.
-    Fix,
+    /// Generate one authoritative SAFE patch, applying it only when explicitly requested.
+    Fix {
+        /// Apply the verified authoritative SAFE patch to the source repository.
+        #[arg(long)]
+        apply_safe: bool,
+    },
     /// Verify a repository-relative patch in an isolated scratch workspace.
     Verify {
         /// Repository-relative unified diff to verify.
@@ -153,7 +157,8 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
         CliCommand::IssueDraft { input, format } => {
             return execute_issue_draft(&repository, input, *format, output);
         }
-        CliCommand::Check | CliCommand::Ci | CliCommand::Fix | CliCommand::Verify { .. } => {}
+        CliCommand::Check | CliCommand::Ci | CliCommand::Fix { .. } | CliCommand::Verify { .. } => {
+        }
     }
     let config_path = resolve_config_path(&repository, &cli.config)?;
     if matches!(cli.command, CliCommand::Ci) {
@@ -163,10 +168,16 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
     if config.output.path.is_some() {
         return Err(CliError::OutputPath);
     }
-    if matches!(cli.command, CliCommand::Fix) {
-        let result = run_fix_command(&config, &repository, || {
-            Some(jiff::Timestamp::now().to_string())
-        })?;
+    if let CliCommand::Fix { apply_safe } = &cli.command {
+        let evaluation_time = || Some(jiff::Timestamp::now().to_string());
+        if *apply_safe {
+            let result = run_apply_safe_command(&config, &repository, evaluation_time, |patch| {
+                output.write_all(patch)?;
+                output.flush()
+            })?;
+            return Ok(CommandStatus(result.exit_code));
+        }
+        let result = run_fix_command(&config, &repository, evaluation_time)?;
         output
             .write_all(&result.patch)
             .map_err(CliError::OutputIo)?;
@@ -187,7 +198,7 @@ pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliEr
     let mode = match cli.command {
         CliCommand::Check => ReadOnlyCommandMode::Check,
         CliCommand::Ci => ReadOnlyCommandMode::Ci,
-        CliCommand::Fix
+        CliCommand::Fix { .. }
         | CliCommand::Verify { .. }
         | CliCommand::Observe { .. }
         | CliCommand::IssueDraft { .. } => unreachable!(),
