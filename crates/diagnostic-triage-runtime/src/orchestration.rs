@@ -11,9 +11,10 @@ use diagnostic_triage_contracts::protocol::{
 };
 use diagnostic_triage_contracts::{
     AdapterId, ContractError, Nullable, ObjectId, RepoPath, Sha256Digest,
-    model::{AdapterKind, Execution, ExecutionStatus, Tool},
+    model::{AdapterKind, Evidence, Execution, ExecutionStatus, FixCandidate, Observation, Tool},
 };
 use diagnostic_triage_engine::{EngineError, deterministic_object_id};
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
@@ -92,6 +93,14 @@ pub(crate) struct ExecutedReadOnlyPlan {
     providers: Vec<ExecutedProvider>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct ReadOnlyRuntimeProjection {
+    plan_id: ObjectId,
+    observations: Vec<Observation>,
+    evidence: Vec<Evidence>,
+    fix_candidates: Vec<FixCandidate>,
+    executions: Vec<Execution>,
+}
 struct ResolvedWorkspace {
     repository_root: PathBuf,
     workspace_root: PathBuf,
@@ -177,6 +186,13 @@ pub(crate) enum ProviderExecutionError {
     Contract(#[from] ContractError),
 }
 
+#[derive(Debug, Error)]
+pub(crate) enum RuntimeProjectionError {
+    #[error(transparent)]
+    Provider(#[from] ProviderExecutionError),
+    #[error("runtime projection object ID collided: {0}")]
+    ObjectIdCollision(ObjectId),
+}
 pub(crate) fn build_read_only_plan(
     config: &RuntimeConfig,
     repository_digest: &Sha256Digest,
@@ -399,6 +415,85 @@ fn synthesize_execution(
     .map_err(ProviderExecutionError::from)
 }
 
+pub(crate) fn project_executed_read_only_plan(
+    executed: ExecutedReadOnlyPlan,
+) -> Result<ReadOnlyRuntimeProjection, RuntimeProjectionError> {
+    let ExecutedReadOnlyPlan { plan_id, providers } = executed;
+    project_provider_states(
+        plan_id,
+        providers
+            .into_iter()
+            .map(|provider| (provider.planned, provider.outcome.state))
+            .collect(),
+    )
+}
+
+fn project_provider_states(
+    plan_id: ObjectId,
+    mut providers: Vec<(PlannedProvider, ProviderSessionState)>,
+) -> Result<ReadOnlyRuntimeProjection, RuntimeProjectionError> {
+    providers.sort_by(|left, right| left.0.config.adapter_id.cmp(&right.0.config.adapter_id));
+    // LLM contract: EXECUTED -> IDENTITIES_VALIDATED -> COMPLETE_PAYLOAD_PROJECTED -> CANONICALIZED; any mismatch or collision -> REJECTED atomically.
+    let mut executions = providers
+        .iter()
+        .map(|(planned, state)| {
+            synthesize_execution(planned, state).map_err(RuntimeProjectionError::Provider)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut object_ids = vec![plan_id.clone()];
+    for (planned, _) in &providers {
+        object_ids.push(planned.request.request_id.clone());
+        object_ids.push(planned.execution_id.clone());
+    }
+    let (mut observations, mut evidence, mut fix_candidates) = (Vec::new(), Vec::new(), Vec::new());
+    for (_, state) in providers {
+        let ProviderSessionState::Complete(session) = state else {
+            continue;
+        };
+        for event in session.events {
+            match event {
+                ProtocolEnvelope::Observation(mut envelope) => {
+                    envelope.observation.evidence_ids.sort();
+                    object_ids.push(envelope.observation.observation_id.clone());
+                    observations.push(envelope.observation);
+                }
+                ProtocolEnvelope::Evidence(envelope) => {
+                    object_ids.push(envelope.evidence.evidence_id.clone());
+                    evidence.push(envelope.evidence);
+                }
+                ProtocolEnvelope::FixCandidate(mut envelope) => {
+                    envelope.fix_candidate.observation_ids.sort();
+                    object_ids.push(envelope.fix_candidate.fix_candidate_id.clone());
+                    fix_candidates.push(envelope.fix_candidate);
+                }
+                ProtocolEnvelope::Manifest(_)
+                | ProtocolEnvelope::Request(_)
+                | ProtocolEnvelope::Execution(_)
+                | ProtocolEnvelope::Completion(_) => {}
+            }
+        }
+    }
+    object_ids.sort();
+    if let Some(collision) = object_ids
+        .windows(2)
+        .find(|pair| pair[0] == pair[1])
+        .map(|pair| pair[0].clone())
+    {
+        return Err(RuntimeProjectionError::ObjectIdCollision(collision));
+    }
+    observations.sort_by(|left, right| left.observation_id.cmp(&right.observation_id));
+    evidence.sort_by(|left, right| left.evidence_id.cmp(&right.evidence_id));
+    fix_candidates.sort_by(|left, right| left.fix_candidate_id.cmp(&right.fix_candidate_id));
+    executions.sort_by(|left, right| left.execution_id.cmp(&right.execution_id));
+    Ok(ReadOnlyRuntimeProjection {
+        plan_id,
+        observations,
+        evidence,
+        fix_candidates,
+        executions,
+    })
+}
+
 fn bounded_message(message: &str) -> String {
     match message {
         "" => EMPTY_EXECUTION_MESSAGE.to_owned(),
@@ -480,12 +575,13 @@ mod tests {
     use std::{env, fs};
 
     use super::{
-        PlannedProvider, ReadOnlyMode, build_read_only_plan, execute_read_only_plan,
-        resolve_provider_program, resolve_workspace, synthesize_execution,
+        PlannedProvider, ReadOnlyMode, RuntimeProjectionError, build_read_only_plan,
+        execute_read_only_plan, project_provider_states, resolve_provider_program,
+        resolve_workspace, synthesize_execution,
     };
     use crate::{RuntimeConfig, session::ProviderSessionState};
     use diagnostic_triage_contracts::{
-        Sha256Digest, ValidatedSession,
+        ObjectId, Sha256Digest, ValidatedSession,
         model::{Execution, ExecutionStatus, PhaseDuration},
         protocol::Operation,
         validate_session_jsonl,
@@ -494,6 +590,8 @@ mod tests {
 
     const REVISION: &str = "a12b34c56d78e90f1234567890abcdef12345678";
     const SESSION_JSONL: &str = include_str!("../../../tests/fixtures/v1/valid-session.jsonl");
+    const FIX_SESSION_JSONL: &str =
+        include_str!("../../../tests/fixtures/v1/invalid-fix-nonpatch-evidence.jsonl");
     const ALPHA: &str = "[[providers]]\nadapter_id=\"alpha\"\nadapter_version=\"1\"\ntool_name=\"ruff\"\ntool_version=\"0.12\"\nprogram=\"provider\"\nargv=[\"--stdio\"]\nrequired=true\nrequired_capabilities=[\"diagnostic.fix/v1\",\"diagnostic.check/v1\"]\noptional_capabilities=[\"diagnostic.metadata/v1\"]";
     const ZETA: &str = "[[providers]]\nadapter_id=\"zeta\"\nadapter_version=\"1\"\ntool_name=\"ruff\"\ntool_version=\"0.12\"\nprogram=\"provider\"\nargv=[\"--stdio\"]\nrequired=true\nrequired_capabilities=[\"diagnostic.fix/v1\",\"diagnostic.check/v1\"]\noptional_capabilities=[\"diagnostic.metadata/v1\"]";
 
@@ -531,6 +629,33 @@ mod tests {
 
     fn project(planned: &PlannedProvider, state: &ProviderSessionState) -> Execution {
         synthesize_execution(planned, state).unwrap()
+    }
+
+    fn aggregate_fixture(
+        adapter_id: &str,
+        request_suffix: u16,
+        required: bool,
+    ) -> (PlannedProvider, ValidatedSession) {
+        let request_id = format!("019f7e95-0000-7000-8000-{request_suffix:012}");
+        let input = FIX_SESSION_JSONL
+            .replace("\"source\":\"STDOUT\"", "\"source\":\"PATCH\"")
+            .replace("\"id\":\"ruff\"", &format!("\"id\":\"{adapter_id}\""))
+            .replace("019f7e95-0000-7000-8000-000000000271", &request_id);
+        let session = validate_session_jsonl(input.as_bytes()).unwrap();
+        let mut provider = config("src").providers.remove(0);
+        provider.adapter_id = session.manifest.adapter.id.clone();
+        provider.adapter_version = session.manifest.adapter.version.clone();
+        provider.tool_name = "ruff".to_owned();
+        provider.tool_version = "0.12.4".to_owned();
+        provider.required = required;
+        let planned = PlannedProvider {
+            config: provider,
+            request: session.request.clone(),
+            execution_id: format!("019f7e95-0000-7000-8000-{:012}", request_suffix + 1)
+                .parse()
+                .unwrap(),
+        };
+        (planned, session)
     }
 
     #[test]
@@ -582,6 +707,68 @@ mod tests {
             synthesize_execution(&planned, &state),
             Err(super::ProviderExecutionError::Duration)
         ));
+    }
+
+    #[test]
+    fn aggregate_projection_is_canonical_complete_only_and_collision_safe() {
+        let (first, first_session) = aggregate_fixture("alpha", 281, true);
+        let (second, second_session) = aggregate_fixture("zeta", 283, false);
+        let plan_id: ObjectId = "019f7e95-0000-7000-8000-000000000280".parse().unwrap();
+        let complete = ProviderSessionState::Complete(Box::new(first_session.clone()));
+        let terminal = ProviderSessionState::Unsupported {
+            missing_required: Vec::new(),
+            reason: "terminal".to_owned(),
+            validated_session: None,
+        };
+        let mut states = vec![
+            (first.clone(), complete.clone()),
+            (second.clone(), terminal),
+        ];
+        let forward = project_provider_states(plan_id.clone(), states.clone()).unwrap();
+        states.reverse();
+        let reverse = project_provider_states(plan_id.clone(), states).unwrap();
+        assert_eq!(
+            serde_json::to_vec(&forward).unwrap(),
+            serde_json::to_vec(&reverse).unwrap()
+        );
+        assert_eq!(forward.observations.len(), 1);
+        assert_eq!(forward.evidence.len(), 1);
+        assert_eq!(forward.fix_candidates.len(), 1);
+        assert_eq!(forward.executions.len(), 2);
+        assert!(forward.executions[0].required);
+        assert!(!forward.executions[1].required);
+
+        let collision = project_provider_states(
+            plan_id,
+            vec![
+                (first.clone(), complete.clone()),
+                (
+                    second,
+                    ProviderSessionState::Complete(Box::new(second_session)),
+                ),
+            ],
+        );
+        assert!(matches!(
+            collision,
+            Err(RuntimeProjectionError::ObjectIdCollision(_))
+        ));
+
+        let reserved = project_provider_states(
+            "019f7e95-0000-7000-8000-000000000272".parse().unwrap(),
+            vec![(first.clone(), complete.clone())],
+        );
+        assert!(matches!(
+            reserved,
+            Err(RuntimeProjectionError::ObjectIdCollision(_))
+        ));
+
+        let mut mismatch = first;
+        mismatch.config.tool_version = "wrong".to_owned();
+        let error = project_provider_states(
+            "019f7e95-0000-7000-8000-000000000280".parse().unwrap(),
+            vec![(mismatch, complete)],
+        );
+        assert!(matches!(error, Err(RuntimeProjectionError::Provider(..))));
     }
 
     #[test]
