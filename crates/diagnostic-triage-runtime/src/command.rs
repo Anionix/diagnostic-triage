@@ -11,7 +11,7 @@ use crate::orchestration::{
     project_executed_read_only_plan,
 };
 
-// LLM contract: CONFIGURED -> EXECUTED -> NORMALIZED -> REPORTED; runtime failure -> INCOMPLETE.
+// LLM contract: CONFIGURED -> EXECUTED -> NORMALIZED -> REPORTED; operational failure -> exit 2.
 
 /// Read-only command selected by the CLI.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -34,8 +34,8 @@ pub enum RuntimeCommandError {
 /// Execute one complete read-only command and assemble its v1 report.
 ///
 /// The repository identity is derived from the exact state snapshot checked
-/// again after every Provider exits. No caller-selected digest can enter the
-/// command path.
+/// again after the Provider group exits. No caller-selected digest can enter
+/// the command path.
 ///
 /// # Errors
 ///
@@ -45,7 +45,7 @@ pub fn run_read_only_command(
     config: &RuntimeConfig,
     repository_root: &Path,
     mode: ReadOnlyCommandMode,
-    evaluation_time: Option<String>,
+    evaluation_time: impl FnOnce() -> Option<String>,
 ) -> Result<SessionReport, RuntimeCommandError> {
     let mode = match mode {
         ReadOnlyCommandMode::Check => ReadOnlyMode::Check,
@@ -57,7 +57,7 @@ pub fn run_read_only_command(
         .map_err(|error| RuntimeCommandError::Projection(Box::new(error)))?;
     let evaluation_time = projection
         .requires_evaluation_time()
-        .then_some(evaluation_time)
+        .then(evaluation_time)
         .flatten();
     assemble_read_only_report(projection, evaluation_time)
         .map_err(|error| RuntimeCommandError::Report(Box::new(error)))

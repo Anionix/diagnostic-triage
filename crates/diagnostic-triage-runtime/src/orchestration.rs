@@ -374,7 +374,7 @@ pub(crate) fn execute_read_only_plan(
     }
     let plan = build_read_only_plan(config, repository_digest, mode)?;
     let before = capture_repository_state(repository_root)?;
-    execute_planned_read_only_plan(plan, repository_root, before)
+    execute_planned_read_only_plan(plan, repository_root, &before)
 }
 
 pub(crate) fn execute_current_read_only_plan(
@@ -388,13 +388,13 @@ pub(crate) fn execute_current_read_only_plan(
     let before = capture_repository_state(repository_root)?;
     let repository_digest = repository_state_digest(&before);
     let plan = build_read_only_plan(config, &repository_digest, mode)?;
-    execute_planned_read_only_plan(plan, repository_root, before)
+    execute_planned_read_only_plan(plan, repository_root, &before)
 }
 
 fn execute_planned_read_only_plan(
     plan: ReadOnlyPlan,
     repository_root: &Path,
-    before: RepositoryState,
+    before: &RepositoryState,
 ) -> Result<ExecutedReadOnlyPlan, ReadOnlyRunError> {
     let ReadOnlyPlan {
         config,
@@ -423,7 +423,7 @@ fn execute_planned_read_only_plan(
         })
     })();
     let after = capture_repository_state(workspace.repository_root())?;
-    if before != after {
+    if before != &after {
         return Err(ReadOnlyRunError::RepositoryMutation);
     }
     run_result

@@ -1,7 +1,7 @@
 use std::{fs, io::Write, path::Path, process::Command};
 
 use clap::Parser;
-use diagnostic_triage::{Cli, execute};
+use diagnostic_triage::{Cli, CliError, execute};
 use tempfile::tempdir;
 
 const REVISION: &str = "a12b34c56d78e90f1234567890abcdef12345678";
@@ -146,4 +146,29 @@ fn broken_provider_is_incomplete_without_mutating_the_repository() {
             .stdout
             .is_empty()
     );
+}
+
+#[test]
+fn ci_does_not_treat_config_pathspec_magic_as_a_tracked_literal() {
+    let repository = tempdir().expect("repository");
+    init_repository(repository.path());
+    fs::copy(
+        repository.path().join("diagnostic-triage.toml"),
+        repository.path().join("*.toml"),
+    )
+    .expect("literal wildcard config");
+    let cli = Cli::try_parse_from([
+        "diagnostic-triage",
+        "--repository",
+        repository.path().to_str().expect("UTF-8 path"),
+        "--config",
+        "*.toml",
+        "ci",
+    ])
+    .expect("CLI");
+
+    assert!(matches!(
+        execute(cli, &mut Vec::new()),
+        Err(CliError::ConfigUntracked(path)) if path == "*.toml"
+    ));
 }

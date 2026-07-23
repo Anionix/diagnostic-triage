@@ -99,8 +99,9 @@ pub fn execute(cli: Cli, output: &mut dyn Write) -> Result<CommandStatus, CliErr
         CliCommand::Check => ReadOnlyCommandMode::Check,
         CliCommand::Ci => ReadOnlyCommandMode::Ci,
     };
-    let evaluation_time = Some(jiff::Timestamp::now().to_string());
-    let report = run_read_only_command(&config, &repository, mode, evaluation_time)?;
+    let report = run_read_only_command(&config, &repository, mode, || {
+        Some(jiff::Timestamp::now().to_string())
+    })?;
     match config.output.format {
         OutputFormat::Json => write_canonical_json(&report, output)?,
         OutputFormat::Tsv => write_tsv(&report, output)?,
@@ -147,7 +148,7 @@ fn resolve_config_path(repository: &Path, relative: &Path) -> Result<PathBuf, Cl
 
 fn require_tracked_config(repository: &Path, relative: &Path) -> Result<(), CliError> {
     let status = Command::new("git")
-        .args(["ls-files", "--error-unmatch", "--"])
+        .args(["--literal-pathspecs", "ls-files", "--error-unmatch", "--"])
         .arg(relative)
         .current_dir(repository)
         .output()

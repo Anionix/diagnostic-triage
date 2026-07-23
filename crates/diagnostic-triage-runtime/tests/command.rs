@@ -49,7 +49,7 @@ fn read_only_command_assembles_a_pass_report_without_providers() {
         &config(),
         repository.path(),
         ReadOnlyCommandMode::Check,
-        None,
+        || None,
     )
     .expect("check report");
 
@@ -61,18 +61,26 @@ fn read_only_command_assembles_a_pass_report_without_providers() {
 fn read_only_command_identity_binds_the_complete_repository_state() {
     let repository = tempdir().expect("repository");
     init_git(repository.path());
-    let baseline =
-        run_read_only_command(&config(), repository.path(), ReadOnlyCommandMode::Ci, None)
-            .expect("baseline report");
+    let baseline = run_read_only_command(
+        &config(),
+        repository.path(),
+        ReadOnlyCommandMode::Ci,
+        || None,
+    )
+    .expect("baseline report");
 
     fs::write(
         repository.path().join("src/lib.rs"),
         b"pub fn value() -> u8 { 2 }\n",
     )
     .expect("mutated source");
-    let changed =
-        run_read_only_command(&config(), repository.path(), ReadOnlyCommandMode::Ci, None)
-            .expect("changed report");
+    let changed = run_read_only_command(
+        &config(),
+        repository.path(),
+        ReadOnlyCommandMode::Ci,
+        || None,
+    )
+    .expect("changed report");
 
     assert_ne!(baseline.session_id, changed.session_id);
 }
