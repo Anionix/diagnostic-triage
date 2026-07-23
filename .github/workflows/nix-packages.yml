@@ -3,10 +3,12 @@ name: Nix packages
 on:
   pull_request:
     paths:
+      - .github/workflows/nix-packages.yml
       - flake.nix
       - flake.lock
       - Cargo.toml
       - Cargo.lock
+      - tests/test_nix_package_contract.py
       - "crates/**"
   workflow_dispatch:
 
@@ -39,6 +41,9 @@ jobs:
       - name: Install pinned Nix
         uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
 
+      - name: Validate package workflow contract
+        run: python3 tests/test_nix_package_contract.py
+
       - name: Build and smoke-test the package
         shell: bash
         env:
@@ -49,6 +54,7 @@ jobs:
           output="$(nix build \
             --accept-flake-config \
             --no-link \
+            --no-update-lock-file \
             --print-out-paths \
             ".#packages.${SYSTEM}.diagnostic-triage")"
           "${output}/bin/diagnostic-triage" --version \
