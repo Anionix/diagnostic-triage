@@ -3,6 +3,9 @@ LLM contract: FIX_PROPOSED -> VERIFIED -> AUTHORIZED -> EXPLICITLY_REQUESTED ->
 SOURCE_REVALIDATED -> TRANSACTION_STAGED -> PUBLISHED; any failed gate -> DENIED
 with the original snapshot preserved.
 
+Lifecycle contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED ->
+VERIFIED -> REPORTED; terminal states: INCOMPLETE | UNSUPPORTED.
+
 Proof contract: this file proves the prospective pure publication decision,
 original-snapshot transition, exact authorization binding, and single-use
 authorization state that a future Rust `fix --apply-safe` path must implement.
