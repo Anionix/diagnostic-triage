@@ -15,8 +15,8 @@ use diagnostic_triage_contracts::protocol::{
 use diagnostic_triage_contracts::{
     AdapterId, ContractError, Nullable, ObjectId, RepoPath, Sha256Digest,
     model::{
-        AdapterKind, EngineIdentity, Evidence, Execution, ExecutionStatus, FixCandidate,
-        Observation, SessionReport, Tool,
+        AdapterKind, EngineIdentity, Evidence, EvidenceSource, Execution, ExecutionStatus, Finding,
+        FindingState, FixCandidate, Observation, SessionReport, Tool, VerificationAttribution,
     },
 };
 use diagnostic_triage_engine::{
@@ -37,7 +37,7 @@ use crate::{
     execution::{ProviderExecutionInput, validated_provider_execution},
     execution_identity as identity,
     process::{ProcessError, ProcessLimits, ProcessSpec, ProcessState, run_bounded},
-    scratch::{ScratchError, ScratchPatch, ScratchWorkspace},
+    scratch::{PATCH_MEDIA_TYPE, ScratchError, ScratchPatch, ScratchWorkspace},
     session::{
         ProviderSessionError, ProviderSessionOutcome, ProviderSessionState, run_provider_session,
     },
@@ -124,6 +124,15 @@ pub(crate) struct ReadOnlyRuntimeProjection {
     evidence: Vec<Evidence>,
     fix_candidates: Vec<FixCandidate>,
     executions: Vec<Execution>,
+}
+
+pub(crate) struct PatchVerificationProjection {
+    pub(crate) candidate: FixCandidate,
+    pub(crate) evidence: Vec<Evidence>,
+    pub(crate) executions: Vec<Execution>,
+    pub(crate) target_fingerprints: Vec<diagnostic_triage_contracts::Fingerprint>,
+    pub(crate) before_findings: Vec<Finding>,
+    pub(crate) after_findings: Vec<Finding>,
 }
 struct ResolvedWorkspace {
     repository_root: PathBuf,
@@ -238,6 +247,14 @@ pub(crate) enum ReadOnlyReportError {
     Engine(#[from] EngineError),
     #[error(transparent)]
     Report(#[from] ReportAssemblyError),
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum PatchVerificationError {
+    #[error(transparent)]
+    Report(#[from] ReadOnlyReportError),
+    #[error(transparent)]
+    Scratch(#[from] ScratchError),
 }
 pub(crate) fn build_read_only_plan(
     config: &RuntimeConfig,
@@ -759,6 +776,124 @@ fn preflight_provider_projection_collections(
     preflight_projection_collections(observations, evidence, fix_candidates, providers.len())
 }
 
+pub(crate) fn project_patch_verification(
+    scratch: &ScratchWorkspace,
+    patch: &ScratchPatch,
+    candidate: &FixCandidate,
+    patch_evidence: Evidence,
+    before: ReadOnlyRuntimeProjection,
+    after: ReadOnlyRuntimeProjection,
+) -> Result<PatchVerificationProjection, PatchVerificationError> {
+    // LLM contract: FIX_PROPOSED -> PATCH_BOUND -> REQUIRED_RESULTS_ATTRIBUTED;
+    // missing targets, incomplete Providers, or inconsistent Evidence -> REJECTED atomically.
+    if !before.fix_candidates.contains(candidate) {
+        return Err(ScratchError::CandidateNotAuthorized.into());
+    }
+    if patch_evidence.source != EvidenceSource::Patch
+        || patch_evidence.media_type != PATCH_MEDIA_TYPE
+    {
+        return Err(ScratchError::PatchEvidenceMismatch.into());
+    }
+    preflight_projection_collections(
+        0,
+        before
+            .evidence
+            .len()
+            .saturating_add(after.evidence.len())
+            .saturating_add(after.executions.len())
+            .saturating_add(2),
+        0,
+        before
+            .executions
+            .len()
+            .saturating_add(after.executions.len()),
+    )
+    .map_err(ReadOnlyReportError::from)?;
+    let mut before_findings = classify_projection(&before)?;
+    let after_findings = classify_projection(&after)?;
+    let scope = candidate.observation_ids.iter().collect::<BTreeSet<_>>();
+    let mut targets = Vec::new();
+    for finding in &mut before_findings {
+        if !finding.observation_ids.is_empty()
+            && finding
+                .observation_ids
+                .iter()
+                .all(|identifier| scope.contains(identifier))
+        {
+            finding.state = FindingState::FixProposed;
+            finding.fix_candidate_id = Some(candidate.fix_candidate_id.clone());
+            targets.push(finding.fingerprint.clone());
+        }
+    }
+    targets.sort();
+    let mut candidate = candidate.clone();
+    candidate.patch_evidence_id = patch_evidence.evidence_id.clone();
+    let patch_sha256 = patch_evidence.sha256.clone();
+    let base = scratch.base_evidence().clone();
+    let mut evidence = before.evidence;
+    evidence.extend(after.evidence);
+    evidence.push(base.clone());
+    evidence.push(patch_evidence);
+    let mut executions = before.executions;
+    let mut verification_executions = after.executions;
+    for execution in &mut verification_executions {
+        let attributed = before_findings
+            .iter()
+            .filter(|finding| {
+                finding.fix_candidate_id.as_ref() == Some(&candidate.fix_candidate_id)
+                    && execution.required
+                    && execution.adapter_kind == AdapterKind::Provider
+                    && execution.tool.name == finding.tool.name
+                    && execution.tool.version == finding.tool.version
+            })
+            .map(|finding| finding.fingerprint.clone())
+            .collect::<Vec<_>>();
+        if attributed.is_empty() {
+            continue;
+        }
+        let result = scratch
+            .capture_applied(patch, Some(execution.execution_id.clone()))?
+            .result;
+        execution.verification = Some(Box::new(VerificationAttribution {
+            fix_candidate_id: candidate.fix_candidate_id.clone(),
+            patch_sha256: patch_sha256.clone(),
+            base_snapshot_sha256: base.sha256.clone(),
+            base_snapshot_evidence_id: base.evidence_id.clone(),
+            target_fingerprints: attributed,
+            result_evidence_id: result.evidence_id.clone(),
+        }));
+        evidence.push(result);
+    }
+    executions.extend(verification_executions);
+    Ok(PatchVerificationProjection {
+        candidate,
+        evidence,
+        executions,
+        target_fingerprints: targets,
+        before_findings,
+        after_findings,
+    })
+}
+
+fn classify_projection(
+    projection: &ReadOnlyRuntimeProjection,
+) -> Result<Vec<Finding>, ReadOnlyReportError> {
+    preflight_projection_collections(
+        projection.observations.len(),
+        projection.evidence.len(),
+        projection.fix_candidates.len(),
+        projection.executions.len(),
+    )?;
+    let rules = projection.config.classification_rules()?;
+    Ok(deduplicate_findings(
+        projection
+            .observations
+            .iter()
+            .map(|observation| build_finding(observation, &rules).map(|value| value.finding))
+            .collect::<Result<Vec<_>, _>>()?,
+    )?)
+}
+
 pub(crate) fn assemble_read_only_report(
     projection: ReadOnlyRuntimeProjection,
     evaluation_time: Option<String>,
@@ -906,8 +1041,8 @@ mod tests {
     use super::{
         PlannedProvider, ReadOnlyMode, ReadOnlyReportError, RuntimeProjectionError,
         assemble_read_only_report, build_read_only_plan, execute_patch_verification,
-        execute_read_only_plan, preflight_projection_collections, project_provider_states,
-        resolve_provider_program, resolve_workspace, synthesize_execution,
+        execute_read_only_plan, preflight_projection_collections, project_patch_verification,
+        project_provider_states, resolve_provider_program, resolve_workspace, synthesize_execution,
     };
     use crate::{
         RuntimeConfig, ScratchChange, ScratchError, ScratchLimits, ScratchPatch, ScratchWorkspace,
@@ -915,7 +1050,10 @@ mod tests {
     };
     use diagnostic_triage_contracts::{
         ObjectId, Sha256Digest, ValidatedSession,
-        model::{Category, Execution, ExecutionStatus, MicroCategory, PhaseDuration, Verdict},
+        model::{
+            AdapterKind, Category, Execution, ExecutionStatus, MicroCategory, PhaseDuration,
+            Verdict,
+        },
         protocol::{Operation, ProtocolEnvelope},
         validate_session_jsonl,
     };
@@ -1133,6 +1271,57 @@ mod tests {
             vec![(mismatch, complete)],
         );
         assert!(matches!(error, Err(RuntimeProjectionError::Provider(..))));
+    }
+
+    #[test]
+    fn patch_verification_projects_required_provider_attribution() {
+        let (planned, session) = aggregate_fixture("alpha", 291, true);
+        let before = project_provider_states(
+            config("src"),
+            "019f7e95-0000-7000-8000-000000000290".parse().unwrap(),
+            vec![(planned, ProviderSessionState::Complete(Box::new(session)))],
+        )
+        .unwrap();
+        let candidate = before.fix_candidates[0].clone();
+        let mut after = before.clone();
+        after.observations.clear();
+        after.evidence.clear();
+        after.fix_candidates.clear();
+        after.executions[0].execution_id = after.plan_id.clone();
+
+        let repository = tempdir().unwrap();
+        let mut scratch =
+            ScratchWorkspace::stage(repository.path(), &[] as &[&str], ScratchLimits::default())
+                .unwrap();
+        let patch = ScratchPatch::new(Vec::new()).unwrap();
+        let patch_evidence = scratch.capture(&patch, None).unwrap().patch;
+        scratch.apply_for_verification(&patch).unwrap();
+        let attempt = |candidate, after| {
+            project_patch_verification(
+                &scratch,
+                &patch,
+                candidate,
+                patch_evidence.clone(),
+                before.clone(),
+                after,
+            )
+        };
+        let mut forged = candidate.clone();
+        forged.fix_candidate_id = "019f7e95-0000-7000-8000-000000000299".parse().unwrap();
+        assert!(attempt(&forged, after.clone()).is_err());
+        let mut overflow = after.clone();
+        overflow.observations = before.observations.clone();
+        overflow.observations[0].message.clear();
+        overflow.evidence = vec![patch_evidence.clone(); MAX_REPORT_COLLECTION_ITEMS];
+        let error = attempt(&candidate, overflow).err().unwrap();
+        assert!(error.to_string().contains("report collection evidence"));
+        let mut observer = after.clone();
+        observer.executions[0].adapter_kind = AdapterKind::Observer;
+        let projected = attempt(&candidate, observer).unwrap();
+        assert!(projected.executions[1].verification.is_none());
+        let verified = attempt(&candidate, after).unwrap();
+        assert!(verified.executions[1].verification.is_some());
+        scratch.cleanup().unwrap();
     }
 
     #[test]
