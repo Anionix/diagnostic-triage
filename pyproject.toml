@@ -1,9 +1,14 @@
 [tool.pytest.ini_options]
 addopts = "-q"
+pythonpath = ["."]
 testpaths = ["tests"]
 
 [tool.pyright]
-include = ["tests/test_contracts.py"]
+include = [
+  "tests/test_contracts.py",
+  "tests/test_release_contract.py",
+  "tools/release_manifest.py",
+]
 pythonVersion = "3.13"
 typeCheckingMode = "strict"
 
