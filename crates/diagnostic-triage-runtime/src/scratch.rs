@@ -612,6 +612,26 @@ impl ScratchWorkspace {
         self.capture(patch, result_execution_id)
     }
 
+    pub(crate) fn validate_applied_patch_evidence(
+        &self,
+        patch: &ScratchPatch,
+        evidence: &Evidence,
+    ) -> Result<(), ScratchError> {
+        let applied = self.applied.as_ref().ok_or(ScratchError::PatchNotApplied)?;
+        patch.preflight(self.limits)?;
+        let encoded = patch.encode()?;
+        validate_canonical_patch_evidence(evidence, &encoded)?;
+        let encoded_len = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
+        if evidence.execution_id.is_some()
+            || evidence.limit_bytes != self.limits.max_evidence_bytes
+            || evidence.observed_bytes != encoded_len
+            || applied.patch_sha256 != evidence.sha256
+        {
+            return Err(ScratchError::PatchEvidenceMismatch);
+        }
+        Ok(())
+    }
+
     /// Apply an unverified patch transactionally to this private workspace for Provider checks.
     ///
     /// The original repository is never written. The immutable base Evidence remains available
@@ -1959,6 +1979,13 @@ fn validate_patch_evidence(
     if candidate.patch_evidence_id != patch_evidence.evidence_id {
         return Err(ScratchError::PatchEvidenceMismatch);
     }
+    validate_canonical_patch_evidence(patch_evidence, encoded_patch)
+}
+
+fn validate_canonical_patch_evidence(
+    patch_evidence: &Evidence,
+    encoded_patch: &[u8],
+) -> Result<(), ScratchError> {
     if patch_evidence.source != EvidenceSource::Patch
         || patch_evidence.media_type != PATCH_MEDIA_TYPE
         || patch_evidence.truncated

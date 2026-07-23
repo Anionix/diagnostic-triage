@@ -15,8 +15,8 @@ use diagnostic_triage_contracts::protocol::{
 use diagnostic_triage_contracts::{
     AdapterId, ContractError, Nullable, ObjectId, RepoPath, Sha256Digest,
     model::{
-        AdapterKind, EngineIdentity, Evidence, EvidenceSource, Execution, ExecutionStatus, Finding,
-        FindingState, FixCandidate, Observation, SessionReport, Tool, VerificationAttribution,
+        AdapterKind, EngineIdentity, Evidence, Execution, ExecutionStatus, Finding, FindingState,
+        FixCandidate, Observation, SessionReport, Tool, VerificationAttribution,
     },
 };
 use diagnostic_triage_engine::{
@@ -37,7 +37,7 @@ use crate::{
     execution::{ProviderExecutionInput, validated_provider_execution},
     execution_identity as identity,
     process::{ProcessError, ProcessLimits, ProcessSpec, ProcessState, run_bounded},
-    scratch::{PATCH_MEDIA_TYPE, ScratchError, ScratchPatch, ScratchWorkspace},
+    scratch::{ScratchError, ScratchPatch, ScratchWorkspace},
     session::{
         ProviderSessionError, ProviderSessionOutcome, ProviderSessionState, run_provider_session,
     },
@@ -789,11 +789,7 @@ pub(crate) fn project_patch_verification(
     if !before.fix_candidates.contains(candidate) {
         return Err(ScratchError::CandidateNotAuthorized.into());
     }
-    if patch_evidence.source != EvidenceSource::Patch
-        || patch_evidence.media_type != PATCH_MEDIA_TYPE
-    {
-        return Err(ScratchError::PatchEvidenceMismatch.into());
-    }
+    scratch.validate_applied_patch_evidence(patch, &patch_evidence)?;
     preflight_projection_collections(
         0,
         before
@@ -1296,30 +1292,34 @@ mod tests {
         let patch = ScratchPatch::new(Vec::new()).unwrap();
         let patch_evidence = scratch.capture(&patch, None).unwrap().patch;
         scratch.apply_for_verification(&patch).unwrap();
-        let attempt = |candidate, after| {
-            project_patch_verification(
-                &scratch,
-                &patch,
-                candidate,
-                patch_evidence.clone(),
-                before.clone(),
-                after,
-            )
+        let attempt = |candidate, evidence, after| {
+            project_patch_verification(&scratch, &patch, candidate, evidence, before.clone(), after)
         };
+        let mut truncated = patch_evidence.clone();
+        truncated.truncated = true;
+        let mut out_of_line = patch_evidence.clone();
+        out_of_line.content = None;
+        let mut digest_mismatch = patch_evidence.clone();
+        digest_mismatch.sha256 = Sha256Digest::compute(b"competing patch");
+        for invalid in [truncated, out_of_line, digest_mismatch] {
+            assert!(attempt(&candidate, invalid, after.clone()).is_err());
+        }
         let mut forged = candidate.clone();
         forged.fix_candidate_id = "019f7e95-0000-7000-8000-000000000299".parse().unwrap();
-        assert!(attempt(&forged, after.clone()).is_err());
+        assert!(attempt(&forged, patch_evidence.clone(), after.clone()).is_err());
         let mut overflow = after.clone();
         overflow.observations = before.observations.clone();
         overflow.observations[0].message.clear();
         overflow.evidence = vec![patch_evidence.clone(); MAX_REPORT_COLLECTION_ITEMS];
-        let error = attempt(&candidate, overflow).err().unwrap();
+        let error = attempt(&candidate, patch_evidence.clone(), overflow)
+            .err()
+            .unwrap();
         assert!(error.to_string().contains("report collection evidence"));
         let mut observer = after.clone();
         observer.executions[0].adapter_kind = AdapterKind::Observer;
-        let projected = attempt(&candidate, observer).unwrap();
+        let projected = attempt(&candidate, patch_evidence.clone(), observer).unwrap();
         assert!(projected.executions[1].verification.is_none());
-        let verified = attempt(&candidate, after).unwrap();
+        let verified = attempt(&candidate, patch_evidence, after).unwrap();
         assert!(verified.executions[1].verification.is_some());
         scratch.cleanup().unwrap();
     }
