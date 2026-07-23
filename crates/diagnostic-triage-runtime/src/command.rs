@@ -94,6 +94,12 @@ pub enum FixCommandError {
     Report(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("no authoritative SAFE fix candidate was produced")]
     NoSafeCandidate,
+    #[error("operation failed ({operation}); scratch cleanup also failed ({cleanup})")]
+    OperationAndCleanup {
+        #[source]
+        operation: Box<FixCommandError>,
+        cleanup: Box<FixCommandError>,
+    },
 }
 
 /// Successful offline Observer transcript plus its stable terminal status.
@@ -194,7 +200,7 @@ pub fn run_fix_command(
     let cleanup = scratch
         .cleanup()
         .map_err(|error| FixCommandError::Scratch(Box::new(error)));
-    result.and_then(|value| cleanup.map(|()| value))
+    finish_with_cleanup(result, cleanup)
 }
 
 /// Verify that an arbitrary unified diff has the exact result of one authoritative SAFE Ruff fix.
@@ -233,8 +239,7 @@ pub fn run_verify_patch_command(
     let imported_cleanup = imported_scratch
         .cleanup()
         .map_err(|error| FixCommandError::Scratch(Box::new(error)));
-    let (imported_base, imported_result) =
-        imported.and_then(|value| imported_cleanup.map(|()| value))?;
+    let (imported_base, imported_result) = finish_with_cleanup(imported, imported_cleanup)?;
 
     let mut canonical_scratch = stage_snapshot(config, repository_root, &paths)?;
     let result = (|| {
@@ -290,7 +295,22 @@ pub fn run_verify_patch_command(
     let canonical_cleanup = canonical_scratch
         .cleanup()
         .map_err(|error| FixCommandError::Scratch(Box::new(error)));
-    result.and_then(|report| canonical_cleanup.map(|()| report))
+    finish_with_cleanup(result, canonical_cleanup)
+}
+
+fn finish_with_cleanup<T>(
+    operation: Result<T, FixCommandError>,
+    cleanup: Result<(), FixCommandError>,
+) -> Result<T, FixCommandError> {
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(operation), Err(cleanup)) => Err(FixCommandError::OperationAndCleanup {
+            operation: Box::new(operation),
+            cleanup: Box::new(cleanup),
+        }),
+    }
 }
 
 fn stage_snapshot(
@@ -564,6 +584,24 @@ pub const fn verdict_exit_code(verdict: &Verdict) -> u8 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn operation_and_cleanup_failures_are_both_retained() {
+        let error = finish_with_cleanup::<()>(
+            Err(FixCommandError::NoSafeCandidate),
+            Err(FixCommandError::PatchFormat),
+        )
+        .expect_err("both failures remain visible");
+
+        assert!(matches!(
+            error,
+            FixCommandError::OperationAndCleanup {
+                operation,
+                cleanup,
+            } if matches!(*operation, FixCommandError::NoSafeCandidate)
+                && matches!(*cleanup, FixCommandError::PatchFormat)
+        ));
+    }
 
     #[test]
     fn github_actions_request_binds_operation_capability_target_and_bytes() {
