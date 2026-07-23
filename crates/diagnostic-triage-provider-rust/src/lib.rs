@@ -9,7 +9,7 @@ use std::{
     collections::HashSet,
     ffi::OsString,
     io::{self, BufRead, BufReader, Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     str::FromStr,
     time::{Duration, Instant},
 };
@@ -260,6 +260,7 @@ fn execute_in_workspace(
         cargo: scope,
         repository_root,
         workspace_root,
+        verification_target: target_dir,
     };
 
     let started = Instant::now();
@@ -597,6 +598,7 @@ struct DiagnosticScope<'a> {
     cargo: &'a CargoScope,
     repository_root: &'a Path,
     workspace_root: &'a Path,
+    verification_target: Option<&'a Path>,
 }
 
 fn cargo_argv(command: &str, scope: &CargoScope, target_dir: Option<&Path>) -> Vec<String> {
@@ -702,14 +704,26 @@ fn append_observations(
         {
             continue;
         }
-        let location = primary
-            .map(|span| scoped_location(span, scope))
-            .transpose()?
-            .flatten();
-        if primary.is_some() && location.is_none() {
+        let generated =
+            primary.is_some_and(|span| verification_target_path(&span.file_name, scope));
+        let location = if generated {
+            None
+        } else {
+            primary
+                .map(|span| scoped_location(span, scope))
+                .transpose()?
+                .flatten()
+        };
+        if primary.is_some() && location.is_none() && !generated {
             continue;
         }
-        let message = diagnostic_message(diagnostic);
+        let message = if generated {
+            let mut repository_safe = diagnostic.clone();
+            repository_safe.rendered = None;
+            diagnostic_message(&repository_safe)
+        } else {
+            diagnostic_message(diagnostic)
+        };
         let rule_id = diagnostic.code.as_ref().map(|code| code.code.clone());
         let key = observation_key(&severity, rule_id.as_deref(), &message, location.as_ref());
         if !seen.insert(key) {
@@ -821,6 +835,17 @@ fn scoped_location(
         }
         Err(error) => Err(error),
     }
+}
+
+fn verification_target_path(raw: &str, scope: &DiagnosticScope<'_>) -> bool {
+    let Some(root) = scope.verification_target else {
+        return false;
+    };
+    let path = Path::new(raw);
+    !raw.contains(['\\', '\0'])
+        && path.is_absolute()
+        && path.starts_with(root)
+        && !path.components().any(|part| part == Component::ParentDir)
 }
 
 fn validate_rustc_span(span: &RustcSpan) -> Result<(), ProviderError> {
@@ -1533,6 +1558,7 @@ mod tests {
                 cargo: &CargoScope::Workspace,
                 repository_root: Path::new("."),
                 workspace_root: Path::new("."),
+                verification_target: None,
             },
         )
     }
@@ -1590,9 +1616,10 @@ if [ "$1" = "clippy" ] && [ "$2" = "--version" ]; then printf 'clippy 0.1.93 (fi
 if [ "$1" = "check" ] || [ "$1" = "clippy" ]; then
   if [ "$2" != "--target-dir" ]; then exit 92; fi
   printf '%s\n' "$3" > "$0.target"
-  mkdir -p "$3" && printf artifact > "$3/artifact"
-  printf '%s\n' '{"reason":"build-finished","success":true}'
-  exit 0
+  mkdir -p "$3/out" && printf source > "$3/out/generated.rs"
+  printf '{"reason":"compiler-message","message":{"message":"generated failure","code":{"code":"E0001","explanation":null},"level":"error","spans":[{"file_name":"%s","line_start":1,"line_end":1,"column_start":1,"column_end":2,"is_primary":true}],"children":[],"rendered":"error at %s"}}\n' "$3/out/generated.rs" "$3/out/generated.rs"
+  printf '%s\n' '{"reason":"build-finished","success":false}'
+  exit 1
 fi
 exit 91
 "#,
@@ -1609,8 +1636,14 @@ exit 91
 
         let response = execute_with_program(&request, &fake.program);
         let target = fs::read_to_string(fake.program.with_extension("target")).unwrap();
+        let observation = response.events.iter().find_map(|event| match event {
+            ProtocolEnvelope::Observation(event) => Some(&event.observation),
+            _ => None,
+        });
 
         assert_eq!(response.completion.status, ExecutionStatus::Complete);
+        assert_eq!(observation.unwrap().message, "generated failure");
+        assert!(observation.unwrap().location.is_none());
         assert_ne!(Path::new(target.trim()), collision);
         assert!(!Path::new(target.trim()).starts_with(repository_root()));
         assert!(!Path::new(target.trim()).exists());
@@ -1797,6 +1830,7 @@ exit 91
             cargo: &cargo,
             repository_root: &root,
             workspace_root: &workspace_root,
+            verification_target: None,
         };
         assert_eq!(
             normalize_path("src/lib.rs", &scope).unwrap().as_str(),
@@ -1830,6 +1864,7 @@ exit 91
             cargo: &cargo,
             repository_root: &fixture.root,
             workspace_root: &workspace_root,
+            verification_target: None,
         };
 
         assert_eq!(
@@ -1848,6 +1883,7 @@ exit 91
             cargo: &cargo,
             repository_root: &root,
             workspace_root: &root,
+            verification_target: None,
         };
         let span = RustcSpan {
             file_name: "crates/diagnostic-triage-contracts/src/lib.rs".to_owned(),
