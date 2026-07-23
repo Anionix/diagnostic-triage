@@ -5,6 +5,8 @@
     reason = "typed constructor consumed by #223 runtime projection"
 )]
 mod execution;
+#[allow(dead_code, reason = "#223 consumer")]
+mod execution_identity;
 mod issue_draft;
 #[allow(
     dead_code,
