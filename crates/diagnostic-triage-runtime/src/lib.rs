@@ -19,6 +19,8 @@ mod orchestration;
 mod ruff_fix;
 mod scratch;
 
+#[doc(hidden)]
+pub use diagnostic_triage_contracts::RepoPath;
 pub use ruff_fix::{
     CanonicalRuffFix, MAX_RUFF_FIX_EDITS, MAX_RUFF_FIX_EVIDENCE_BYTES, MAX_RUFF_FIX_FILE_BYTES,
     MAX_RUFF_FIX_JSON_DEPTH, MAX_RUFF_FIX_STRING_BYTES, RUFF_FIX_MEDIA_TYPE, RuffFixError,

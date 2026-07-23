@@ -10,11 +10,11 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use diagnostic_triage_runtime::{
-    ConfigError, FixCommandError, ObserverCommandError, ReadOnlyCommandMode, ReporterError,
-    RuntimeCommandError, RuntimeConfig, ValidatedSessionReport, config::OutputFormat,
-    run_fix_command, run_github_actions_observer, run_read_only_command, run_verify_patch_command,
-    verdict_exit_code, write_bug_issue_draft_json, write_bug_issue_draft_markdown,
-    write_canonical_json, write_tsv,
+    ConfigError, FixCommandError, ObserverCommandError, ReadOnlyCommandMode, RepoPath,
+    ReporterError, RuntimeCommandError, RuntimeConfig, ValidatedSessionReport,
+    config::OutputFormat, run_fix_command, run_github_actions_observer, run_read_only_command,
+    run_verify_patch_command, verdict_exit_code, write_bug_issue_draft_json,
+    write_bug_issue_draft_markdown, write_canonical_json, write_tsv,
 };
 use thiserror::Error;
 
@@ -349,7 +349,8 @@ fn resolve_observer_input_path(
     repository: &Path,
     relative: &Path,
 ) -> Result<(PathBuf, String), CliError> {
-    let canonical = resolve_input_path(repository, relative)?;
+    let normalized = normalize_observer_input(relative)?;
+    let canonical = resolve_input_path(repository, Path::new(&normalized))?;
     let repo_relative = canonical
         .strip_prefix(repository)
         .map_err(|_| CliError::InputPath(relative.display().to_string()))?;
@@ -370,7 +371,41 @@ fn resolve_observer_input_path(
     if repo_path.is_empty() {
         return Err(CliError::InputPath(relative.display().to_string()));
     }
+    repo_path
+        .parse::<RepoPath>()
+        .map_err(|_| CliError::InputPath(relative.display().to_string()))?;
     Ok((canonical, repo_path))
+}
+
+fn normalize_observer_input(relative: &Path) -> Result<String, CliError> {
+    if relative.as_os_str().is_empty() || relative.is_absolute() {
+        return Err(CliError::InputPath(relative.display().to_string()));
+    }
+    let mut components = Vec::new();
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            if matches!(component, Component::CurDir) {
+                continue;
+            }
+            return Err(CliError::InputPath(relative.display().to_string()));
+        };
+        let Some(component) = component.to_str() else {
+            return Err(CliError::InputPath(relative.display().to_string()));
+        };
+        if component.contains(['\\', '\0']) {
+            return Err(CliError::InputPath(relative.display().to_string()));
+        }
+        components.push(component);
+    }
+    let normalized = if components.is_empty() {
+        ".".to_owned()
+    } else {
+        components.join("/")
+    };
+    normalized
+        .parse::<RepoPath>()
+        .map(|path| path.to_string())
+        .map_err(|_| CliError::InputPath(relative.display().to_string()))
 }
 
 fn read_bounded(path: &Path) -> Result<Vec<u8>, CliError> {
@@ -482,6 +517,18 @@ mod tests {
         assert!(matches!(
             resolve_observer_input_path(&repository, Path::new("runs")),
             Err(CliError::InputPath(path)) if path == "runs"
+        ));
+    }
+
+    #[test]
+    fn observer_input_rejects_drive_relative_filename_before_file_resolution() {
+        let directory = tempdir().expect("temporary directory");
+        let repository = fs::canonicalize(directory.path()).expect("canonical repository");
+        fs::write(directory.path().join("C:run.json"), b"{}").expect("input");
+
+        assert!(matches!(
+            resolve_observer_input_path(&repository, Path::new("C:run.json")),
+            Err(CliError::InputPath(path)) if path == "C:run.json"
         ));
     }
 
