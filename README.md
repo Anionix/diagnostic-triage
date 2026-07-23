@@ -21,6 +21,13 @@ are rejected with a migration error; the runtime never guesses identity data.
 The canonical architecture and terminology are recorded in [CONTEXT.md](CONTEXT.md)
 and [ADR 0001](docs/adr/0001-standalone-canonical-engine.md).
 
+## Running from source
+
+`observe --source github-actions` requires the first-party
+`diagnostic-triage-observer-github-actions` binary. Release archives place it
+beside `diagnostic-triage`; source installs must install both packages to the
+same Cargo `--root`, or put the Observer on `PATH`.
+
 ## License
 
 Apache-2.0.
