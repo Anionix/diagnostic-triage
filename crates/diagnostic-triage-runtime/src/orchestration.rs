@@ -425,6 +425,37 @@ fn run_all_providers(
     })
 }
 
+fn verification_plan_digest(
+    base: &Sha256Digest,
+    patch: &Sha256Digest,
+    result: &Sha256Digest,
+) -> Sha256Digest {
+    Sha256Digest::compute(format!("{base}{patch}{result}").as_bytes())
+}
+
+fn resolve_isolated_provider_programs(
+    original: &ResolvedWorkspace,
+    scratch: &ScratchWorkspace,
+    providers: &[PlannedProvider],
+) -> Result<Vec<PathBuf>, ReadOnlyRunError> {
+    providers
+        .iter()
+        .map(|provider| {
+            let configured = &provider.config.program;
+            let path = Path::new(configured);
+            if !path.is_absolute()
+                && !is_bare_program_name(path)
+                && !scratch.contains_source_path(configured)?
+            {
+                return Err(ReadOnlyRunError::ProviderProgramUnstaged {
+                    program: path.into(),
+                });
+            }
+            resolve_provider_program(original.repository_root(), configured)
+        })
+        .collect()
+}
+
 pub(crate) fn execute_fix_plan(
     config: &RuntimeConfig,
     repository_root: &Path,
@@ -451,22 +482,7 @@ pub(crate) fn execute_fix_plan(
     if scratch.capture(&empty, None)?.result.sha256 != scratch.base_evidence().sha256 {
         return Err(ScratchError::BaseChanged.into());
     }
-    let programs = providers
-        .iter()
-        .map(|provider| {
-            let configured = &provider.config.program;
-            let path = Path::new(configured);
-            if !path.is_absolute()
-                && !is_bare_program_name(path)
-                && !scratch.contains_source_path(configured)?
-            {
-                return Err(ReadOnlyRunError::ProviderProgramUnstaged {
-                    program: path.into(),
-                });
-            }
-            resolve_provider_program(original.repository_root(), &provider.config.program)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let programs = resolve_isolated_provider_programs(&original, scratch, &providers)?;
     let run_result = run_all_providers(config, plan_id, providers, programs, &workspace);
     let scratch_after = scratch.capture(&empty, None);
     let original_after = capture_repository_state(original.repository_root())?;
@@ -484,8 +500,16 @@ pub(crate) fn execute_patch_verification(
     patch: &ScratchPatch,
 ) -> Result<ExecutedReadOnlyPlan, ReadOnlyRunError> {
     let before = scratch.capture_applied(patch, None)?;
-    let plan = build_read_only_plan(config, &before.result.sha256, ReadOnlyMode::Verify)?;
+    let digest = verification_plan_digest(
+        &before.base.sha256,
+        &before.patch.sha256,
+        &before.result.sha256,
+    );
+    let plan = build_read_only_plan(config, &digest, ReadOnlyMode::Verify)?;
     let original = resolve_workspace(repository_root, &config.repository.workspace)?;
+    if original.repository_root() != scratch.source_repository_root() {
+        return Err(ReadOnlyRunError::ScratchRepositoryMismatch);
+    }
     let workspace = resolve_workspace(scratch.path(), &config.repository.workspace)?;
     let ReadOnlyPlan {
         config,
@@ -493,35 +517,20 @@ pub(crate) fn execute_patch_verification(
         targets,
         providers,
     } = plan;
-    // LLM contract: PATCH_APPLIED -> VERIFY_PLANNED -> PROVIDERS_REAPED -> RESULT_RECAPTURED;
-    // missing apply or any post-apply mutation -> INCOMPLETE.
+    // LLM contract: PATCH_APPLIED -> VERIFY_PLANNED -> PROVIDER_TARGETS_VALIDATED ->
+    // SOURCE_LINEAGE_VALIDATED -> PROVIDERS_PREFLIGHTED -> PROVIDERS_REAPED -> RESULT_RECAPTURED.
     validate_provider_targets(&workspace, &targets)?;
-    let programs = providers
-        .iter()
-        .map(|provider| {
-            resolve_provider_program(original.repository_root(), &provider.config.program)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     let original_before = capture_repository_state(original.repository_root())?;
-    let run_result: Result<ExecutedReadOnlyPlan, ReadOnlyRunError> = (|| {
-        let mut executed = Vec::with_capacity(providers.len());
-        for (planned, program) in providers.into_iter().zip(programs) {
-            executed.push(planned.run(&workspace, program)?);
-        }
-        Ok(ExecutedReadOnlyPlan {
-            config,
-            plan_id,
-            providers: executed,
-        })
-    })();
+    scratch.validate_source_unchanged()?;
+    let programs = resolve_isolated_provider_programs(&original, scratch, &providers)?;
+    let run_result = run_all_providers(config, plan_id, providers, programs, &workspace);
     let scratch_after = scratch.capture_applied(patch, None);
     let original_after = capture_repository_state(original.repository_root())?;
     if original_before != original_after {
         return Err(ReadOnlyRunError::RepositoryMutation);
     }
     scratch_after?;
-    let executed = run_result?;
-    Ok(executed)
+    run_result
 }
 
 type RepositoryState = [Vec<u8>; 3];
@@ -1223,6 +1232,27 @@ mod tests {
         super::run_git(repository, &["commit", "-qm", "baseline"]).unwrap();
     }
 
+    fn assert_verification_plan_identity(
+        config: &RuntimeConfig,
+        scratch: &ScratchWorkspace,
+        patch: &ScratchPatch,
+        verified: &super::ExecutedReadOnlyPlan,
+    ) {
+        let evidence = scratch
+            .capture_applied(
+                patch,
+                Some(verified.providers[0].planned.execution_id.clone()),
+            )
+            .unwrap();
+        let digest = super::verification_plan_digest(
+            &evidence.base.sha256,
+            &evidence.patch.sha256,
+            &evidence.result.sha256,
+        );
+        let expected = build_read_only_plan(config, &digest, ReadOnlyMode::Verify).unwrap();
+        assert_eq!(verified.plan_id, expected.plan_id);
+    }
+
     fn execution_fixture() -> (PlannedProvider, ValidatedSession) {
         let session = validate_session_jsonl(SESSION_JSONL.as_bytes()).unwrap();
         let mut config = config("src").providers.remove(0);
@@ -1776,9 +1806,18 @@ mod tests {
     #[test]
     fn patch_verification_requires_apply_and_runs_against_the_bound_result() {
         let repository = tempdir().unwrap();
+        fs::write(repository.path().join("enable-launch-probe"), b"").unwrap();
         fs::write(repository.path().join("tracked.txt"), b"before").unwrap();
+        fs::create_dir(repository.path().join("bin")).unwrap();
+        let provider = format!("provider{}", env::consts::EXE_SUFFIX);
+        fs::copy(
+            env::current_exe().unwrap(),
+            repository.path().join("bin").join(&provider),
+        )
+        .unwrap();
         init_git(repository.path());
-        let mut config = config("tracked.txt");
+        let mut reap_config = config("tracked.txt");
+        let mut config = reap_config.clone();
         config.providers.truncate(1);
         config.providers[0].program = env::current_exe().unwrap().to_str().unwrap().to_owned();
         config.providers[0].argv = vec!["--exact".to_owned(), "__no_such_test__".to_owned()];
@@ -1793,33 +1832,90 @@ mod tests {
             ScratchLimits::default(),
         )
         .unwrap();
-
         let error =
             execute_patch_verification(&config, repository.path(), &scratch, &patch).unwrap_err();
         assert!(matches!(
             error,
             super::ReadOnlyRunError::Scratch(ScratchError::PatchNotApplied)
         ));
-
         scratch.apply_for_verification(&patch).unwrap();
+        let other = tempdir().unwrap();
+        fs::write(other.path().join("tracked.txt"), b"before").unwrap();
+        init_git(other.path());
+        assert!(matches!(
+            execute_patch_verification(&config, other.path(), &scratch, &patch),
+            Err(super::ReadOnlyRunError::ScratchRepositoryMismatch)
+        ));
+        let provider_program = config.providers[0].program.clone();
+        config.providers[0].program = "./missing-provider".to_owned();
+        fs::write(repository.path().join("tracked.txt"), b"stale source").unwrap();
+        assert!(matches!(
+            execute_patch_verification(&config, repository.path(), &scratch, &patch),
+            Err(super::ReadOnlyRunError::Scratch(ScratchError::BaseChanged))
+        ));
+        fs::write(repository.path().join("tracked.txt"), b"before").unwrap();
+        assert!(matches!(
+            execute_patch_verification(&config, repository.path(), &scratch, &patch),
+            Err(super::ReadOnlyRunError::ProviderProgramUnstaged { .. })
+        ));
+        config.providers[0].program = provider_program;
         let verified =
             execute_patch_verification(&config, repository.path(), &scratch, &patch).unwrap();
-        assert_eq!(
-            verified.providers[0].planned.request.operation,
-            Operation::Verify
-        );
-        let evidence = scratch
-            .capture_applied(
-                &patch,
-                Some(verified.providers[0].planned.execution_id.clone()),
-            )
-            .unwrap();
-        assert_ne!(evidence.base.sha256, evidence.result.sha256);
+        assert_verification_plan_identity(&config, &scratch, &patch, &verified);
         assert_eq!(
             fs::read(repository.path().join("tracked.txt")).unwrap(),
             b"before"
         );
         scratch.cleanup().unwrap();
+        reap_config.providers[0].program = "/definitely/missing/provider".to_owned();
+        reap_config.providers[1].program = format!("./bin/{provider}");
+        reap_config.providers[1].argv = vec![
+            "--ignored".to_owned(),
+            "--exact".to_owned(),
+            "orchestration::tests::provider_launch_probe".to_owned(),
+        ];
+        let mut scratch = ScratchWorkspace::stage(
+            repository.path(),
+            &["bin", "enable-launch-probe", "tracked.txt"],
+            ScratchLimits::default(),
+        )
+        .unwrap();
+        scratch.apply_for_verification(&patch).unwrap();
+        assert!(matches!(
+            execute_patch_verification(&reap_config, repository.path(), &scratch, &patch),
+            Err(super::ReadOnlyRunError::Scratch(
+                ScratchError::VerificationResultChanged
+            ))
+        ));
+        assert!(scratch.path().join("provider-launched").is_file());
+        fs::remove_file(scratch.path().join("provider-launched")).unwrap();
+        reap_config.providers[1].program = "/different/missing/provider".to_owned();
+        assert!(matches!(
+            execute_patch_verification(&reap_config, repository.path(), &scratch, &patch),
+            Err(super::ReadOnlyRunError::Provider { adapter_id, .. })
+                if adapter_id.as_str() == "alpha"
+        ));
+        scratch.cleanup().unwrap();
+    }
+
+    #[test]
+    fn verification_plan_identity_binds_ordered_lineage() {
+        let base = Sha256Digest::compute(b"base");
+        let patch = Sha256Digest::compute(b"patch");
+        let result = Sha256Digest::compute(b"result");
+        let expected = super::verification_plan_digest(&base, &patch, &result);
+        assert_ne!(
+            expected,
+            super::verification_plan_digest(&result, &patch, &base)
+        );
+        assert_ne!(
+            expected,
+            super::verification_plan_digest(&base, &result, &patch)
+        );
+        assert_ne!(
+            expected,
+            super::verification_plan_digest(&patch, &base, &result)
+        );
     }
 
     #[cfg(unix)]
