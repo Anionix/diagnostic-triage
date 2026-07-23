@@ -85,7 +85,7 @@ pub enum CliError {
 ///
 /// Returns [`CliError`] for repository, configuration, runtime, or reporter
 /// failures. Callers map every such failure to exit code 2.
-pub fn execute(cli: Cli, output: &mut dyn Write) -> Result<CommandStatus, CliError> {
+pub fn execute(cli: &Cli, output: &mut dyn Write) -> Result<CommandStatus, CliError> {
     let repository = canonical_repository(&cli.repository)?;
     let config_path = resolve_config_path(&repository, &cli.config)?;
     if matches!(cli.command, CliCommand::Ci) {
@@ -139,7 +139,7 @@ fn resolve_config_path(repository: &Path, relative: &Path) -> Result<PathBuf, Cl
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(CliError::ConfigPath(relative.display().to_string()));
     }
-    let canonical = fs::canonicalize(&candidate).map_err(|error| CliError::ConfigIo(error))?;
+    let canonical = fs::canonicalize(&candidate).map_err(CliError::ConfigIo)?;
     if !canonical.starts_with(repository) {
         return Err(CliError::ConfigPath(relative.display().to_string()));
     }

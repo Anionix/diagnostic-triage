@@ -60,7 +60,7 @@ fn ci_emits_only_the_selected_report_and_returns_pass() {
     .expect("CLI");
     let mut output = Vec::new();
 
-    let status = execute(cli, &mut output).expect("CI report");
+    let status = execute(&cli, &mut output).expect("CI report");
 
     assert_eq!(status.code(), 0);
     assert!(
@@ -168,7 +168,7 @@ fn ci_does_not_treat_config_pathspec_magic_as_a_tracked_literal() {
     .expect("CLI");
 
     assert!(matches!(
-        execute(cli, &mut Vec::new()),
+        execute(&cli, &mut Vec::new()),
         Err(CliError::ConfigUntracked(path)) if path == "*.toml"
     ));
 }
