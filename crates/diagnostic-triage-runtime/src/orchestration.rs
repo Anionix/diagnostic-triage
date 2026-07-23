@@ -37,6 +37,7 @@ use crate::{
     execution::{ProviderExecutionInput, validated_provider_execution},
     execution_identity as identity,
     process::{ProcessError, ProcessLimits, ProcessSpec, ProcessState, run_bounded},
+    scratch::{ScratchError, ScratchPatch, ScratchWorkspace},
     session::{
         ProviderSessionError, ProviderSessionOutcome, ProviderSessionState, run_provider_session,
     },
@@ -205,6 +206,8 @@ pub(crate) enum ReadOnlyRunError {
     RepositoryTrackedEntry,
     #[error("configured Provider mutated tracked repository state")]
     RepositoryMutation,
+    #[error("scratch verification boundary failed")]
+    Scratch(#[from] ScratchError),
 }
 
 #[derive(Debug, Error)]
@@ -343,6 +346,53 @@ pub(crate) fn execute_read_only_plan(
         return Err(ReadOnlyRunError::RepositoryMutation);
     }
     run_result
+}
+
+pub(crate) fn execute_patch_verification(
+    config: &RuntimeConfig,
+    repository_root: &Path,
+    scratch: &ScratchWorkspace,
+    patch: &ScratchPatch,
+) -> Result<ExecutedReadOnlyPlan, ReadOnlyRunError> {
+    let before = scratch.capture_applied(patch, None)?;
+    let plan = build_read_only_plan(config, &before.result.sha256, ReadOnlyMode::Verify)?;
+    let original = resolve_workspace(repository_root, &config.repository.workspace)?;
+    let workspace = resolve_workspace(scratch.path(), &config.repository.workspace)?;
+    let ReadOnlyPlan {
+        config,
+        plan_id,
+        targets,
+        providers,
+    } = plan;
+    // LLM contract: PATCH_APPLIED -> VERIFY_PLANNED -> PROVIDERS_REAPED -> RESULT_RECAPTURED;
+    // missing apply or any post-apply mutation -> INCOMPLETE.
+    validate_provider_targets(&workspace, &targets)?;
+    let programs = providers
+        .iter()
+        .map(|provider| {
+            resolve_provider_program(original.repository_root(), &provider.config.program)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let original_before = capture_repository_state(original.repository_root())?;
+    let run_result: Result<ExecutedReadOnlyPlan, ReadOnlyRunError> = (|| {
+        let mut executed = Vec::with_capacity(providers.len());
+        for (planned, program) in providers.into_iter().zip(programs) {
+            executed.push(planned.run(&workspace, program)?);
+        }
+        Ok(ExecutedReadOnlyPlan {
+            config,
+            plan_id,
+            providers: executed,
+        })
+    })();
+    let scratch_after = scratch.capture_applied(patch, None);
+    let original_after = capture_repository_state(original.repository_root())?;
+    if original_before != original_after {
+        return Err(ReadOnlyRunError::RepositoryMutation);
+    }
+    scratch_after?;
+    let executed = run_result?;
+    Ok(executed)
 }
 
 type RepositoryState = [Vec<u8>; 3];
@@ -839,11 +889,14 @@ mod tests {
 
     use super::{
         PlannedProvider, ReadOnlyMode, ReadOnlyReportError, RuntimeProjectionError,
-        assemble_read_only_report, build_read_only_plan, execute_read_only_plan,
-        preflight_projection_collections, project_provider_states, resolve_provider_program,
-        resolve_workspace, synthesize_execution,
+        assemble_read_only_report, build_read_only_plan, execute_patch_verification,
+        execute_read_only_plan, preflight_projection_collections, project_provider_states,
+        resolve_provider_program, resolve_workspace, synthesize_execution,
     };
-    use crate::{RuntimeConfig, session::ProviderSessionState};
+    use crate::{
+        RuntimeConfig, ScratchChange, ScratchError, ScratchLimits, ScratchPatch, ScratchWorkspace,
+        session::ProviderSessionState,
+    };
     use diagnostic_triage_contracts::{
         ObjectId, Sha256Digest, ValidatedSession,
         model::{Category, Execution, ExecutionStatus, MicroCategory, PhaseDuration, Verdict},
@@ -1196,6 +1249,95 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(error, super::ReadOnlyRunError::RepositoryMutation));
+    }
+
+    #[test]
+    fn patch_verification_requires_apply_and_runs_against_the_bound_result() {
+        let repository = tempdir().unwrap();
+        fs::write(repository.path().join("tracked.txt"), b"before").unwrap();
+        init_git(repository.path());
+        let mut config = config("tracked.txt");
+        config.providers.truncate(1);
+        config.providers[0].program = env::current_exe().unwrap().to_str().unwrap().to_owned();
+        config.providers[0].argv = vec!["--exact".to_owned(), "__no_such_test__".to_owned()];
+        let patch = ScratchPatch::new(vec![ScratchChange::Write {
+            path: "tracked.txt".to_owned(),
+            contents: b"after".to_vec(),
+        }])
+        .unwrap();
+        let mut scratch = ScratchWorkspace::stage(
+            repository.path(),
+            &["tracked.txt"],
+            ScratchLimits::default(),
+        )
+        .unwrap();
+
+        let error =
+            execute_patch_verification(&config, repository.path(), &scratch, &patch).unwrap_err();
+        assert!(matches!(
+            error,
+            super::ReadOnlyRunError::Scratch(ScratchError::PatchNotApplied)
+        ));
+
+        scratch.apply_for_verification(&patch).unwrap();
+        let verified =
+            execute_patch_verification(&config, repository.path(), &scratch, &patch).unwrap();
+        assert_eq!(
+            verified.providers[0].planned.request.operation,
+            Operation::Verify
+        );
+        let evidence = scratch
+            .capture_applied(
+                &patch,
+                Some(verified.providers[0].planned.execution_id.clone()),
+            )
+            .unwrap();
+        assert_ne!(evidence.base.sha256, evidence.result.sha256);
+        assert_eq!(
+            fs::read(repository.path().join("tracked.txt")).unwrap(),
+            b"before"
+        );
+        scratch.cleanup().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn patch_verification_detects_original_repository_mutation() {
+        let repository = tempdir().unwrap();
+        let tracked = repository.path().join("tracked.txt");
+        fs::write(&tracked, b"before").unwrap();
+        init_git(repository.path());
+        fs::set_permissions(&tracked, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut config = config("tracked.txt");
+        config.providers.truncate(1);
+        let chmod = env::split_paths(&env::var_os("PATH").unwrap())
+            .map(|directory| directory.join("chmod"))
+            .find(|candidate| candidate.is_file())
+            .unwrap();
+        config.providers[0].program = chmod.to_str().unwrap().to_owned();
+        config.providers[0].argv = vec!["0600".to_owned(), tracked.to_str().unwrap().to_owned()];
+        let patch = ScratchPatch::new(vec![ScratchChange::Write {
+            path: "tracked.txt".to_owned(),
+            contents: b"after".to_vec(),
+        }])
+        .unwrap();
+        let mut scratch = ScratchWorkspace::stage(
+            repository.path(),
+            &["tracked.txt"],
+            ScratchLimits::default(),
+        )
+        .unwrap();
+        scratch.apply_for_verification(&patch).unwrap();
+
+        let error =
+            execute_patch_verification(&config, repository.path(), &scratch, &patch).unwrap_err();
+
+        assert!(matches!(error, super::ReadOnlyRunError::RepositoryMutation));
+        assert_eq!(
+            fs::read(scratch.path().join("tracked.txt")).unwrap(),
+            b"after"
+        );
+        scratch.cleanup().unwrap();
     }
 
     #[test]

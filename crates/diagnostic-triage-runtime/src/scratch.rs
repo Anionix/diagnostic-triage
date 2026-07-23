@@ -601,6 +601,17 @@ impl ScratchWorkspace {
         })
     }
 
+    pub(crate) fn capture_applied(
+        &self,
+        patch: &ScratchPatch,
+        result_execution_id: Option<ObjectId>,
+    ) -> Result<ScratchEvidence, ScratchError> {
+        if self.applied.is_none() {
+            return Err(ScratchError::PatchNotApplied);
+        }
+        self.capture(patch, result_execution_id)
+    }
+
     /// Apply an unverified patch transactionally to this private workspace for Provider checks.
     ///
     /// The original repository is never written. The immutable base Evidence remains available
@@ -843,6 +854,8 @@ pub enum ScratchError {
     PatchEvidenceMismatch,
     #[error("a patch was already applied to this private workspace")]
     PatchAlreadyApplied,
+    #[error("the private workspace has no applied patch to verify")]
+    PatchNotApplied,
     #[error("candidate patch evidence is not complete inline PATCH evidence")]
     InvalidPatchEvidence,
     #[error("safe-fix verification input is invalid: {source}")]
