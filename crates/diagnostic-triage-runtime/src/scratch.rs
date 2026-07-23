@@ -298,6 +298,7 @@ impl SafeFixAuthorization {
 struct AppliedScratchState {
     patch_sha256: Sha256Digest,
     result_sha256: Sha256Digest,
+    authorization_consumed: bool,
 }
 
 #[derive(Debug)]
@@ -771,7 +772,31 @@ impl ScratchWorkspace {
         let encoded_patch = patch.encode()?;
         validate_patch_evidence(candidate, patch_evidence, &encoded_patch)?;
 
-        self.apply_to_private_workspace(patch, patch_evidence.sha256.clone())
+        if self
+            .applied
+            .as_ref()
+            .is_some_and(|applied| applied.authorization_consumed)
+        {
+            return Err(ScratchError::AuthorizationAlreadyConsumed);
+        }
+        if self.applied.is_some() {
+            self.validate_source_unchanged()?;
+            self.capture_applied(patch, None)?;
+            let Some(applied) = self.applied.as_mut() else {
+                return Err(ScratchError::PatchNotApplied);
+            };
+            applied.authorization_consumed = true;
+            return Ok(PatchApplication::Applied {
+                patch_sha256: patch_evidence.sha256.clone(),
+                base_snapshot_sha256: self.base.sha256.clone(),
+            });
+        }
+
+        let result = self.apply_to_private_workspace(patch, patch_evidence.sha256.clone());
+        if let Some(applied) = &mut self.applied {
+            applied.authorization_consumed = true;
+        }
+        result
     }
 
     fn apply_to_private_workspace(
@@ -824,6 +849,7 @@ impl ScratchWorkspace {
         self.applied = Some(AppliedScratchState {
             patch_sha256,
             result_sha256,
+            authorization_consumed: false,
         });
         let cleanup_result = old_tempdir.close();
         #[cfg(all(test, unix))]
@@ -897,6 +923,8 @@ pub enum ScratchError {
     PatchEvidenceMismatch,
     #[error("a patch was already applied to this private workspace")]
     PatchAlreadyApplied,
+    #[error("the verified safe-fix authorization was already consumed")]
+    AuthorizationAlreadyConsumed,
     #[error("the private workspace has no applied patch to verify")]
     PatchNotApplied,
     #[error("candidate patch evidence is not complete inline PATCH evidence")]
