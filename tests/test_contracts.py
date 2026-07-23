@@ -265,7 +265,7 @@ def validate_execution(execution: dict[str, Any]) -> None:
     if isinstance(run_duration, int) and performance["status"] != "NOT_EVALUATED":
         expected_status = (
             "IMPROVEMENT_CANDIDATE"
-            if run_duration > performance["budget_ms"]
+            if run_duration >= performance["budget_ms"]
             else "WITHIN_BUDGET"
         )
         if performance["status"] != expected_status:
@@ -1442,6 +1442,25 @@ class ContractTest(unittest.TestCase):
                 for execution in required_executions
             )
         )
+
+    def test_execution_performance_budget_is_inclusive(self) -> None:
+        for run_duration, status in (
+            (59_999, "WITHIN_BUDGET"),
+            (60_000, "IMPROVEMENT_CANDIDATE"),
+            (60_001, "IMPROVEMENT_CANDIDATE"),
+        ):
+            validate_execution(
+                {
+                    "phases_ms": {
+                        "queue": "UNAVAILABLE",
+                        "setup": "UNAVAILABLE",
+                        "run": run_duration,
+                        "normalize": "UNAVAILABLE",
+                        "total": "UNAVAILABLE",
+                    },
+                    "performance": {"status": status, "budget_ms": 60_000},
+                }
+            )
 
     def test_report_semantic_invariants(self) -> None:
         report = load_json(FIXTURE_DIR / "valid-report.json")

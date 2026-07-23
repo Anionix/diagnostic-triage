@@ -33,7 +33,7 @@ pub(crate) fn validated_provider_execution(
         input
             .run_duration_ms
             .map_or(PerformanceStatus::NotEvaluated, |duration| {
-                if duration > PERFORMANCE_BUDGET_MS {
+                if duration >= PERFORMANCE_BUDGET_MS {
                     PerformanceStatus::ImprovementCandidate
                 } else {
                     PerformanceStatus::WithinBudget
@@ -144,7 +144,8 @@ mod tests {
     #[test]
     fn evaluates_only_the_run_duration_against_budget() {
         for (duration, expected) in [
-            (Some(60_000), PerformanceStatus::WithinBudget),
+            (Some(59_999), PerformanceStatus::WithinBudget),
+            (Some(60_000), PerformanceStatus::ImprovementCandidate),
             (Some(60_001), PerformanceStatus::ImprovementCandidate),
             (None, PerformanceStatus::NotEvaluated),
         ] {

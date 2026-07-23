@@ -1320,7 +1320,7 @@ impl Performance {
             return Err(model_error("performance budget must be 1..=600000 ms"));
         }
         if let PhaseDuration::Milliseconds(run) = run {
-            let expected = if *run > self.budget_ms {
+            let expected = if *run >= self.budget_ms {
                 PerformanceStatus::ImprovementCandidate
             } else {
                 PerformanceStatus::WithinBudget
@@ -1508,8 +1508,9 @@ impl SessionReport {
 #[cfg(test)]
 mod tests {
     use super::{
-        Evidence, EvidenceSchemaVersion, PhaseDuration, SessionReport, Sha256Digest,
-        ToolchainFingerprint, Unavailable, VerificationAttribution, is_valid_rfc3339_datetime,
+        Evidence, EvidenceSchemaVersion, Performance, PerformanceStatus, PhaseDuration,
+        SessionReport, Sha256Digest, ToolchainFingerprint, Unavailable, VerificationAttribution,
+        is_valid_rfc3339_datetime,
     };
 
     #[test]
@@ -1545,6 +1546,22 @@ mod tests {
             serde_json::to_string(&PhaseDuration::Unavailable(Unavailable::Value)).unwrap(),
             "\"UNAVAILABLE\""
         );
+    }
+
+    #[test]
+    fn performance_budget_is_inclusive() {
+        for (run, status) in [
+            (59_999, PerformanceStatus::WithinBudget),
+            (60_000, PerformanceStatus::ImprovementCandidate),
+            (60_001, PerformanceStatus::ImprovementCandidate),
+        ] {
+            Performance {
+                status,
+                budget_ms: 60_000,
+            }
+            .validate(&PhaseDuration::Milliseconds(run))
+            .unwrap();
+        }
     }
 
     #[test]
