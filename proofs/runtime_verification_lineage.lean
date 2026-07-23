@@ -3,7 +3,8 @@ LLM contract: PATCH_APPLIED -> VERIFY_PLANNED -> PROVIDER_TARGETS_VALIDATED ->
 SOURCE_LINEAGE_VALIDATED -> PROVIDERS_PREFLIGHTED -> PROVIDERS_REAPED -> RESULT_RECAPTURED.
 
 Proof contract: ordered base, patch, and result identity plus an exhaustive
-original-read-only or scratch-mutable isolation partition.
+original-read-only or scratch-mutable isolation partition. Repository state
+equality binds HEAD, index, tracked, and all untracked state.
 Source: https://github.com/Anionix/diagnostic-triage/issues/82
 -/
 structure VerifyIdentity where
@@ -31,3 +32,14 @@ theorem isolation_state_partition (state : IsolationState) :
     (state = .original ∧ mayMutate state = false) ∨
     (state = .scratch ∧ mayMutate state = true) := by
   cases state <;> simp [mayMutate]
+
+structure RepositoryState where
+  head : String
+  index : String
+  tracked : String
+  untracked : String
+
+theorem changed_untracked_changes_state (before after : RepositoryState)
+    (changed : before.untracked ≠ after.untracked) : before ≠ after := by
+  intro same
+  exact changed (congrArg RepositoryState.untracked same)

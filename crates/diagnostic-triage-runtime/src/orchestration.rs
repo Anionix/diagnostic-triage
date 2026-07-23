@@ -222,9 +222,9 @@ pub(crate) enum ReadOnlyRunError {
     RepositoryStateProcess(#[source] ProcessError),
     #[error("repository state command failed: state={0:?}, exit_code={1:?}")]
     RepositoryStateCommand(ProcessState, Option<u8>),
-    #[error("tracked repository entry cannot be checked safely")]
-    RepositoryTrackedEntry,
-    #[error("configured Provider mutated tracked repository state")]
+    #[error("repository entry cannot be checked safely")]
+    RepositoryStateEntry,
+    #[error("configured Provider mutated source repository state")]
     RepositoryMutation,
     #[error("FIX and VERIFY require an isolated scratch workspace")]
     IsolatedModeRequired,
@@ -546,13 +546,16 @@ pub(crate) fn execute_patch_verification(
     run_result
 }
 
-type RepositoryState = [Vec<u8>; 3];
+type RepositoryState = [Vec<u8>; 4];
 
 fn capture_repository_state(repository_root: &Path) -> Result<RepositoryState, ReadOnlyRunError> {
+    // LLM contract: REPOSITORY_DISCOVERED -> HEAD_BOUND -> INDEX_BOUND ->
+    // TRACKED_BOUND -> UNTRACKED_BOUND; any before/after component change -> REJECTED.
     Ok([
         run_git(repository_root, &["rev-parse", "--verify", "HEAD"])?,
         run_git(repository_root, &["ls-files", "--stage", "-v", "-z"])?,
         raw_tracked_state(repository_root)?,
+        raw_untracked_state(repository_root)?,
     ])
 }
 
@@ -562,6 +565,28 @@ fn run_git(repository_root: &Path, argv: &[&str]) -> Result<Vec<u8>, ReadOnlyRun
 
 fn raw_tracked_state(repository_root: &Path) -> Result<Vec<u8>, ReadOnlyRunError> {
     let paths = run_git(repository_root, &["ls-files", "-z"])?;
+    raw_path_state(repository_root, &paths)
+}
+
+fn raw_untracked_state(repository_root: &Path) -> Result<Vec<u8>, ReadOnlyRunError> {
+    let mut paths = run_git(
+        repository_root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )?;
+    paths.extend(run_git(
+        repository_root,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+        ],
+    )?);
+    raw_path_state(repository_root, &paths)
+}
+
+fn raw_path_state(repository_root: &Path, paths: &[u8]) -> Result<Vec<u8>, ReadOnlyRunError> {
     let mut input = Vec::new();
     let mut state = Vec::new();
     for raw in paths
@@ -569,9 +594,9 @@ fn raw_tracked_state(repository_root: &Path) -> Result<Vec<u8>, ReadOnlyRunError
         .filter(|path| !path.is_empty())
     {
         let relative =
-            std::str::from_utf8(raw).map_err(|_| ReadOnlyRunError::RepositoryTrackedEntry)?;
+            std::str::from_utf8(raw).map_err(|_| ReadOnlyRunError::RepositoryStateEntry)?;
         if relative.contains('\n') {
-            return Err(ReadOnlyRunError::RepositoryTrackedEntry);
+            return Err(ReadOnlyRunError::RepositoryStateEntry);
         }
         let path = repository_root.join(relative);
         match fs::symlink_metadata(&path) {
@@ -590,14 +615,14 @@ fn raw_tracked_state(repository_root: &Path) -> Result<Vec<u8>, ReadOnlyRunError
                 state.push(0);
                 let target =
                     fs::read_link(&path).map_err(|source| ReadOnlyRunError::WorkspaceIo {
-                        operation: "read tracked symbolic link",
+                        operation: "read repository symbolic link",
                         path,
                         source,
                     })?;
                 state.extend_from_slice(
                     target
                         .to_str()
-                        .ok_or(ReadOnlyRunError::RepositoryTrackedEntry)?
+                        .ok_or(ReadOnlyRunError::RepositoryStateEntry)?
                         .as_bytes(),
                 );
                 state.push(0);
@@ -609,12 +634,12 @@ fn raw_tracked_state(repository_root: &Path) -> Result<Vec<u8>, ReadOnlyRunError
             }
             Err(source) => {
                 return Err(ReadOnlyRunError::WorkspaceIo {
-                    operation: "inspect tracked repository state",
+                    operation: "inspect repository state",
                     path,
                     source,
                 });
             }
-            Ok(_) => return Err(ReadOnlyRunError::RepositoryTrackedEntry),
+            Ok(_) => return Err(ReadOnlyRunError::RepositoryStateEntry),
         }
     }
     state.extend(run_git_input(
@@ -1982,6 +2007,53 @@ mod tests {
     }
 
     #[test]
+    fn patch_verification_detects_untracked_content_mutation() {
+        for ignored in [false, true] {
+            let repository = tempdir().unwrap();
+            fs::write(repository.path().join("tracked.txt"), b"before").unwrap();
+            if ignored {
+                fs::write(repository.path().join(".gitignore"), b"provider-output\n").unwrap();
+            }
+            init_git(repository.path());
+            let untracked = repository.path().join("provider-output");
+            fs::write(&untracked, b"before").unwrap();
+            let source = tempdir().unwrap();
+            let replacement = source.path().join("replacement");
+            fs::write(&replacement, b"after").unwrap();
+            let mut config = config("tracked.txt");
+            config.providers.truncate(1);
+            let copy = env::split_paths(&env::var_os("PATH").unwrap())
+                .map(|directory| directory.join("cp"))
+                .find(|candidate| candidate.is_file())
+                .unwrap();
+            config.providers[0].program = copy.to_str().unwrap().to_owned();
+            config.providers[0].argv = vec![
+                replacement.to_str().unwrap().to_owned(),
+                untracked.to_str().unwrap().to_owned(),
+            ];
+            let patch = ScratchPatch::new(vec![ScratchChange::Write {
+                path: "tracked.txt".to_owned(),
+                contents: b"after".to_vec(),
+            }])
+            .unwrap();
+            let mut scratch = ScratchWorkspace::stage(
+                repository.path(),
+                &["tracked.txt"],
+                ScratchLimits::default(),
+            )
+            .unwrap();
+            scratch.apply_for_verification(&patch).unwrap();
+
+            let error = execute_patch_verification(&config, repository.path(), &scratch, &patch)
+                .unwrap_err();
+
+            assert!(matches!(error, super::ReadOnlyRunError::RepositoryMutation));
+            assert_eq!(fs::read(untracked).unwrap(), b"after");
+            scratch.cleanup().unwrap();
+        }
+    }
+
+    #[test]
     fn executes_absolute_provider_under_trusted_repository_root() {
         let repository = tempdir().unwrap();
         let mut config = config("src");
@@ -2117,13 +2189,17 @@ mod tests {
             "orchestration::tests::provider_launch_probe".to_owned(),
         ];
 
-        execute_read_only_plan(
+        let launched = execute_read_only_plan(
             &config,
             repository.path(),
             &Sha256Digest::compute(b"repository"),
             ReadOnlyMode::Check,
         )
-        .unwrap();
+        .unwrap_err();
+        assert!(matches!(
+            launched,
+            super::ReadOnlyRunError::RepositoryMutation
+        ));
         assert!(repository.path().join("provider-launched").is_file());
         fs::remove_file(repository.path().join("provider-launched")).unwrap();
 
