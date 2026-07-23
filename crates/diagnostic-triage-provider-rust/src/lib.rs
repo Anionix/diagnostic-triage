@@ -226,10 +226,40 @@ fn execute_with_program(request: &RequestEnvelope, program: &Path) -> ProviderRe
         Ok(scope) => scope,
         Err(error) => return incomplete(request, Vec::new(), Duration::ZERO, error.to_string()),
     };
+    let verification_target = if request.operation == Operation::Verify {
+        match VerificationTargetDir::new(&repository_root, &request.request_id) {
+            Ok(target) => target,
+            Err(error) => {
+                return incomplete(request, Vec::new(), Duration::ZERO, error.to_string());
+            }
+        }
+    } else {
+        VerificationTargetDir::disabled()
+    };
+    let response = execute_in_workspace(
+        request,
+        program,
+        &repository_root,
+        &workspace_root,
+        &scope,
+        verification_target.path(),
+    );
+    finalize_verification_target(verification_target, request, response)
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_in_workspace(
+    request: &RequestEnvelope,
+    program: &Path,
+    repository_root: &Path,
+    workspace_root: &Path,
+    scope: &CargoScope,
+    target_dir: Option<&Path>,
+) -> ProviderResponse {
     let diagnostic_scope = DiagnosticScope {
-        cargo: &scope,
-        repository_root: &repository_root,
-        workspace_root: &workspace_root,
+        cargo: scope,
+        repository_root,
+        workspace_root,
     };
 
     let started = Instant::now();
@@ -242,7 +272,7 @@ fn execute_with_program(request: &RequestEnvelope, program: &Path) -> ProviderRe
         request,
         program,
         &["--version".to_owned()],
-        &workspace_root,
+        workspace_root,
         started,
         usage,
     ) {
@@ -283,8 +313,8 @@ fn execute_with_program(request: &RequestEnvelope, program: &Path) -> ProviderRe
     let check_outcome = match run_step(
         request,
         program,
-        &cargo_argv("check", &scope),
-        &workspace_root,
+        &cargo_argv("check", scope, target_dir),
+        workspace_root,
         started,
         usage,
     ) {
@@ -328,7 +358,7 @@ fn execute_with_program(request: &RequestEnvelope, program: &Path) -> ProviderRe
         request,
         program,
         &["clippy".to_owned(), "--version".to_owned()],
-        &workspace_root,
+        workspace_root,
         started,
         usage,
     ) {
@@ -359,8 +389,8 @@ fn execute_with_program(request: &RequestEnvelope, program: &Path) -> ProviderRe
     let clippy_outcome = match run_step(
         request,
         program,
-        &cargo_argv("clippy", &scope),
-        &workspace_root,
+        &cargo_argv("clippy", scope, target_dir),
+        workspace_root,
         started,
         usage,
     ) {
@@ -475,6 +505,83 @@ fn parse_version(bytes: &[u8], expected_name: &str) -> Result<String, String> {
     Ok(version.unwrap_or_default().to_owned())
 }
 
+#[derive(Debug)]
+struct VerificationTargetDir {
+    path: Option<PathBuf>,
+}
+
+impl VerificationTargetDir {
+    const fn disabled() -> Self {
+        Self { path: None }
+    }
+
+    fn new(repository_root: &Path, request_id: &ObjectId) -> io::Result<Self> {
+        let root = std::fs::canonicalize(std::env::temp_dir())?;
+        if root.starts_with(repository_root) {
+            return Err(io::Error::other("temporary directory is inside repository"));
+        }
+        for attempt in 0..64 {
+            let path = root.join(format!(
+                "diagnostic-triage-cargo-{}-{request_id}-{attempt}",
+                std::process::id()
+            ));
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            match builder.create(&path) {
+                Ok(()) => return Ok(Self { path: Some(path) }),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::ErrorKind::AlreadyExists.into())
+    }
+
+    fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+
+    fn close(mut self) -> io::Result<()> {
+        let Some(path) = self.path.take() else {
+            return Ok(());
+        };
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.path = Some(path);
+                Err(error)
+            }
+        }
+    }
+}
+
+fn finalize_verification_target(
+    target: VerificationTargetDir,
+    request: &RequestEnvelope,
+    response: ProviderResponse,
+) -> ProviderResponse {
+    match target.close() {
+        Ok(()) => response,
+        Err(error) => incomplete(
+            request,
+            Vec::new(),
+            std::time::Duration::ZERO,
+            format!("cleanup Cargo verification target: {error}"),
+        ),
+    }
+}
+
+impl Drop for VerificationTargetDir {
+    fn drop(&mut self) {
+        if let Some(Err(error)) = self.path.take().map(std::fs::remove_dir_all) {
+            eprintln!("Cargo verification target cleanup retry failed: {error}");
+        }
+    }
+}
+
 // Cargo scope state is selected before execution so observations stay within the requested
 // workspace or manifest; invalid or unsupported scope terminates as INCOMPLETE | UNSUPPORTED.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -492,8 +599,11 @@ struct DiagnosticScope<'a> {
     workspace_root: &'a Path,
 }
 
-fn cargo_argv(command: &str, scope: &CargoScope) -> Vec<String> {
+fn cargo_argv(command: &str, scope: &CargoScope, target_dir: Option<&Path>) -> Vec<String> {
     let mut argv = vec![command.to_owned()];
+    if let Some(target_dir) = target_dir {
+        argv.extend(["--target-dir".to_owned(), target_dir.display().to_string()]);
+    }
     match scope {
         CargoScope::Workspace => argv.push("--workspace".to_owned()),
         CargoScope::Manifest { manifest, .. } => {
@@ -930,11 +1040,11 @@ fn select_cargo_scope(
 }
 
 fn unsupported_request(request: &RequestEnvelope) -> Option<String> {
-    if request.operation != Operation::Check {
-        return Some("Rust Provider supports only CHECK".to_owned());
+    if !matches!(request.operation, Operation::Check | Operation::Verify) {
+        return Some("Rust Provider supports only CHECK and VERIFY".to_owned());
     }
     if !capability_requested(request, CHECK_CAPABILITY) {
-        return Some("CHECK requires diagnostic.check/v1".to_owned());
+        return Some("diagnostic operation requires diagnostic.check/v1".to_owned());
     }
     request
         .required_capabilities
@@ -1315,7 +1425,8 @@ mod tests {
             Severity, Tool,
         },
         protocol::{
-            EnvelopeKind, ObservationEnvelope, ProtocolEnvelope, ProtocolVersion, RequestEnvelope,
+            EnvelopeKind, ObservationEnvelope, Operation, ProtocolEnvelope, ProtocolVersion,
+            RequestEnvelope,
         },
     };
     use std::{
@@ -1323,6 +1434,7 @@ mod tests {
         io::Cursor,
         path::{Path, PathBuf},
         sync::atomic::{AtomicU64, Ordering},
+        time::Instant,
     };
 
     const MEMBER_SCOPE: &str = "crates/diagnostic-triage-provider-rust";
@@ -1453,8 +1565,8 @@ mod tests {
         let root = repository_root();
         let scope = select_cargo_scope(&request(), &root, &root).unwrap();
         assert_eq!(scope, CargoScope::Workspace);
-        let check = cargo_argv("check", &scope);
-        let clippy = cargo_argv("clippy", &scope);
+        let check = cargo_argv("check", &scope, None);
+        let clippy = cargo_argv("clippy", &scope, None);
         assert_eq!(
             check,
             [
@@ -1466,6 +1578,56 @@ mod tests {
             ]
         );
         assert_eq!(&check[1..], &clippy[1..]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_uses_and_removes_an_external_cargo_target() {
+        let fake = FakeCargo::from_body(
+            r#"
+if [ "$1" = "--version" ]; then printf 'cargo 1.93.1 (fixture)\n'; exit 0; fi
+if [ "$1" = "clippy" ] && [ "$2" = "--version" ]; then printf 'clippy 0.1.93 (fixture)\n'; exit 0; fi
+if [ "$1" = "check" ] || [ "$1" = "clippy" ]; then
+  if [ "$2" != "--target-dir" ]; then exit 92; fi
+  printf '%s\n' "$3" > "$0.target"
+  mkdir -p "$3" && printf artifact > "$3/artifact"
+  printf '%s\n' '{"reason":"build-finished","success":true}'
+  exit 0
+fi
+exit 91
+"#,
+        );
+        let mut request = request();
+        request.operation = Operation::Verify;
+        let id = &request.request_id;
+        let collision = std::env::temp_dir().join(format!(
+            "diagnostic-triage-cargo-{}-{id}-0",
+            std::process::id()
+        ));
+        let _ignored = fs::remove_dir_all(&collision);
+        fs::create_dir(&collision).unwrap();
+
+        let response = execute_with_program(&request, &fake.program);
+        let target = fs::read_to_string(fake.program.with_extension("target")).unwrap();
+
+        assert_eq!(response.completion.status, ExecutionStatus::Complete);
+        assert_ne!(Path::new(target.trim()), collision);
+        assert!(!Path::new(target.trim()).starts_with(repository_root()));
+        assert!(!Path::new(target.trim()).exists());
+        fs::remove_dir(collision).unwrap();
+    }
+
+    #[test]
+    fn verify_cleanup_failure_is_incomplete() {
+        let request = request();
+        let complete = super::complete_or_event_limit(&request, Vec::new(), 0, Instant::now());
+        let target = super::VerificationTargetDir {
+            path: Some(repository_root().join("missing-verification-target")),
+        };
+
+        let response = super::finalize_verification_target(target, &request, complete);
+
+        assert_eq!(response.completion.status, ExecutionStatus::Incomplete);
     }
 
     #[test]
@@ -1481,8 +1643,8 @@ mod tests {
                 repository_path: MEMBER_SCOPE.parse().unwrap(),
             }
         );
-        let check = cargo_argv("check", &scope);
-        let clippy = cargo_argv("clippy", &scope);
+        let check = cargo_argv("check", &scope, None);
+        let clippy = cargo_argv("clippy", &scope, None);
         assert!(!check.contains(&"--workspace".to_owned()));
         assert_eq!(&check[1..], &clippy[1..]);
     }
