@@ -28,3 +28,9 @@ theorem valid_provider_state_yields_exactly_one_execution (state : ProviderState
 theorem invalid_provider_state_is_rejected (state : ProviderState) :
     synthesizeExecution .invalid state = .error .invalidInput := by
   rfl
+def synthesizeAll : List ProviderState -> List Execution
+  | [] => []
+  | state :: states => ⟨executionStatus state⟩ :: synthesizeAll states
+theorem valid_provider_list_yields_one_execution_per_provider (states : List ProviderState) :
+    (synthesizeAll states).length = states.length := by
+  induction states <;> simp [synthesizeAll, *]
