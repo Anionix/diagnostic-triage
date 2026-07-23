@@ -9,14 +9,21 @@ use std::{
 use diagnostic_triage_contracts::protocol::{
     EnvelopeKind, Operation, ProtocolEnvelope, ProtocolVersion, RequestEnvelope, RequestLimits,
 };
-use diagnostic_triage_contracts::{AdapterId, ContractError, ObjectId, RepoPath, Sha256Digest};
+use diagnostic_triage_contracts::{
+    AdapterId, ContractError, Nullable, ObjectId, RepoPath, Sha256Digest,
+    model::{AdapterKind, Execution, ExecutionStatus, Tool},
+};
 use diagnostic_triage_engine::{EngineError, deterministic_object_id};
 use thiserror::Error;
 
 use crate::{
     config::{ConfigError, ProviderConfig, RuntimeConfig},
+    execution::{ProviderExecutionInput, validated_provider_execution},
+    execution_identity as identity,
     process::ProcessSpec,
-    session::{ProviderSessionError, ProviderSessionOutcome, run_provider_session},
+    session::{
+        ProviderSessionError, ProviderSessionOutcome, ProviderSessionState, run_provider_session,
+    },
 };
 
 // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED -> REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
@@ -24,6 +31,8 @@ use crate::{
 const PLAN_ID_DOMAIN: &str = "diagnostic-triage.runtime-plan/v1";
 const REQUEST_ID_DOMAIN: &str = "diagnostic-triage.runtime-request/v1";
 const EXECUTION_ID_DOMAIN: &str = "diagnostic-triage.runtime-execution/v1";
+const MAX_EXECUTION_MESSAGE_CHARS: usize = 8_192;
+const EMPTY_EXECUTION_MESSAGE: &str = "provider session ended without a reason";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadOnlyMode {
@@ -156,6 +165,16 @@ pub(crate) enum ReadOnlyRunError {
         #[source]
         source: ProviderSessionError,
     },
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum ProviderExecutionError {
+    #[error("provider {0} projection identity mismatch: {1:?}")]
+    Mismatch(AdapterId, identity::ProviderIdentityMismatch),
+    #[error("provider tool duration is out of range")]
+    Duration,
+    #[error(transparent)]
+    Contract(#[from] ContractError),
 }
 
 pub(crate) fn build_read_only_plan(
@@ -300,6 +319,93 @@ fn canonical_existing_ancestor(
     }
 }
 
+fn synthesize_execution(
+    planned: &PlannedProvider,
+    state: &ProviderSessionState,
+) -> Result<Execution, ProviderExecutionError> {
+    use ProviderSessionState as State;
+    use identity::ExpectedCompletion as Completion;
+
+    let (status, session, completion, exit_code) = match state {
+        State::Complete(session) => (
+            ExecutionStatus::Complete,
+            Some(session.as_ref()),
+            Completion::Complete,
+            session.completion.tool_exit_code.clone(),
+        ),
+        State::Incomplete {
+            reason,
+            validated_session,
+        } => (
+            ExecutionStatus::Incomplete,
+            validated_session.as_deref(),
+            Completion::Incomplete(reason),
+            Nullable(None),
+        ),
+        State::Unsupported {
+            reason,
+            validated_session,
+            ..
+        } => (
+            ExecutionStatus::Unsupported,
+            validated_session.as_deref(),
+            Completion::Unsupported(reason),
+            Nullable(None),
+        ),
+    };
+    if let Some(session) = session {
+        identity::validate_provider_execution_identity(
+            &identity::ProviderExecutionIdentity {
+                request: &planned.request,
+                adapter_id: &planned.config.adapter_id,
+                adapter_version: &planned.config.adapter_version,
+                adapter_kind: AdapterKind::Provider,
+                tool_name: &planned.config.tool_name,
+                tool_version: &planned.config.tool_version,
+                completion,
+            },
+            session,
+        )
+        .map_err(|mismatch| {
+            ProviderExecutionError::Mismatch(planned.config.adapter_id.clone(), mismatch)
+        })?;
+    }
+    let run_ms = session
+        .map(|value| {
+            u32::try_from(value.completion.tool_duration_ms)
+                .map_err(|_| ProviderExecutionError::Duration)
+        })
+        .transpose()?;
+    let message = match completion {
+        Completion::Complete => session.and_then(|value| value.completion.message.clone()),
+        Completion::Incomplete(reason) | Completion::Unsupported(reason) => {
+            Some(bounded_message(reason))
+        }
+    };
+    validated_provider_execution(ProviderExecutionInput {
+        execution_id: planned.execution_id.clone(),
+        adapter_id: planned.config.adapter_id.clone(),
+        tool: Tool {
+            name: planned.config.tool_name.clone(),
+            version: planned.config.tool_version.clone(),
+            rule_id: None,
+        },
+        required: planned.config.required,
+        status,
+        exit_code,
+        message,
+        run_duration_ms: run_ms,
+    })
+    .map_err(ProviderExecutionError::from)
+}
+
+fn bounded_message(message: &str) -> String {
+    match message {
+        "" => EMPTY_EXECUTION_MESSAGE.to_owned(),
+        value => value.chars().take(MAX_EXECUTION_MESSAGE_CHARS).collect(),
+    }
+}
+
 fn resolve_workspace(
     repository_root: &Path,
     workspace: &diagnostic_triage_contracts::RepoPath,
@@ -374,14 +480,20 @@ mod tests {
     use std::{env, fs};
 
     use super::{
-        ReadOnlyMode, build_read_only_plan, execute_read_only_plan, resolve_provider_program,
-        resolve_workspace,
+        PlannedProvider, ReadOnlyMode, build_read_only_plan, execute_read_only_plan,
+        resolve_provider_program, resolve_workspace, synthesize_execution,
     };
     use crate::{RuntimeConfig, session::ProviderSessionState};
-    use diagnostic_triage_contracts::{Sha256Digest, protocol::Operation};
+    use diagnostic_triage_contracts::{
+        Sha256Digest, ValidatedSession,
+        model::{Execution, ExecutionStatus, PhaseDuration},
+        protocol::Operation,
+        validate_session_jsonl,
+    };
     use tempfile::tempdir;
 
     const REVISION: &str = "a12b34c56d78e90f1234567890abcdef12345678";
+    const SESSION_JSONL: &str = include_str!("../../../tests/fixtures/v1/valid-session.jsonl");
     const ALPHA: &str = "[[providers]]\nadapter_id=\"alpha\"\nadapter_version=\"1\"\ntool_name=\"ruff\"\ntool_version=\"0.12\"\nprogram=\"provider\"\nargv=[\"--stdio\"]\nrequired=true\nrequired_capabilities=[\"diagnostic.fix/v1\",\"diagnostic.check/v1\"]\noptional_capabilities=[\"diagnostic.metadata/v1\"]";
     const ZETA: &str = "[[providers]]\nadapter_id=\"zeta\"\nadapter_version=\"1\"\ntool_name=\"ruff\"\ntool_version=\"0.12\"\nprogram=\"provider\"\nargv=[\"--stdio\"]\nrequired=true\nrequired_capabilities=[\"diagnostic.fix/v1\",\"diagnostic.check/v1\"]\noptional_capabilities=[\"diagnostic.metadata/v1\"]";
 
@@ -392,6 +504,84 @@ mod tests {
              [limits]\ntimeout_ms=1234\nmax_stdout_bytes=321\nmax_stderr_bytes=654\nmax_evidence_bytes=777\nmax_events=8"
         ))
         .expect("valid plan config")
+    }
+
+    fn execution_fixture() -> (PlannedProvider, ValidatedSession) {
+        let session = validate_session_jsonl(SESSION_JSONL.as_bytes()).unwrap();
+        let mut config = config("src").providers.remove(0);
+        config.adapter_id = session.manifest.adapter.id.clone();
+        config.adapter_version = session.manifest.adapter.version.clone();
+        config.tool_name = "ruff".to_owned();
+        config.tool_version = "0.12.4".to_owned();
+        let planned = PlannedProvider {
+            config,
+            request: session.request.clone(),
+            execution_id: "019f7e95-0000-7000-8000-000000000009".parse().unwrap(),
+        };
+        (planned, session)
+    }
+
+    fn fixture_terminal(status: &str) -> ValidatedSession {
+        let input = SESSION_JSONL.replace(
+            "\"status\":\"COMPLETE\",\"tool_exit_code\":1",
+            &format!("\"status\":\"{status}\",\"tool_exit_code\":null,\"message\":\"terminal\""),
+        );
+        validate_session_jsonl(input.as_bytes()).unwrap()
+    }
+
+    fn project(planned: &PlannedProvider, state: &ProviderSessionState) -> Execution {
+        synthesize_execution(planned, state).unwrap()
+    }
+
+    #[test]
+    fn synthesizes_execution_only_from_planned_identity_and_session_state() {
+        let (planned, session) = execution_fixture();
+        let complete = project(
+            &planned,
+            &ProviderSessionState::Complete(Box::new(session.clone())),
+        );
+        assert_eq!(complete.execution_id, planned.execution_id);
+        assert_eq!(complete.adapter_id, planned.config.adapter_id);
+        assert_eq!(complete.tool.name, planned.config.tool_name);
+        assert!(complete.required);
+        assert_eq!(complete.status, ExecutionStatus::Complete);
+        assert_eq!(complete.exit_code.0, Some(1));
+        assert_eq!(complete.phases_ms.run, PhaseDuration::Milliseconds(184));
+
+        let terminal = fixture_terminal("INCOMPLETE");
+        let incomplete = project(
+            &planned,
+            &ProviderSessionState::Incomplete {
+                reason: "terminal".to_owned(),
+                validated_session: Some(Box::new(terminal)),
+            },
+        );
+        assert_eq!(incomplete.status, ExecutionStatus::Incomplete);
+        assert_eq!(incomplete.exit_code.0, None);
+        assert_eq!(incomplete.phases_ms.run, PhaseDuration::Milliseconds(184));
+
+        let unsupported = project(
+            &planned,
+            &ProviderSessionState::Unsupported {
+                missing_required: Vec::new(),
+                reason: "x".repeat(9_000),
+                validated_session: None,
+            },
+        );
+        assert_eq!(unsupported.message.unwrap().chars().count(), 8_192);
+        assert_eq!(
+            unsupported.phases_ms.run,
+            PhaseDuration::Unavailable(diagnostic_triage_contracts::model::Unavailable::Value)
+        );
+
+        assert_eq!(super::bounded_message(""), super::EMPTY_EXECUTION_MESSAGE);
+        let mut overflow = session;
+        overflow.completion.tool_duration_ms = u64::MAX;
+        let state = ProviderSessionState::Complete(Box::new(overflow));
+        assert!(matches!(
+            synthesize_execution(&planned, &state),
+            Err(super::ProviderExecutionError::Duration)
+        ));
     }
 
     #[test]
