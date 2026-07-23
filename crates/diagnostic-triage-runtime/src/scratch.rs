@@ -304,6 +304,7 @@ struct AppliedScratchState {
 pub struct ScratchWorkspace {
     tempdir: TempDir,
     repo_root: PathBuf,
+    selected_paths: Vec<String>,
     workspace_nonce: Uuid,
     base: Evidence,
     applied: Option<AppliedScratchState>,
@@ -393,6 +394,7 @@ impl ScratchWorkspace {
         Ok(Self {
             tempdir,
             repo_root,
+            selected_paths: normalized_paths,
             workspace_nonce: Uuid::now_v7(),
             base,
             applied: None,
@@ -404,6 +406,27 @@ impl ScratchWorkspace {
     #[must_use]
     pub fn path(&self) -> &Path {
         self.tempdir.path()
+    }
+
+    pub(crate) fn source_repository_root(&self) -> &Path {
+        &self.repo_root
+    }
+
+    pub(crate) fn contains_source_path(&self, value: &str) -> Result<bool, ScratchError> {
+        let path = PathBuf::from(normalize_user_path(value)?);
+        Ok(self
+            .selected_paths
+            .iter()
+            .any(|selected| selected == "." || path.starts_with(selected)))
+    }
+    pub(crate) fn validate_source_unchanged(&self) -> Result<(), ScratchError> {
+        let comparison = Self::stage(&self.repo_root, &self.selected_paths, self.limits)?;
+        let unchanged = comparison.base.sha256 == self.base.sha256;
+        comparison.cleanup()?;
+        if !unchanged {
+            return Err(ScratchError::BaseChanged);
+        }
+        Ok(())
     }
 
     /// Return the immutable base snapshot Evidence captured immediately after staging.

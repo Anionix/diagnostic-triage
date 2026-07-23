@@ -197,6 +197,8 @@ pub(crate) enum ReadOnlyRunError {
     },
     #[error("provider program path form is unsupported: {program}")]
     ProviderProgramUnsupported { program: PathBuf },
+    #[error("repo-relative provider program was not staged: {program}")]
+    ProviderProgramUnstaged { program: PathBuf },
     #[error("failed to resolve provider target {target}")]
     ProviderTargetIo {
         target: RepoPath,
@@ -222,6 +224,10 @@ pub(crate) enum ReadOnlyRunError {
     RepositoryTrackedEntry,
     #[error("configured Provider mutated tracked repository state")]
     RepositoryMutation,
+    #[error("FIX and VERIFY require an isolated scratch workspace")]
+    IsolatedModeRequired,
+    #[error("scratch workspace was staged from another repository")]
+    ScratchRepositoryMismatch,
     #[error("scratch verification boundary failed")]
     Scratch(#[from] ScratchError),
 }
@@ -355,6 +361,9 @@ pub(crate) fn execute_read_only_plan(
     repository_digest: &Sha256Digest,
     mode: ReadOnlyMode,
 ) -> Result<ExecutedReadOnlyPlan, ReadOnlyRunError> {
+    if matches!(mode, ReadOnlyMode::Fix | ReadOnlyMode::Verify) {
+        return Err(ReadOnlyRunError::IsolatedModeRequired);
+    }
     let plan = build_read_only_plan(config, repository_digest, mode)?;
     let workspace = resolve_workspace(repository_root, &config.repository.workspace)?;
     let ReadOnlyPlan {
@@ -387,6 +396,84 @@ pub(crate) fn execute_read_only_plan(
     if before != after {
         return Err(ReadOnlyRunError::RepositoryMutation);
     }
+    run_result
+}
+
+fn run_all_providers(
+    config: RuntimeConfig,
+    plan_id: ObjectId,
+    providers: Vec<PlannedProvider>,
+    programs: Vec<PathBuf>,
+    workspace: &ResolvedWorkspace,
+) -> Result<ExecutedReadOnlyPlan, ReadOnlyRunError> {
+    let mut executed = Vec::with_capacity(providers.len());
+    let mut first_error = None;
+    for (planned, program) in providers.into_iter().zip(programs) {
+        match planned.run(workspace, program) {
+            Ok(provider) => executed.push(provider),
+            Err(error) if first_error.is_none() => first_error = Some(error),
+            Err(_) => {}
+        }
+    }
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(ExecutedReadOnlyPlan {
+        config,
+        plan_id,
+        providers: executed,
+    })
+}
+
+pub(crate) fn execute_fix_plan(
+    config: &RuntimeConfig,
+    repository_root: &Path,
+    scratch: &ScratchWorkspace,
+) -> Result<ExecutedReadOnlyPlan, ReadOnlyRunError> {
+    let plan = build_read_only_plan(config, &scratch.base_evidence().sha256, ReadOnlyMode::Fix)?;
+    let original = resolve_workspace(repository_root, &config.repository.workspace)?;
+    if original.repository_root() != scratch.source_repository_root() {
+        return Err(ReadOnlyRunError::ScratchRepositoryMismatch);
+    }
+    let workspace = resolve_workspace(scratch.path(), &config.repository.workspace)?;
+    let ReadOnlyPlan {
+        config,
+        plan_id,
+        targets,
+        providers,
+    } = plan;
+    // LLM contract: FIX_PLANNED -> SCRATCH_BOUND -> PROVIDERS_REAPED -> MUTATION_BOUNDED;
+    // original-repository mutation or invalid scratch output -> REJECTED atomically.
+    validate_provider_targets(&workspace, &targets)?;
+    let original_before = capture_repository_state(original.repository_root())?;
+    scratch.validate_source_unchanged()?;
+    let empty = ScratchPatch::new(Vec::new())?;
+    if scratch.capture(&empty, None)?.result.sha256 != scratch.base_evidence().sha256 {
+        return Err(ScratchError::BaseChanged.into());
+    }
+    let programs = providers
+        .iter()
+        .map(|provider| {
+            let configured = &provider.config.program;
+            let path = Path::new(configured);
+            if !path.is_absolute()
+                && !is_bare_program_name(path)
+                && !scratch.contains_source_path(configured)?
+            {
+                return Err(ReadOnlyRunError::ProviderProgramUnstaged {
+                    program: path.into(),
+                });
+            }
+            resolve_provider_program(original.repository_root(), &provider.config.program)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let run_result = run_all_providers(config, plan_id, providers, programs, &workspace);
+    let scratch_after = scratch.capture(&empty, None);
+    let original_after = capture_repository_state(original.repository_root())?;
+    if original_before != original_after {
+        return Err(ReadOnlyRunError::RepositoryMutation);
+    }
+    scratch_after?;
     run_result
 }
 
@@ -1089,7 +1176,7 @@ mod tests {
     use super::{
         PatchVerificationError, PlannedProvider, ReadOnlyMode, ReadOnlyReportError,
         RuntimeProjectionError, assemble_read_only_report, authorize_canonical_ruff_verification,
-        build_read_only_plan, execute_patch_verification, execute_read_only_plan,
+        build_read_only_plan, execute_fix_plan, execute_patch_verification, execute_read_only_plan,
         preflight_projection_collections, project_patch_verification, project_provider_states,
         resolve_provider_program, resolve_workspace, synthesize_execution,
     };
@@ -1605,6 +1692,88 @@ mod tests {
     }
 
     #[test]
+    fn fix_provider_runs_only_in_bounded_scratch() {
+        let repository = tempdir().unwrap();
+        fs::write(repository.path().join("enable-launch-probe"), b"").unwrap();
+        fs::write(repository.path().join("tracked.txt"), b"original").unwrap();
+        fs::create_dir(repository.path().join("bin")).unwrap();
+        let provider = format!("provider{}", env::consts::EXE_SUFFIX);
+        fs::copy(
+            env::current_exe().unwrap(),
+            repository.path().join("bin").join(&provider),
+        )
+        .unwrap();
+        init_git(repository.path());
+        let stage = |paths: &[&str], limits| {
+            ScratchWorkspace::stage(repository.path(), paths, limits).unwrap()
+        };
+        let mut fix_config = config("tracked.txt");
+        fix_config.providers.truncate(1);
+        fix_config.providers[0]
+            .optional_capabilities
+            .push("fix.propose/v1".parse().unwrap());
+        fix_config.providers[0].program = format!("./bin/{provider}");
+        fix_config.providers[0].argv = vec![
+            "--ignored".to_owned(),
+            "--exact".to_owned(),
+            "orchestration::tests::provider_launch_probe".to_owned(),
+        ];
+        let scratch = stage(
+            &["enable-launch-probe", "tracked.txt"],
+            ScratchLimits::default(),
+        );
+        let provider_program = fix_config.providers[0].program.clone();
+        fix_config.providers[0].program = "./bin/missing-provider".to_owned();
+        fs::write(repository.path().join("tracked.txt"), b"stale source").unwrap();
+        assert!(matches!(
+            execute_fix_plan(&fix_config, repository.path(), &scratch),
+            Err(super::ReadOnlyRunError::Scratch(ScratchError::BaseChanged))
+        ));
+        fs::write(repository.path().join("tracked.txt"), b"original").unwrap();
+        fix_config.providers[0].program = provider_program;
+        assert!(matches!(
+            execute_fix_plan(&fix_config, repository.path(), &scratch),
+            Err(super::ReadOnlyRunError::ProviderProgramUnstaged { .. })
+        ));
+        scratch.cleanup().unwrap();
+        let scratch = stage(
+            &["bin", "enable-launch-probe", "tracked.txt"],
+            ScratchLimits::default(),
+        );
+        fs::write(scratch.path().join("tracked.txt"), b"stale scratch").unwrap();
+        assert!(matches!(
+            execute_fix_plan(&fix_config, repository.path(), &scratch),
+            Err(super::ReadOnlyRunError::Scratch(ScratchError::BaseChanged))
+        ));
+        fs::write(scratch.path().join("tracked.txt"), b"original").unwrap();
+        execute_fix_plan(&fix_config, repository.path(), &scratch).unwrap();
+        assert!(scratch.path().join("provider-launched").is_file());
+        assert!(!repository.path().join("provider-launched").exists());
+        fs::remove_file(scratch.path().join("provider-launched")).unwrap();
+        let mut reap_config = config("tracked.txt");
+        for provider in &mut reap_config.providers {
+            provider.optional_capabilities = fix_config.providers[0].optional_capabilities.clone();
+        }
+        reap_config.providers[0].program = "/definitely/missing/provider".to_owned();
+        reap_config.providers[1].program = fix_config.providers[0].program.clone();
+        reap_config.providers[1].argv = fix_config.providers[0].argv.clone();
+        let tight = ScratchLimits {
+            max_files: 3,
+            ..ScratchLimits::default()
+        };
+        let bounded = stage(&["bin", "enable-launch-probe", "tracked.txt"], tight);
+        assert!(matches!(
+            execute_fix_plan(&reap_config, repository.path(), &bounded),
+            Err(super::ReadOnlyRunError::Scratch(
+                ScratchError::BoundExceeded { .. }
+            ))
+        ));
+        assert!(bounded.path().join("provider-launched").is_file());
+        bounded.cleanup().unwrap();
+        scratch.cleanup().unwrap();
+    }
+
+    #[test]
     fn patch_verification_requires_apply_and_runs_against_the_bound_result() {
         let repository = tempdir().unwrap();
         fs::write(repository.path().join("tracked.txt"), b"before").unwrap();
@@ -1952,6 +2121,12 @@ mod tests {
     fn plans_are_canonical_domain_separated_and_input_sensitive() {
         let digest = Sha256Digest::compute(b"repository");
         let runtime_config = config("src");
+        for mode in [ReadOnlyMode::Fix, ReadOnlyMode::Verify] {
+            assert!(matches!(
+                execute_read_only_plan(&runtime_config, Path::new("."), &digest, mode),
+                Err(super::ReadOnlyRunError::IsolatedModeRequired)
+            ));
+        }
         let forward = build_read_only_plan(&runtime_config, &digest, ReadOnlyMode::Check).unwrap();
         let repeated = build_read_only_plan(&runtime_config, &digest, ReadOnlyMode::Check).unwrap();
         let mut reversed = runtime_config.clone();
