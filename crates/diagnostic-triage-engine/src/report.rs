@@ -324,13 +324,26 @@ fn validate_collection_limits(input: &ReportAssemblyInput) -> Result<(), ReportA
         ("fix_candidates", input.fix_candidates.len()),
         ("executions", input.executions.len()),
     ] {
-        if actual > MAX_REPORT_COLLECTION_ITEMS {
-            return Err(ReportAssemblyError::CollectionLimit {
-                collection,
-                actual,
-                max: MAX_REPORT_COLLECTION_ITEMS,
-            });
-        }
+        validate_report_collection_count(collection, actual)?;
+    }
+    Ok(())
+}
+
+/// Validate one top-level report collection before expensive materialization.
+///
+/// # Errors
+///
+/// Returns [`ReportAssemblyError::CollectionLimit`] when `actual` exceeds the v1 limit.
+pub fn validate_report_collection_count(
+    collection: &'static str,
+    actual: usize,
+) -> Result<(), ReportAssemblyError> {
+    if actual > MAX_REPORT_COLLECTION_ITEMS {
+        return Err(ReportAssemblyError::CollectionLimit {
+            collection,
+            actual,
+            max: MAX_REPORT_COLLECTION_ITEMS,
+        });
     }
     Ok(())
 }

@@ -24,7 +24,10 @@ use diagnostic_triage_engine::{
     dedup::deduplicate_findings,
     deterministic_object_id,
     finding::build_finding,
-    report::{ReportAssemblyError, ReportAssemblyInput, assemble_session_report},
+    report::{
+        ReportAssemblyError, ReportAssemblyInput, assemble_session_report,
+        validate_report_collection_count,
+    },
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -215,6 +218,8 @@ pub(crate) enum ProviderExecutionError {
 pub(crate) enum RuntimeProjectionError {
     #[error(transparent)]
     Provider(#[from] ProviderExecutionError),
+    #[error(transparent)]
+    Report(#[from] ReportAssemblyError),
     #[error("runtime projection object ID collided: {0}")]
     ObjectIdCollision(ObjectId),
 }
@@ -590,8 +595,9 @@ fn project_provider_states(
     plan_id: ObjectId,
     mut providers: Vec<(PlannedProvider, ProviderSessionState)>,
 ) -> Result<ReadOnlyRuntimeProjection, RuntimeProjectionError> {
+    // LLM contract: EXECUTED -> BOUNDED -> IDENTITIES_VALIDATED -> COMPLETE_PAYLOAD_PROJECTED -> CANONICALIZED; overflow, mismatch, or collision -> REJECTED atomically.
+    preflight_provider_projection_collections(&providers)?;
     providers.sort_by(|left, right| left.0.config.adapter_id.cmp(&right.0.config.adapter_id));
-    // LLM contract: EXECUTED -> IDENTITIES_VALIDATED -> COMPLETE_PAYLOAD_PROJECTED -> CANONICALIZED; any mismatch or collision -> REJECTED atomically.
     let mut executions = providers
         .iter()
         .map(|(planned, state)| {
@@ -653,6 +659,28 @@ fn project_provider_states(
     })
 }
 
+fn preflight_provider_projection_collections(
+    providers: &[(PlannedProvider, ProviderSessionState)],
+) -> Result<(), ReportAssemblyError> {
+    let (mut observations, mut evidence, mut fix_candidates) = (0usize, 0usize, 0usize);
+    for (_, state) in providers {
+        let ProviderSessionState::Complete(session) = state else {
+            continue;
+        };
+        // ValidatedSession guarantees these completion counts equal the retained event stream.
+        observations = observations.saturating_add(
+            usize::try_from(session.completion.counts.observations).unwrap_or(usize::MAX),
+        );
+        evidence = evidence.saturating_add(
+            usize::try_from(session.completion.counts.evidence).unwrap_or(usize::MAX),
+        );
+        fix_candidates = fix_candidates.saturating_add(
+            usize::try_from(session.completion.counts.fix_candidates).unwrap_or(usize::MAX),
+        );
+    }
+    preflight_projection_collections(observations, evidence, fix_candidates, providers.len())
+}
+
 pub(crate) fn assemble_read_only_report(
     projection: ReadOnlyRuntimeProjection,
     evaluation_time: Option<String>,
@@ -665,6 +693,13 @@ pub(crate) fn assemble_read_only_report(
         fix_candidates,
         executions,
     } = projection;
+    // LLM contract: NORMALIZED -> BOUNDED -> CLASSIFIED; aggregate overflow -> REJECTED before classification.
+    preflight_projection_collections(
+        observations.len(),
+        evidence.len(),
+        fix_candidates.len(),
+        executions.len(),
+    )?;
     let rules = config.classification_rules()?;
     let policy = config.policy_snapshot()?;
     // LLM contract: NORMALIZED -> CLASSIFIED -> REPORTED; invalid classification, policy, or reference -> REJECTED atomically.
@@ -689,6 +724,23 @@ pub(crate) fn assemble_read_only_report(
         },
         &policy,
     )?)
+}
+
+fn preflight_projection_collections(
+    observations: usize,
+    evidence: usize,
+    fix_candidates: usize,
+    executions: usize,
+) -> Result<(), ReportAssemblyError> {
+    for (collection, actual) in [
+        ("observations", observations),
+        ("evidence", evidence),
+        ("fix_candidates", fix_candidates),
+        ("executions", executions),
+    ] {
+        validate_report_collection_count(collection, actual)?;
+    }
+    Ok(())
 }
 
 fn bounded_message(message: &str) -> String {
@@ -774,17 +826,19 @@ mod tests {
     use std::{env, fs, path::Path};
 
     use super::{
-        PlannedProvider, ReadOnlyMode, RuntimeProjectionError, assemble_read_only_report,
-        build_read_only_plan, execute_read_only_plan, project_provider_states,
-        resolve_provider_program, resolve_workspace, synthesize_execution,
+        PlannedProvider, ReadOnlyMode, ReadOnlyReportError, RuntimeProjectionError,
+        assemble_read_only_report, build_read_only_plan, execute_read_only_plan,
+        preflight_projection_collections, project_provider_states, resolve_provider_program,
+        resolve_workspace, synthesize_execution,
     };
     use crate::{RuntimeConfig, session::ProviderSessionState};
     use diagnostic_triage_contracts::{
         ObjectId, Sha256Digest, ValidatedSession,
         model::{Category, Execution, ExecutionStatus, MicroCategory, PhaseDuration, Verdict},
-        protocol::Operation,
+        protocol::{Operation, ProtocolEnvelope},
         validate_session_jsonl,
     };
+    use diagnostic_triage_engine::report::{MAX_REPORT_COLLECTION_ITEMS, ReportAssemblyError};
     use tempfile::tempdir;
 
     const REVISION: &str = "a12b34c56d78e90f1234567890abcdef12345678";
@@ -1012,6 +1066,98 @@ mod tests {
         assert_eq!(report.verdict, Verdict::Pass);
         assert!(report.findings.is_empty());
         assert!(report.executions.is_empty());
+    }
+
+    #[test]
+    fn projection_collection_preflight_is_exact_and_covers_every_collection() {
+        preflight_projection_collections(
+            MAX_REPORT_COLLECTION_ITEMS,
+            MAX_REPORT_COLLECTION_ITEMS,
+            MAX_REPORT_COLLECTION_ITEMS,
+            MAX_REPORT_COLLECTION_ITEMS,
+        )
+        .unwrap();
+
+        for (collection, counts) in [
+            ("observations", [MAX_REPORT_COLLECTION_ITEMS + 1, 0, 0, 0]),
+            ("evidence", [0, MAX_REPORT_COLLECTION_ITEMS + 1, 0, 0]),
+            ("fix_candidates", [0, 0, MAX_REPORT_COLLECTION_ITEMS + 1, 0]),
+            ("executions", [0, 0, 0, MAX_REPORT_COLLECTION_ITEMS + 1]),
+        ] {
+            let error =
+                preflight_projection_collections(counts[0], counts[1], counts[2], counts[3])
+                    .unwrap_err();
+            assert!(matches!(
+                error,
+                ReportAssemblyError::CollectionLimit { collection: actual, .. }
+                    if actual == collection
+            ));
+        }
+    }
+
+    #[test]
+    fn projection_overflow_precedes_observation_classification() {
+        let (planned, session) = aggregate_fixture("alpha", 291, true);
+        let mut projection = project_provider_states(
+            config("src"),
+            "019f7e95-0000-7000-8000-000000000290".parse().unwrap(),
+            vec![(planned, ProviderSessionState::Complete(Box::new(session)))],
+        )
+        .unwrap();
+        let mut invalid = projection.observations[0].clone();
+        invalid.message.clear();
+        projection.observations = vec![invalid; MAX_REPORT_COLLECTION_ITEMS + 1];
+
+        assert!(matches!(
+            assemble_read_only_report(projection, Some("2026-07-23T00:00:00Z".to_owned())),
+            Err(ReadOnlyReportError::Report(ReportAssemblyError::CollectionLimit {
+                collection: "observations",
+                actual,
+                max,
+            })) if actual == MAX_REPORT_COLLECTION_ITEMS + 1 && max == MAX_REPORT_COLLECTION_ITEMS
+        ));
+    }
+
+    #[test]
+    fn provider_projection_overflow_precedes_aggregate_materialization() {
+        let (first, mut first_session) = aggregate_fixture("alpha", 301, true);
+        let (second, mut second_session) = aggregate_fixture("zeta", 303, true);
+        let first_observation = first_session
+            .events
+            .iter()
+            .find(|event| matches!(event, ProtocolEnvelope::Observation(_)))
+            .unwrap()
+            .clone();
+        let second_observation = second_session
+            .events
+            .iter()
+            .find(|event| matches!(event, ProtocolEnvelope::Observation(_)))
+            .unwrap()
+            .clone();
+        let per_provider = MAX_REPORT_COLLECTION_ITEMS / 2 + 1;
+        first_session.events = vec![first_observation; per_provider];
+        second_session.events = vec![second_observation; per_provider];
+        for session in [&mut first_session, &mut second_session] {
+            session.completion.counts.observations = u64::try_from(per_provider).unwrap();
+            session.completion.counts.evidence = 0;
+            session.completion.counts.fix_candidates = 0;
+        }
+
+        assert!(matches!(
+            project_provider_states(
+                config("src"),
+                "019f7e95-0000-7000-8000-000000000300".parse().unwrap(),
+                vec![
+                    (first, ProviderSessionState::Complete(Box::new(first_session))),
+                    (second, ProviderSessionState::Complete(Box::new(second_session))),
+                ],
+            ),
+            Err(RuntimeProjectionError::Report(ReportAssemblyError::CollectionLimit {
+                collection: "observations",
+                actual,
+                max,
+            })) if actual == per_provider * 2 && max == MAX_REPORT_COLLECTION_ITEMS
+        ));
     }
 
     #[cfg(unix)]
