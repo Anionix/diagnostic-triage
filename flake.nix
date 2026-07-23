@@ -168,6 +168,9 @@
               python
             ];
           };
+          release = pkgs.mkShell {
+            packages = [ pkgs.cosign ];
+          };
         }
       );
 

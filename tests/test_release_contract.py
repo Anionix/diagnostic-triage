@@ -24,7 +24,6 @@ ACTION_PINS = {
     "actions/upload-artifact": "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
     "actions/download-artifact": "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
     "cachix/install-nix-action": "630ae543ea3a38a9a4166f03376c02c50f408342",
-    "sigstore/cosign-installer": "6f9f17788090df1f26f669e9d70d6ae9567deba6",
 }
 
 
@@ -190,7 +189,12 @@ class ReleaseContractTests(unittest.TestCase):
             all(re.fullmatch(r"[0-9a-f]{40}", ref) for _, ref in references)
         )
         self.assertEqual(set(references), set(ACTION_PINS.items()))
-        self.assertIn("cosign-release: v3.1.2", workflow)
+        self.assertNotIn("sigstore/cosign-installer", workflow)
+        self.assertNotIn("cosign-release:", workflow)
+        self.assertIn(
+            "nix develop --accept-flake-config .#release --command bash",
+            workflow,
+        )
         self.assertIn("github.event_name == 'push'", workflow)
         self.assertEqual(workflow.count("ref: ${{ github.sha }}"), 4)
         self.assertEqual(
@@ -211,6 +215,11 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertIn("contents: read", publish_job)
         self.assertNotIn("contents: write", publish_job)
         self.assertIn("contents: write", release_job)
+
+    def test_cosign_is_sourced_from_the_locked_release_shell(self) -> None:
+        flake = (ROOT / "flake.nix").read_text(encoding="utf-8")
+        self.assertIn("release = pkgs.mkShell", flake)
+        self.assertIn("packages = [ pkgs.cosign ];", flake)
 
     def test_matrix_has_four_unique_native_runners(self) -> None:
         self.assertEqual(
