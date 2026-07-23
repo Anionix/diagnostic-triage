@@ -5,6 +5,7 @@ use diagnostic_triage::{Cli, CliError, execute};
 use tempfile::tempdir;
 
 const REVISION: &str = "a12b34c56d78e90f1234567890abcdef12345678";
+const POLICY_FAIL_REPORT: &[u8] = include_bytes!("../../../tests/fixtures/v1/valid-report.json");
 
 fn init_repository(repository: &Path) {
     fs::create_dir(repository.join("src")).expect("source directory");
@@ -41,9 +42,24 @@ fn init_repository(repository: &Path) {
 }
 
 #[test]
-fn parser_exposes_check_and_ci_without_implicit_flags() {
+fn parser_exposes_public_commands_without_implicit_network_or_apply_flags() {
     assert!(Cli::try_parse_from(["diagnostic-triage", "check"]).is_ok());
     assert!(Cli::try_parse_from(["diagnostic-triage", "ci"]).is_ok());
+    assert!(
+        Cli::try_parse_from([
+            "diagnostic-triage",
+            "observe",
+            "--source",
+            "github-actions",
+            "--input",
+            "run.json",
+        ])
+        .is_ok()
+    );
+    assert!(
+        Cli::try_parse_from(["diagnostic-triage", "issue-draft", "--input", "report.json",])
+            .is_ok()
+    );
     assert!(Cli::try_parse_from(["diagnostic-triage", "unknown"]).is_err());
 }
 
@@ -171,4 +187,83 @@ fn ci_does_not_treat_config_pathspec_magic_as_a_tracked_literal() {
         execute(&cli, &mut Vec::new()),
         Err(CliError::ConfigUntracked(path)) if path == "*.toml"
     ));
+}
+
+#[test]
+fn issue_draft_reads_a_repository_relative_report_and_never_posts_it() {
+    let repository = tempdir().expect("repository");
+    init_repository(repository.path());
+    let check = Cli::try_parse_from([
+        "diagnostic-triage",
+        "--repository",
+        repository.path().to_str().expect("UTF-8 path"),
+        "check",
+    ])
+    .expect("check CLI");
+    let mut report = Vec::new();
+    execute(&check, &mut report).expect("check report");
+    fs::write(repository.path().join("report.json"), report).expect("report file");
+
+    let draft = Cli::try_parse_from([
+        "diagnostic-triage",
+        "--repository",
+        repository.path().to_str().expect("UTF-8 path"),
+        "issue-draft",
+        "--input",
+        "report.json",
+        "--format",
+        "json",
+    ])
+    .expect("issue-draft CLI");
+    let mut output = Vec::new();
+
+    assert_eq!(execute(&draft, &mut output).expect("draft").code(), 0);
+    let output = std::str::from_utf8(&output).expect("UTF-8 draft");
+    assert!(output.contains("\"labels\":[\"bug\"]"));
+    assert!(!output.contains("api.github.com"));
+}
+
+#[test]
+fn issue_draft_rejects_path_escape() {
+    let repository = tempdir().expect("repository");
+    init_repository(repository.path());
+    let draft = Cli::try_parse_from([
+        "diagnostic-triage",
+        "--repository",
+        repository.path().to_str().expect("UTF-8 path"),
+        "issue-draft",
+        "--input",
+        "../report.json",
+    ])
+    .expect("issue-draft CLI");
+
+    assert!(matches!(
+        execute(&draft, &mut Vec::new()),
+        Err(CliError::InputPath(path)) if path == "../report.json"
+    ));
+}
+
+#[test]
+fn issue_draft_markdown_preserves_policy_failure_exit_status() {
+    let repository = tempdir().expect("repository");
+    init_repository(repository.path());
+    fs::write(repository.path().join("report.json"), POLICY_FAIL_REPORT).expect("report");
+    let draft = Cli::try_parse_from([
+        "diagnostic-triage",
+        "--repository",
+        repository.path().to_str().expect("UTF-8 path"),
+        "issue-draft",
+        "--input",
+        "report.json",
+        "--format",
+        "markdown",
+    ])
+    .expect("issue-draft CLI");
+    let mut output = Vec::new();
+
+    assert_eq!(execute(&draft, &mut output).expect("draft").code(), 1);
+    let output = std::str::from_utf8(&output).expect("UTF-8 draft");
+    assert!(output.starts_with("# Diagnostic Triage bug issue draft\n\n"));
+    assert!(output.contains("\"verdict\":\"POLICY_FAIL\""));
+    assert!(!output.contains("\\n"));
 }
