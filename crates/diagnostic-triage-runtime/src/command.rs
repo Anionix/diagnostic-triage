@@ -238,6 +238,22 @@ pub fn run_apply_safe_command(
     evaluation_time: impl FnOnce() -> Option<String>,
     emit_patch: impl FnOnce(&[u8]) -> std::io::Result<()>,
 ) -> Result<FixCommandResult, FixCommandError> {
+    run_apply_safe_command_for_platform(
+        config,
+        repository_root,
+        evaluation_time,
+        source_publication_supported(),
+        emit_patch,
+    )
+}
+
+fn run_apply_safe_command_for_platform(
+    config: &RuntimeConfig,
+    repository_root: &Path,
+    evaluation_time: impl FnOnce() -> Option<String>,
+    publication_supported: bool,
+    emit_patch: impl FnOnce(&[u8]) -> std::io::Result<()>,
+) -> Result<FixCommandResult, FixCommandError> {
     // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED ->
     // REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
     // LLM contract: EXPLICIT_REQUEST -> SAFE_SELECTED -> TOOL_NATIVE -> SCRATCH_APPLIED ->
@@ -256,16 +272,15 @@ pub fn run_apply_safe_command(
             .requires_evaluation_time()
             .then(evaluation_time)
             .flatten();
-        let no_fix_projection = before.clone();
         let Some(PreparedRuffFix {
             projection: before,
             candidate,
             canonical,
-        }) = prepare_single_canonical_ruff_fix(&scratch, before)
+        }) = prepare_single_canonical_ruff_fix(&scratch, before.clone())
             .map_err(|error| FixCommandError::Preparation(Box::new(error)))?
         else {
             require_source_state(repository_root, &source_state)?;
-            let report = assemble_read_only_report(no_fix_projection, report_time)
+            let report = assemble_read_only_report(before, report_time)
                 .map_err(|error| FixCommandError::Report(Box::new(error)))?;
             return Ok((
                 FixCommandResult {
@@ -275,6 +290,7 @@ pub fn run_apply_safe_command(
                 false,
             ));
         };
+        require_source_publication_support(publication_supported)?;
         let unified = render_unified_patch(&scratch, &canonical.patch)?;
 
         let application = scratch
@@ -479,16 +495,21 @@ fn verify_unified_patch_result(
 }
 
 fn capture_source_state(repository_root: &Path) -> Result<RepositoryState, FixCommandError> {
-    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
-    {
-        capture_repository_state(repository_root)
-            .map_err(|error| FixCommandError::Snapshot(Box::new(error)))
+    capture_repository_state(repository_root)
+        .map_err(|error| FixCommandError::Snapshot(Box::new(error)))
+}
+
+const fn source_publication_supported() -> bool {
+    cfg!(any(target_os = "linux", target_vendor = "apple"))
+}
+
+fn require_source_publication_support(publication_supported: bool) -> Result<(), FixCommandError> {
+    // LLM contract: SAFE_CANDIDATE -> PLATFORM_VERIFIED -> PUBLICATION_ALLOWED;
+    // unsupported publication -> UNSUPPORTED. NO_CANDIDATE returns before this boundary.
+    if !publication_supported {
+        return Err(FixCommandError::ApplySafePlatformUnsupported);
     }
-    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
-    {
-        let _ = repository_root;
-        Err(FixCommandError::ApplySafePlatformUnsupported)
-    }
+    Ok(())
 }
 
 fn require_source_state(
@@ -975,6 +996,42 @@ mod tests {
             require_source_state(repository.path(), &source_state),
             Err(FixCommandError::RepositoryChanged)
         ));
+    }
+
+    #[test]
+    fn unsupported_publication_platform_preserves_a_no_candidate_noop() {
+        let repository = git_repository();
+        let config = repository_config("src");
+        let original = fs::read(repository.path().join("src/lib.rs")).expect("source");
+        let mut emitted = false;
+
+        let result = run_apply_safe_command_for_platform(
+            &config,
+            repository.path(),
+            || None,
+            false,
+            |_| {
+                emitted = true;
+                Ok(())
+            },
+        )
+        .expect("read-only no-op");
+
+        assert!(result.patch.is_empty());
+        assert!(!emitted);
+        assert_eq!(
+            fs::read(repository.path().join("src/lib.rs")).expect("unchanged source"),
+            original
+        );
+    }
+
+    #[test]
+    fn publication_platform_gate_reports_unsupported_publication() {
+        assert!(matches!(
+            require_source_publication_support(false),
+            Err(FixCommandError::ApplySafePlatformUnsupported)
+        ));
+        assert!(require_source_publication_support(true).is_ok());
     }
 
     #[test]
