@@ -199,6 +199,8 @@ pub(crate) enum ReadOnlyRunError {
     ProviderProgramUnsupported { program: PathBuf },
     #[error("repo-relative provider program was not staged: {program}")]
     ProviderProgramUnstaged { program: PathBuf },
+    #[error("repository provider program must use a staged repo-relative path: {program}")]
+    ProviderProgramMustBeRelative { program: PathBuf },
     #[error("failed to resolve provider target {target}")]
     ProviderTargetIo {
         target: RepoPath,
@@ -443,6 +445,17 @@ fn resolve_isolated_provider_programs(
         .map(|provider| {
             let configured = &provider.config.program;
             let path = Path::new(configured);
+            // LLM contract: CONFIGURED_PROVIDER -> SOURCE_CLASSIFIED ->
+            // STAGED_REPO_RELATIVE | TRUSTED_EXTERNAL; repository-bound absolute -> REJECTED.
+            let repository_bound_absolute = path.is_absolute()
+                && (path.starts_with(original.repository_root())
+                    || fs::canonicalize(path)
+                        .is_ok_and(|resolved| resolved.starts_with(original.repository_root())));
+            if repository_bound_absolute {
+                return Err(ReadOnlyRunError::ProviderProgramMustBeRelative {
+                    program: path.into(),
+                });
+            }
             if !path.is_absolute()
                 && !is_bare_program_name(path)
                 && !scratch.contains_source_path(configured)?
@@ -1753,6 +1766,16 @@ mod tests {
             ScratchLimits::default(),
         );
         let provider_program = fix_config.providers[0].program.clone();
+        fix_config.providers[0].program =
+            fs::canonicalize(repository.path().join("bin").join(&provider))
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+        assert!(matches!(
+            execute_fix_plan(&fix_config, repository.path(), &scratch),
+            Err(super::ReadOnlyRunError::ProviderProgramMustBeRelative { .. })
+        ));
         fix_config.providers[0].program = "./bin/missing-provider".to_owned();
         fs::write(repository.path().join("tracked.txt"), b"stale source").unwrap();
         assert!(matches!(
