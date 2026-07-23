@@ -717,11 +717,11 @@ fn biome_argv(request: &RequestEnvelope) -> Result<Vec<String>, ProviderError> {
 }
 
 fn unsupported_request(request: &RequestEnvelope) -> Option<String> {
-    if request.operation != Operation::Check {
-        return Some("Biome Provider supports only CHECK".to_owned());
+    if !matches!(request.operation, Operation::Check | Operation::Verify) {
+        return Some("Biome Provider supports only CHECK and VERIFY".to_owned());
     }
     if !capability_requested(request, CHECK_CAPABILITY) {
-        return Some("CHECK requires diagnostic.check/v1".to_owned());
+        return Some("diagnostic operation requires diagnostic.check/v1".to_owned());
     }
     request
         .required_capabilities
@@ -1023,7 +1023,7 @@ mod tests {
     use crate::process::{CapturedOutput, ProcessOutcome, ProcessState};
     use diagnostic_triage_contracts::{
         model::{ExecutionStatus, Severity},
-        protocol::{ProtocolEnvelope, RequestEnvelope},
+        protocol::{Operation, ProtocolEnvelope, RequestEnvelope},
         validate_session_jsonl,
     };
     use std::{
@@ -1107,6 +1107,10 @@ mod tests {
 
     #[test]
     fn unsupported_required_capability_finishes_without_invoking_biome() {
+        let mut verify_request = request();
+        verify_request.operation = Operation::Verify;
+        assert!(super::unsupported_request(&verify_request).is_none());
+
         let mut unknown_request = request();
         unknown_request.required_capabilities = vec![
             "diagnostic.unknown/v1"
@@ -1120,6 +1124,7 @@ mod tests {
         assert!(response.events.is_empty());
 
         let mut fix_request = request();
+        fix_request.operation = Operation::Fix;
         fix_request
             .required_capabilities
             .push("fix.propose/v1".parse().unwrap());

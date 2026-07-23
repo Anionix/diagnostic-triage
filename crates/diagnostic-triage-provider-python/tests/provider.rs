@@ -534,7 +534,7 @@ fn fix_operation_emits_complete_findings_and_candidates() {
 #[test]
 fn nested_workspace_targets_are_resolved_from_the_repository_root() {
     let mut fake = FakeRuff::new(
-        r#"if [ ! -d "$5" ]; then printf 'missing target: %s' "$5" >&2; exit 2; fi
+        r#"if [ ! -d "$6" ]; then printf 'missing target: %s' "$6" >&2; exit 2; fi
 printf '%s' '[{"code":"F401","filename":"pkg/src/a.py","location":{"row":1,"column":1},"end_location":{"row":1,"column":2},"message":"unused","severity":"error","fix":null}]'; exit 1"#,
     );
     fs::create_dir_all(fake.root.join("tools")).unwrap();
@@ -617,7 +617,7 @@ fn root_workspace_preserves_missing_targets_and_rejects_escape_ancestors() {
     use std::os::unix::fs::symlink;
 
     let fake =
-        FakeRuff::new(r#"if [ "$5" != "missing.py" ]; then exit 2; fi; printf '[]'; exit 0"#);
+        FakeRuff::new(r#"if [ "$6" != "missing.py" ]; then exit 2; fi; printf '[]'; exit 0"#);
     let mut request = request();
     request.targets = vec!["missing.py".parse().unwrap()];
 
@@ -862,7 +862,7 @@ fn malformed_process_json_is_incomplete_with_stdout_evidence() {
 #[test]
 fn binary_emits_manifest_before_reading_then_runs_ruff() {
     let fake = FakeRuff::new(
-        r#"if [ "$1" != "check" ] || [ "$2" != "--output-format" ] || [ "$3" != "json" ] || [ "$4" != "--" ] || [ "$5" != "src" ]; then printf 'bad argv' >&2; exit 2; fi
+        r#"if [ "$1" != "check" ] || [ "$2" != "--no-cache" ] || [ "$3" != "--output-format" ] || [ "$4" != "json" ] || [ "$5" != "--" ] || [ "$6" != "src" ]; then printf 'bad argv' >&2; exit 2; fi
 printf '%s' '[{"code":"F401","filename":"src/a.py","location":{"row":1,"column":1},"end_location":{"row":1,"column":2},"message":"unused","severity":"error","fix":{"applicability":"safe","message":"remove","edits":[{"content":"","location":{"row":1,"column":1},"end_location":{"row":1,"column":2}}]}}]'; exit 1"#,
     );
     let mut paths = vec![fake.root.clone()];

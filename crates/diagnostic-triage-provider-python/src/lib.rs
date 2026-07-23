@@ -594,7 +594,7 @@ pub fn run_ruff_session(
             }
         };
     let check_spec = ProcessSpec::new(ruff_program)
-        .args(["check", "--output-format", "json", "--"])
+        .args(["check", "--no-cache", "--output-format", "json", "--"])
         .args(request.targets.iter().map(RepoPath::as_str))
         .current_dir(&repository_root);
     let check_outcome = match run_bounded(&check_spec, check_limits) {
