@@ -1,9 +1,12 @@
 //! Pure, deterministic planning for read-only runtime sessions.
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::BTreeSet,
     fs, io,
     path::{Component, Path, PathBuf},
+    time::Duration,
 };
 
 use diagnostic_triage_contracts::protocol::{
@@ -30,7 +33,7 @@ use crate::{
     config::{ConfigError, ProviderConfig, RuntimeConfig},
     execution::{ProviderExecutionInput, validated_provider_execution},
     execution_identity as identity,
-    process::ProcessSpec,
+    process::{ProcessError, ProcessLimits, ProcessSpec, ProcessState, run_bounded},
     session::{
         ProviderSessionError, ProviderSessionOutcome, ProviderSessionState, run_provider_session,
     },
@@ -43,6 +46,7 @@ const REQUEST_ID_DOMAIN: &str = "diagnostic-triage.runtime-request/v1";
 const EXECUTION_ID_DOMAIN: &str = "diagnostic-triage.runtime-execution/v1";
 const MAX_EXECUTION_MESSAGE_CHARS: usize = 8_192;
 const EMPTY_EXECUTION_MESSAGE: &str = "provider session ended without a reason";
+const REPOSITORY_STATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ReadOnlyMode {
@@ -187,6 +191,14 @@ pub(crate) enum ReadOnlyRunError {
         #[source]
         source: ProviderSessionError,
     },
+    #[error("repository state command could not run")]
+    RepositoryStateProcess(#[source] ProcessError),
+    #[error("repository state command failed: state={0:?}, exit_code={1:?}")]
+    RepositoryStateCommand(ProcessState, Option<u8>),
+    #[error("tracked repository entry cannot be checked safely")]
+    RepositoryTrackedEntry,
+    #[error("configured Provider mutated tracked repository state")]
+    RepositoryMutation,
 }
 
 #[derive(Debug, Error)]
@@ -289,7 +301,7 @@ pub(crate) fn execute_read_only_plan(
         targets,
         providers,
     } = plan;
-    // LLM contract: PLANNED -> TARGETS_PREFLIGHTED -> PROGRAMS_PREFLIGHTED -> PROVIDER_STARTED; target rejection -> zero Provider launches.
+    // LLM contract: PLANNED -> PREFLIGHTED -> REPOSITORY_SNAPSHOTTED -> PROVIDER_GROUPS_REAPED -> MUTATION_VERIFIED; external writers excluded.
     validate_provider_targets(&workspace, &targets)?;
     let programs = providers
         .iter()
@@ -297,15 +309,128 @@ pub(crate) fn execute_read_only_plan(
             resolve_provider_program(workspace.repository_root(), &provider.config.program)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut executed = Vec::with_capacity(providers.len());
-    for (planned, program) in providers.into_iter().zip(programs) {
-        executed.push(planned.run(&workspace, program)?);
+    let before = capture_repository_state(workspace.repository_root())?;
+    let run_result: Result<ExecutedReadOnlyPlan, ReadOnlyRunError> = (|| {
+        let mut executed = Vec::with_capacity(providers.len());
+        for (planned, program) in providers.into_iter().zip(programs) {
+            executed.push(planned.run(&workspace, program)?);
+        }
+        Ok(ExecutedReadOnlyPlan {
+            config,
+            plan_id,
+            providers: executed,
+        })
+    })();
+    let after = capture_repository_state(workspace.repository_root())?;
+    if before != after {
+        return Err(ReadOnlyRunError::RepositoryMutation);
     }
-    Ok(ExecutedReadOnlyPlan {
-        config,
-        plan_id,
-        providers: executed,
-    })
+    run_result
+}
+
+type RepositoryState = [Vec<u8>; 3];
+
+fn capture_repository_state(repository_root: &Path) -> Result<RepositoryState, ReadOnlyRunError> {
+    Ok([
+        run_git(repository_root, &["rev-parse", "--verify", "HEAD"])?,
+        run_git(repository_root, &["ls-files", "--stage", "-v", "-z"])?,
+        raw_tracked_state(repository_root)?,
+    ])
+}
+
+fn run_git(repository_root: &Path, argv: &[&str]) -> Result<Vec<u8>, ReadOnlyRunError> {
+    run_git_input(repository_root, argv, Vec::new())
+}
+
+fn raw_tracked_state(repository_root: &Path) -> Result<Vec<u8>, ReadOnlyRunError> {
+    let paths = run_git(repository_root, &["ls-files", "-z"])?;
+    let mut input = Vec::new();
+    let mut state = Vec::new();
+    for raw in paths
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+    {
+        let relative =
+            std::str::from_utf8(raw).map_err(|_| ReadOnlyRunError::RepositoryTrackedEntry)?;
+        if relative.contains('\n') {
+            return Err(ReadOnlyRunError::RepositoryTrackedEntry);
+        }
+        let path = repository_root.join(relative);
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() => {
+                state.push(1);
+                #[cfg(unix)]
+                state.extend_from_slice(&metadata.permissions().mode().to_le_bytes());
+                state.extend_from_slice(raw);
+                state.push(0);
+                input.extend_from_slice(raw);
+                input.push(b'\n');
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                state.push(2);
+                state.extend_from_slice(raw);
+                state.push(0);
+                let target =
+                    fs::read_link(&path).map_err(|source| ReadOnlyRunError::WorkspaceIo {
+                        operation: "read tracked symbolic link",
+                        path,
+                        source,
+                    })?;
+                state.extend_from_slice(
+                    target
+                        .to_str()
+                        .ok_or(ReadOnlyRunError::RepositoryTrackedEntry)?
+                        .as_bytes(),
+                );
+                state.push(0);
+            }
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                state.push(0);
+                state.extend_from_slice(raw);
+                state.push(0);
+            }
+            Err(source) => {
+                return Err(ReadOnlyRunError::WorkspaceIo {
+                    operation: "inspect tracked repository state",
+                    path,
+                    source,
+                });
+            }
+            Ok(_) => return Err(ReadOnlyRunError::RepositoryTrackedEntry),
+        }
+    }
+    state.extend(run_git_input(
+        repository_root,
+        &["hash-object", "--no-filters", "--stdin-paths"],
+        input,
+    )?);
+    Ok(state)
+}
+
+fn run_git_input(
+    repository_root: &Path,
+    argv: &[&str],
+    stdin: Vec<u8>,
+) -> Result<Vec<u8>, ReadOnlyRunError> {
+    let outcome = run_bounded(
+        &ProcessSpec::new("git")
+            .args(argv.iter().copied())
+            .current_dir(repository_root)
+            .stdin(stdin),
+        ProcessLimits {
+            timeout: REPOSITORY_STATE_TIMEOUT,
+            max_stdout_bytes: ProcessLimits::DEFAULT_STDOUT_BYTES,
+            max_stderr_bytes: ProcessLimits::DEFAULT_STDERR_BYTES,
+        },
+    )
+    .map_err(ReadOnlyRunError::RepositoryStateProcess)?;
+    if outcome.state != ProcessState::Complete || outcome.exit_code != Some(0) {
+        return Err(ReadOnlyRunError::RepositoryStateCommand(
+            outcome.state,
+            outcome.exit_code,
+        ));
+    }
+    Ok(outcome.stdout.bytes)
 }
 
 fn validate_provider_targets(
@@ -644,7 +769,9 @@ fn is_bare_program_name(program: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, fs};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use std::{env, fs, path::Path};
 
     use super::{
         PlannedProvider, ReadOnlyMode, RuntimeProjectionError, assemble_read_only_report,
@@ -674,6 +801,16 @@ mod tests {
              [limits]\ntimeout_ms=1234\nmax_stdout_bytes=321\nmax_stderr_bytes=654\nmax_evidence_bytes=777\nmax_events=8"
         ))
         .expect("valid plan config")
+    }
+
+    fn init_git(repository: &Path) {
+        fs::write(repository.join(".baseline"), b"baseline").unwrap();
+        super::run_git(repository, &["init", "-q"]).unwrap();
+        super::run_git(repository, &["config", "user.name", "t"]).unwrap();
+        super::run_git(repository, &["config", "user.email", "t@e"]).unwrap();
+        super::run_git(repository, &["config", "commit.gpgsign", "false"]).unwrap();
+        super::run_git(repository, &["add", "-A"]).unwrap();
+        super::run_git(repository, &["commit", "-qm", "baseline"]).unwrap();
     }
 
     fn execution_fixture() -> (PlannedProvider, ValidatedSession) {
@@ -877,11 +1014,38 @@ mod tests {
         assert!(report.executions.is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn tracked_provider_mutation_is_rejected_before_projection() {
+        let repository = tempdir().unwrap();
+        let tracked = repository.path().join("tracked.txt");
+        fs::write(&tracked, b"original").unwrap();
+        init_git(repository.path());
+        fs::set_permissions(&tracked, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut config = config("tracked.txt");
+        config.providers.truncate(1);
+        let chmod = env::split_paths(&env::var_os("PATH").unwrap())
+            .map(|directory| directory.join("chmod"))
+            .find(|candidate| candidate.is_file())
+            .unwrap();
+        config.providers[0].program = chmod.to_str().unwrap().to_owned();
+        config.providers[0].argv = vec!["0600".into(), "tracked.txt".into()];
+        let error = execute_read_only_plan(
+            &config,
+            repository.path(),
+            &Sha256Digest::compute(b"repository"),
+            ReadOnlyMode::Check,
+        )
+        .unwrap_err();
+        assert!(matches!(error, super::ReadOnlyRunError::RepositoryMutation));
+    }
+
     #[test]
     fn executes_absolute_provider_under_trusted_repository_root() {
         let repository = tempdir().unwrap();
         let mut config = config("src");
         fs::create_dir(repository.path().join("workspace")).unwrap();
+        init_git(repository.path());
         config.repository.workspace = "workspace".parse().unwrap();
         config.repository.targets = vec!["workspace".parse().unwrap()];
         config.providers.truncate(1);
@@ -941,6 +1105,7 @@ mod tests {
             repository.path().join("bin").join(&program),
         )
         .unwrap();
+        init_git(repository.path());
         assert!(!env::current_dir().unwrap().starts_with(repository.path()));
 
         let mut config = config("src");
@@ -999,6 +1164,7 @@ mod tests {
         fs::create_dir(repository.path().join("workspace")).unwrap();
         fs::write(repository.path().join("enable-launch-probe"), b"").unwrap();
         symlink(outside.path(), repository.path().join("workspace/link")).unwrap();
+        init_git(repository.path());
         let mut config = config("workspace/link/missing.py");
         config.repository.workspace = "workspace".parse().unwrap();
         config.repository.targets = vec!["workspace/missing.py".parse().unwrap()];
