@@ -252,7 +252,7 @@ pub(crate) fn build_read_only_plan(
         ReadOnlyMode::Verify => ("verify", Operation::Verify),
     };
     if operation == Operation::Fix {
-        // LLM contract: CONFIGURED -> CAPABILITY_PROMOTED -> PLANNED; incapable FIX Provider -> FILTERED.
+        // LLM contract: CONFIGURED -> CAPABILITY_AND_ROLE_PROMOTED -> PLANNED; incapable FIX Provider -> FILTERED.
         config.providers.retain_mut(|provider| {
             let fix_capability = provider
                 .required_capabilities
@@ -270,6 +270,7 @@ pub(crate) fn build_read_only_plan(
                 provider.required_capabilities.push(fix_capability);
                 provider.required_capabilities.sort();
             }
+            provider.required = true;
             true
         });
     }
@@ -1574,10 +1575,10 @@ mod tests {
     #[test]
     fn fix_plan_promotes_optional_capability_to_required() {
         let mut runtime_config = config("src");
-        runtime_config.providers.truncate(1);
         runtime_config.providers[0]
             .optional_capabilities
             .push("fix.propose/v1".parse().unwrap());
+        runtime_config.providers[0].required = false;
 
         let plan = build_read_only_plan(
             &runtime_config,
@@ -1585,6 +1586,7 @@ mod tests {
             ReadOnlyMode::Fix,
         )
         .unwrap();
+        assert_eq!(plan.providers.len(), 1);
         let provider = &plan.providers[0];
 
         assert!(
@@ -1604,7 +1606,9 @@ mod tests {
             provider.request.required_capabilities,
             provider.config.required_capabilities
         );
+        assert!(provider.config.required);
         assert_eq!(provider.config, plan.config.providers[0]);
+        plan.config.validate().unwrap();
     }
 
     #[test]
