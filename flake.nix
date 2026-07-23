@@ -49,11 +49,14 @@
           rust = pkgs.rust-bin.stable."1.85.1".default.override {
             targets = nixpkgs.lib.optionals pkgs.stdenv.isLinux [ rustTarget ];
           };
-          rustScope = if pkgs.stdenv.isLinux then pkgs.pkgsStatic else pkgs;
-          rustPlatform = rustScope.makeRustPlatform {
+          rustPlatform = pkgs.makeRustPlatform {
             cargo = rust;
             rustc = rust;
           };
+          targetLinkerName =
+            "CARGO_TARGET_${nixpkgs.lib.toUpper (
+              nixpkgs.lib.replaceStrings [ "-" ] [ "_" ] rustTarget
+            )}_LINKER";
           source = nixpkgs.lib.cleanSourceWith {
             src = ./.;
             filter =
@@ -73,33 +76,41 @@
               in
               name != ".git" && name != "result" && name != "target" && !excludedTree && !nonFixtureTest;
           };
-          package = rustPlatform.buildRustPackage {
-            pname = "diagnostic-triage";
-            inherit version;
-            src = source;
-            cargoLock.lockFile = ./Cargo.lock;
-            cargoBuildFlags = [
-              "--workspace"
-              "--bins"
-              "--locked"
-            ];
-            doCheck = false;
-            installPhase = ''
-              runHook preInstall
-              install -d "$out/bin" "$out/share/diagnostic-triage"
-              for binary in ${nixpkgs.lib.escapeShellArgs binaryNames}; do
-                binary_path="$(find target -type f -path "*/release/$binary" -perm -0100 -print -quit)"
-                test -n "$binary_path"
-                install -m755 "$binary_path" "$out/bin/$binary"
-              done
-              cp -R schemas "$out/share/diagnostic-triage/schemas"
-              cp -R tests/fixtures "$out/share/diagnostic-triage/fixtures"
-              cp -R provenance "$out/share/diagnostic-triage/provenance"
-              cp -R release "$out/share/diagnostic-triage/release"
-              install -m644 LICENSE README.md flake.nix flake.lock "$out/share/diagnostic-triage/"
-              runHook postInstall
-            '';
-          };
+          package = rustPlatform.buildRustPackage (
+            {
+              pname = "diagnostic-triage";
+              inherit version;
+              src = source;
+              cargoLock.lockFile = ./Cargo.lock;
+              cargoBuildFlags = [
+                "--workspace"
+                "--bins"
+                "--locked"
+              ];
+              doCheck = false;
+              installPhase = ''
+                runHook preInstall
+                install -d "$out/bin" "$out/share/diagnostic-triage"
+                for binary in ${nixpkgs.lib.escapeShellArgs binaryNames}; do
+                  binary_path="$(find target -type f -path "*/release/$binary" -perm -0100 -print -quit)"
+                  test -n "$binary_path"
+                  install -m755 "$binary_path" "$out/bin/$binary"
+                done
+                cp -R schemas "$out/share/diagnostic-triage/schemas"
+                cp -R tests/fixtures "$out/share/diagnostic-triage/fixtures"
+                cp -R provenance "$out/share/diagnostic-triage/provenance"
+                cp -R release "$out/share/diagnostic-triage/release"
+                install -m644 LICENSE README.md flake.nix flake.lock "$out/share/diagnostic-triage/"
+                runHook postInstall
+              '';
+            }
+            // nixpkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+              # Build scripts stay native; only release binaries use the musl linker.
+              CARGO_BUILD_TARGET = rustTarget;
+              "${targetLinkerName}" =
+                "${pkgs.pkgsStatic.stdenv.cc}/bin/${pkgs.pkgsStatic.stdenv.cc.targetPrefix}cc";
+            }
+          );
           archiveName = "diagnostic-triage-v${version}-${rustTarget}.tar.gz";
           archiveRoot = nixpkgs.lib.removeSuffix ".tar.gz" archiveName;
           releaseArchive =
