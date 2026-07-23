@@ -34,3 +34,6 @@ def synthesizeAll : List ProviderState -> List Execution
 theorem valid_provider_list_yields_one_execution_per_provider (states : List ProviderState) :
     (synthesizeAll states).length = states.length := by
   induction states <;> simp [synthesizeAll, *]
+-- Mutation-guard model only; repository capture and Git semantics remain Rust-tested.
+def repositoryStateAccepted (before after : Nat) : Bool := before == after
+theorem accepted_repository_state_is_unchanged (before after : Nat) : repositoryStateAccepted before after = true ↔ before = after := by simp [repositoryStateAccepted]
