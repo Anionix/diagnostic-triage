@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 import tomllib
 import unittest
@@ -16,7 +17,15 @@ from tools.release_manifest import (
 
 ROOT = Path(__file__).resolve().parents[1]
 MATRIX_PATH = ROOT / "release" / "artifact-matrix.json"
+WORKFLOW_PATH = ROOT / ".github" / "workflows" / "release.yml"
 REVISION = "0123456789abcdef0123456789abcdef01234567"
+ACTION_PINS = {
+    "actions/checkout": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+    "actions/upload-artifact": "043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    "actions/download-artifact": "3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+    "cachix/install-nix-action": "630ae543ea3a38a9a4166f03376c02c50f408342",
+    "sigstore/cosign-installer": "6f9f17788090df1f26f669e9d70d6ae9567deba6",
+}
 
 
 class ReleaseContractTests(unittest.TestCase):
@@ -158,6 +167,38 @@ class ReleaseContractTests(unittest.TestCase):
         self.assertEqual(package["version"], self.matrix.version)
         notes = (ROOT / "release" / "RELEASE_NOTES.md").read_text(encoding="utf-8")
         self.assertIn(f"v{self.matrix.version}", notes)
+
+    def test_release_workflow_pins_every_action(self) -> None:
+        workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+        references = re.findall(
+            r"^\s*uses:\s+([^@\s]+)@([^\s#]+)", workflow, re.MULTILINE
+        )
+        self.assertTrue(references)
+        self.assertTrue(
+            all(re.fullmatch(r"[0-9a-f]{40}", ref) for _, ref in references)
+        )
+        self.assertEqual(set(references), set(ACTION_PINS.items()))
+        self.assertIn("cosign-release: v3.1.2", workflow)
+        self.assertIn("github.event_name == 'push'", workflow)
+        self.assertEqual(workflow.count("ref: ${{ github.sha }}"), 4)
+        self.assertEqual(
+            workflow.count('test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"'),
+            4,
+        )
+        self.assertIn(
+            'test "$(git rev-parse "${GITHUB_REF}^{commit}")" = "${GITHUB_SHA}"',
+            workflow,
+        )
+        self.assertIn('git archive \\\n', workflow)
+        self.assertIn('"${GITHUB_SHA}" \\\n            | gzip -n', workflow)
+        self.assertIn('install_root="$(mktemp -d)"', workflow)
+        self.assertIn("gzip -t", workflow)
+        self.assertIn('source_root="${source_unpack}/diagnostic-triage-', workflow)
+        publish_job, release_job = workflow.split("\n  release:\n", 1)
+        publish_job = publish_job.split("\n  publish:\n", 1)[1]
+        self.assertIn("contents: read", publish_job)
+        self.assertNotIn("contents: write", publish_job)
+        self.assertIn("contents: write", release_job)
 
     def test_matrix_has_four_unique_native_runners(self) -> None:
         self.assertEqual(
