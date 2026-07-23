@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "diagnostic-triage"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "clap",
  "diagnostic-triage-runtime",
@@ -235,7 +235,7 @@ dependencies = [
 
 [[package]]
 name = "diagnostic-triage-contracts"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "camino",
  "indexmap",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "diagnostic-triage-engine"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "diagnostic-triage-contracts",
  "indexmap",
@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "diagnostic-triage-observer-github-actions"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "camino",
  "diagnostic-triage-contracts",
@@ -278,7 +278,7 @@ dependencies = [
 
 [[package]]
 name = "diagnostic-triage-provider-biome"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "camino",
  "diagnostic-triage-contracts",
@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "diagnostic-triage-provider-python"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "camino",
  "diagnostic-triage-contracts",
@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "diagnostic-triage-provider-rust"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "camino",
  "diagnostic-triage-contracts",
@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "diagnostic-triage-runtime"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 dependencies = [
  "camino",
  "csv",
