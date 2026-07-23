@@ -15,8 +15,8 @@ use diagnostic_triage_contracts::protocol::{
 use diagnostic_triage_contracts::{
     AdapterId, ContractError, Nullable, ObjectId, RepoPath, Sha256Digest,
     model::{
-        AdapterKind, EngineIdentity, Evidence, Execution, ExecutionStatus, Finding, FindingState,
-        FixCandidate, Observation, SessionReport, Tool, VerificationAttribution,
+        AdapterKind, Applicability, EngineIdentity, Evidence, Execution, ExecutionStatus, Finding,
+        FindingState, FixCandidate, Observation, SessionReport, Tool, VerificationAttribution,
     },
 };
 use diagnostic_triage_engine::{
@@ -38,7 +38,7 @@ use crate::{
     execution::{ProviderExecutionInput, validated_provider_execution},
     execution_identity as identity,
     process::{ProcessError, ProcessLimits, ProcessSpec, ProcessState, run_bounded},
-    ruff_fix::CanonicalRuffFix,
+    ruff_fix::{CanonicalRuffFix, RuffFixError, RuffFixLimits, canonicalize_ruff_fix},
     scratch::{SafeFixAuthorization, ScratchError, ScratchPatch, ScratchWorkspace},
     session::{
         ProviderSessionError, ProviderSessionOutcome, ProviderSessionState, run_provider_session,
@@ -135,6 +135,9 @@ impl ReadOnlyRuntimeProjection {
 }
 
 pub(crate) struct PatchVerificationProjection {
+    config: RuntimeConfig,
+    session_id: ObjectId,
+    observations: Vec<Observation>,
     pub(crate) candidate: FixCandidate,
     pub(crate) evidence: Vec<Evidence>,
     pub(crate) executions: Vec<Execution>,
@@ -146,6 +149,12 @@ pub(crate) struct PatchVerificationProjection {
 pub(crate) struct AuthorizedPatchVerification {
     pub(crate) projection: PatchVerificationProjection,
     pub(crate) authorization: SafeFixAuthorization,
+}
+
+pub(crate) struct PreparedRuffFix {
+    pub(crate) projection: ReadOnlyRuntimeProjection,
+    pub(crate) candidate: FixCandidate,
+    pub(crate) canonical: CanonicalRuffFix,
 }
 struct ResolvedWorkspace {
     repository_root: PathBuf,
@@ -272,12 +281,26 @@ pub(crate) enum ReadOnlyReportError {
 
 #[derive(Debug, Error)]
 pub(crate) enum PatchVerificationError {
+    #[error("before and after verification plans used different runtime configuration")]
+    ConfigMismatch,
     #[error("canonical Ruff Evidence lineage does not match the Provider projection")]
     RuffLineageMismatch,
     #[error(transparent)]
     Report(#[from] ReadOnlyReportError),
     #[error(transparent)]
     Scratch(#[from] ScratchError),
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum FixPreparationError {
+    #[error("multiple authoritative SAFE fix candidates require explicit selection: {count}")]
+    AmbiguousSafeCandidates { count: usize },
+    #[error("SAFE fix candidate references an absent Observation")]
+    MissingObservation,
+    #[error("SAFE fix candidate references absent patch Evidence")]
+    MissingEvidence,
+    #[error(transparent)]
+    Ruff(#[from] RuffFixError),
 }
 pub(crate) fn build_read_only_plan(
     config: &RuntimeConfig,
@@ -958,6 +981,52 @@ fn project_provider_states(
     })
 }
 
+pub(crate) fn prepare_single_canonical_ruff_fix(
+    scratch: &ScratchWorkspace,
+    projection: ReadOnlyRuntimeProjection,
+) -> Result<Option<PreparedRuffFix>, FixPreparationError> {
+    // LLM contract: PROJECTED -> SAFE_CANDIDATE_SELECTED -> RUFF_LINEAGE_BOUND ->
+    // CANONICALIZED; zero candidates -> NO_PATCH, ambiguity or broken references -> REJECTED.
+    let safe = projection
+        .fix_candidates
+        .iter()
+        .filter(|candidate| candidate.applicability == Applicability::Safe && candidate.tool_native)
+        .collect::<Vec<_>>();
+    let [candidate] = safe.as_slice() else {
+        return match safe.len() {
+            0 => Ok(None),
+            count => Err(FixPreparationError::AmbiguousSafeCandidates { count }),
+        };
+    };
+    let observation = candidate
+        .observation_ids
+        .first()
+        .and_then(|identifier| {
+            projection
+                .observations
+                .iter()
+                .find(|observation| observation.observation_id == *identifier)
+        })
+        .ok_or(FixPreparationError::MissingObservation)?;
+    let evidence = projection
+        .evidence
+        .iter()
+        .find(|evidence| evidence.evidence_id == candidate.patch_evidence_id)
+        .ok_or(FixPreparationError::MissingEvidence)?;
+    let canonical = canonicalize_ruff_fix(
+        scratch,
+        observation,
+        candidate,
+        evidence,
+        RuffFixLimits::default(),
+    )?;
+    Ok(Some(PreparedRuffFix {
+        candidate: (*candidate).clone(),
+        canonical,
+        projection,
+    }))
+}
+
 fn preflight_provider_projection_collections(
     providers: &[(PlannedProvider, ProviderSessionState)],
 ) -> Result<(), ReportAssemblyError> {
@@ -993,16 +1062,22 @@ pub(crate) fn project_patch_verification(
     if !before.fix_candidates.contains(candidate) {
         return Err(ScratchError::CandidateNotAuthorized.into());
     }
+    if before.config != after.config {
+        return Err(PatchVerificationError::ConfigMismatch);
+    }
     scratch.validate_applied_patch_evidence(patch, &patch_evidence)?;
     preflight_projection_collections(
-        0,
+        before
+            .observations
+            .len()
+            .saturating_add(after.observations.len()),
         before
             .evidence
             .len()
             .saturating_add(after.evidence.len())
             .saturating_add(after.executions.len())
             .saturating_add(2),
-        0,
+        1,
         before
             .executions
             .len()
@@ -1026,6 +1101,10 @@ pub(crate) fn project_patch_verification(
         }
     }
     targets.sort();
+    let config = before.config.clone();
+    let session_id = after.plan_id.clone();
+    let mut observations = before.observations.clone();
+    observations.extend(after.observations.clone());
     let mut candidate = candidate.clone();
     candidate.patch_evidence_id = patch_evidence.evidence_id.clone();
     let patch_sha256 = patch_evidence.sha256.clone();
@@ -1066,6 +1145,9 @@ pub(crate) fn project_patch_verification(
     }
     executions.extend(verification_executions);
     Ok(PatchVerificationProjection {
+        config,
+        session_id,
+        observations,
         candidate,
         evidence,
         executions,
@@ -1116,6 +1198,46 @@ pub(crate) fn authorize_canonical_ruff_verification(
         projection,
         authorization,
     })
+}
+
+pub(crate) fn assemble_verified_report(
+    authorized: AuthorizedPatchVerification,
+    evaluation_time: Option<String>,
+) -> Result<SessionReport, ReadOnlyReportError> {
+    let AuthorizedPatchVerification {
+        projection,
+        authorization,
+    } = authorized;
+    let verified = authorization.verified_fix();
+    let mut findings = verified.verified_targets.clone();
+    findings.extend(verified.post_fix_findings.clone());
+    let PatchVerificationProjection {
+        config,
+        session_id,
+        observations,
+        candidate,
+        evidence,
+        executions,
+        ..
+    } = projection;
+    preflight_projection_collections(observations.len(), evidence.len(), 1, executions.len())?;
+    let policy = config.policy_snapshot()?;
+    Ok(assemble_session_report(
+        ReportAssemblyInput {
+            session_id,
+            engine: EngineIdentity {
+                version: config.engine.version,
+                source_revision: config.engine.source_revision,
+            },
+            observations,
+            findings,
+            evidence,
+            fix_candidates: vec![candidate],
+            executions,
+            evaluation_time,
+        },
+        &policy,
+    )?)
 }
 
 fn classify_projection(
@@ -1282,10 +1404,11 @@ mod tests {
     use std::{env, fs, path::Path};
 
     use super::{
-        PatchVerificationError, PlannedProvider, ReadOnlyMode, ReadOnlyReportError,
-        ReadOnlyRuntimeProjection, RuntimeProjectionError, assemble_read_only_report,
-        authorize_canonical_ruff_verification, build_read_only_plan, execute_fix_plan,
-        execute_patch_verification, execute_read_only_plan, preflight_projection_collections,
+        FixPreparationError, PatchVerificationError, PlannedProvider, ReadOnlyMode,
+        ReadOnlyReportError, ReadOnlyRuntimeProjection, RuntimeProjectionError,
+        assemble_read_only_report, assemble_verified_report, authorize_canonical_ruff_verification,
+        build_read_only_plan, execute_fix_plan, execute_patch_verification, execute_read_only_plan,
+        preflight_projection_collections, prepare_single_canonical_ruff_fix,
         project_patch_verification, project_provider_states, resolve_provider_program,
         resolve_workspace, synthesize_execution,
     };
@@ -1331,6 +1454,21 @@ mod tests {
         before: ReadOnlyRuntimeProjection,
         after: ReadOnlyRuntimeProjection,
     ) {
+        let report = assemble_verified_report(
+            authorize_canonical_ruff_verification(
+                scratch,
+                canonical,
+                candidate,
+                application,
+                before.clone(),
+                after.clone(),
+            )
+            .unwrap(),
+            Some("2026-07-23T00:00:00Z".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(report.fix_candidates.len(), 1);
+        assert_eq!(report.findings.len(), 1);
         let authorized = authorize_canonical_ruff_verification(
             scratch,
             canonical,
@@ -1699,6 +1837,19 @@ mod tests {
             RuffFixLimits::default(),
         )
         .unwrap();
+        let prepared = prepare_single_canonical_ruff_fix(&scratch, before.clone())
+            .unwrap()
+            .unwrap();
+        assert_eq!(prepared.candidate, candidate);
+        assert_eq!(prepared.canonical.patch, canonical.patch);
+        let mut ambiguous = before.clone();
+        let mut competing = candidate.clone();
+        competing.fix_candidate_id = "019f7e95-0000-7000-8000-000000000399".parse().unwrap();
+        ambiguous.fix_candidates.push(competing);
+        assert!(matches!(
+            prepare_single_canonical_ruff_fix(&scratch, ambiguous),
+            Err(FixPreparationError::AmbiguousSafeCandidates { count: 2 })
+        ));
         let application = scratch.apply_for_verification(&canonical.patch).unwrap();
         let mut after = before.clone();
         after.observations.clear();
