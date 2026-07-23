@@ -524,7 +524,7 @@ fn phase(value: Option<u32>) -> PhaseDuration {
 
 fn performance(run: &PhaseDuration) -> Performance {
     let status = match run {
-        PhaseDuration::Milliseconds(value) if *value > PERFORMANCE_BUDGET_MS => {
+        PhaseDuration::Milliseconds(value) if *value >= PERFORMANCE_BUDGET_MS => {
             PerformanceStatus::ImprovementCandidate
         }
         PhaseDuration::Milliseconds(_) => PerformanceStatus::WithinBudget,
@@ -1217,6 +1217,20 @@ mod tests {
             execution.toolchain_fingerprint,
             ToolchainFingerprint::Unavailable(_)
         ));
+    }
+
+    #[test]
+    fn classifies_the_sixty_second_budget_inclusively() {
+        for (duration, expected) in [
+            (59_999, PerformanceStatus::WithinBudget),
+            (60_000, PerformanceStatus::ImprovementCandidate),
+            (60_001, PerformanceStatus::ImprovementCandidate),
+        ] {
+            assert_eq!(
+                crate::performance(&PhaseDuration::Milliseconds(duration)).status,
+                expected
+            );
+        }
     }
 
     #[test]
