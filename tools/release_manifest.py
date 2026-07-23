@@ -219,6 +219,41 @@ def _require_release_directory(
         )
 
 
+def _artifact_output_names(artifact_dir: Path, *paths: Path) -> set[str]:
+    try:
+        artifact_root = artifact_dir.resolve()
+        names: set[str] = set()
+        for path in paths:
+            resolved = path.resolve()
+            try:
+                relative = resolved.relative_to(artifact_root)
+            except ValueError:
+                continue
+            if len(relative.parts) != 1:
+                raise ReleaseContractError(
+                    "release outputs inside the artifact directory "
+                    "must be direct children"
+                )
+            names.add(relative.name)
+        return names
+    except (OSError, RuntimeError) as error:
+        raise ReleaseContractError(
+            f"cannot resolve release output paths: {error}"
+        ) from error
+
+
+def _require_distinct_output_names(
+    archive_names: AbstractSet[str],
+    manifest_path: Path,
+    checksums_path: Path,
+) -> None:
+    output_names = [manifest_path.name, checksums_path.name]
+    if len(set(output_names)) != 2 or set(archive_names).intersection(output_names):
+        raise ReleaseContractError(
+            "release manifest, checksums, and archive names must be distinct"
+        )
+
+
 def create_release_manifest(
     *,
     repository_root: Path,
@@ -242,10 +277,19 @@ def create_release_manifest(
 
     source_name = f"diagnostic-triage-v{matrix.version}-source.tar.gz"
     required_names = {spec.archive for spec in matrix.artifacts} | {source_name}
+    _require_distinct_output_names(
+        required_names,
+        manifest_path,
+        checksums_path,
+    )
     _require_release_directory(
         artifact_dir,
         required=required_names,
-        permitted_outputs={manifest_path.name, checksums_path.name},
+        permitted_outputs=_artifact_output_names(
+            artifact_dir,
+            manifest_path,
+            checksums_path,
+        ),
     )
     artifact_records = [
         _artifact_record(
@@ -333,12 +377,17 @@ def verify_release(
             "expected source revision must be 40 lowercase hex digits"
         )
     source_name = f"diagnostic-triage-v{matrix.version}-source.tar.gz"
-    required_names = {
-        *(spec.archive for spec in matrix.artifacts),
-        source_name,
-        manifest_path.name,
-        checksums_path.name,
-    }
+    archive_names = {*(spec.archive for spec in matrix.artifacts), source_name}
+    _require_distinct_output_names(
+        archive_names,
+        manifest_path,
+        checksums_path,
+    )
+    required_names = archive_names | _artifact_output_names(
+        artifact_dir,
+        manifest_path,
+        checksums_path,
+    )
     _require_release_directory(artifact_dir, required=required_names)
     raw = _object_record(_load_json(manifest_path), "release manifest")
     _require_fields(

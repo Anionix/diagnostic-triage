@@ -126,6 +126,55 @@ class ReleaseContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ReleaseContractError, "does not match"):
             self.verify()
 
+    def test_external_metadata_outputs_round_trip_without_aliasing_dist(self) -> None:
+        metadata_dir = self.root / "metadata"
+        external_manifest = metadata_dir / self.manifest.name
+        external_checksums = metadata_dir / self.checksums.name
+
+        create_release_manifest(
+            repository_root=ROOT,
+            matrix_path=MATRIX_PATH,
+            artifact_dir=self.artifact_dir,
+            tag=f"v{self.matrix.version}",
+            revision=REVISION,
+            manifest_path=external_manifest,
+            checksums_path=external_checksums,
+        )
+        verify_release(
+            repository_root=ROOT,
+            matrix_path=MATRIX_PATH,
+            artifact_dir=self.artifact_dir,
+            expected_tag=f"v{self.matrix.version}",
+            expected_revision=REVISION,
+            manifest_path=external_manifest,
+            checksums_path=external_checksums,
+        )
+
+        (self.artifact_dir / self.manifest.name).write_bytes(b"unrelated\n")
+        with self.assertRaisesRegex(ReleaseContractError, "does not match"):
+            create_release_manifest(
+                repository_root=ROOT,
+                matrix_path=MATRIX_PATH,
+                artifact_dir=self.artifact_dir,
+                tag=f"v{self.matrix.version}",
+                revision=REVISION,
+                manifest_path=external_manifest,
+                checksums_path=external_checksums,
+            )
+
+        (self.artifact_dir / self.manifest.name).unlink()
+        nested_manifest = self.artifact_dir / "metadata" / self.manifest.name
+        with self.assertRaisesRegex(ReleaseContractError, "direct children"):
+            create_release_manifest(
+                repository_root=ROOT,
+                matrix_path=MATRIX_PATH,
+                artifact_dir=self.artifact_dir,
+                tag=f"v{self.matrix.version}",
+                revision=REVISION,
+                manifest_path=nested_manifest,
+                checksums_path=external_checksums,
+            )
+
     def test_symlink_artifact_and_duplicate_manifest_key_are_rejected(self) -> None:
         target = self.artifact_dir / self.matrix.artifacts[0].archive
         target.unlink()
