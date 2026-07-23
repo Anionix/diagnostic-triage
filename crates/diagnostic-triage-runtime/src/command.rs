@@ -21,8 +21,9 @@ use similar::TextDiff;
 use thiserror::Error;
 
 use crate::orchestration::{
-    PreparedRuffFix, ReadOnlyMode, assemble_read_only_report, assemble_verified_report,
-    authorize_canonical_ruff_verification, execute_current_read_only_plan, execute_fix_plan,
+    AuthorizedPatchVerification, PreparedRuffFix, ReadOnlyMode, RepositoryState,
+    assemble_read_only_report, assemble_verified_report, authorize_canonical_ruff_verification,
+    capture_repository_state, execute_current_read_only_plan, execute_fix_plan,
     execute_patch_verification, prepare_single_canonical_ruff_fix, project_executed_read_only_plan,
 };
 use crate::{
@@ -93,6 +94,14 @@ pub enum FixCommandError {
     PatchMismatch,
     #[error("safe-fix verification failed: {0}")]
     Verification(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("repository changed while the verified patch was being prepared")]
+    RepositoryChanged,
+    #[error("verified patch output failed before source publication: {0}")]
+    PatchOutput(#[source] std::io::Error),
+    #[error("fix --apply-safe source publication is supported only on Linux and Apple platforms")]
+    ApplySafePlatformUnsupported,
+    #[error("safe patch was applied, but the final repository no longer matches verification")]
+    AppliedRepositoryConflict,
     #[error("report assembly failed: {0}")]
     Report(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("no authoritative SAFE fix candidate was produced")]
@@ -101,6 +110,11 @@ pub enum FixCommandError {
     OperationAndCleanup {
         #[source]
         operation: Box<FixCommandError>,
+        cleanup: Box<FixCommandError>,
+    },
+    #[error("safe patch was applied, but scratch cleanup failed ({cleanup})")]
+    AppliedAndCleanup {
+        #[source]
         cleanup: Box<FixCommandError>,
     },
 }
@@ -206,6 +220,134 @@ pub fn run_fix_command(
     finish_with_cleanup(result, cleanup)
 }
 
+/// Verify and explicitly apply one authoritative SAFE Ruff fix to the source repository.
+///
+/// The tool-native candidate is canonicalized and verified in private workspaces first. The
+/// runtime emits the verified patch, consumes the exact authorization, revalidates the source
+/// snapshot, and atomically exchanges the single-file result. No output failure or
+/// pre-publication safety failure writes to the source repository. The output callback must return
+/// success only after its destination accepted and flushed the complete patch.
+///
+/// # Errors
+///
+/// Returns a typed operational failure when any safety gate, source binding, publication, or
+/// cleanup step fails.
+pub fn run_apply_safe_command(
+    config: &RuntimeConfig,
+    repository_root: &Path,
+    evaluation_time: impl FnOnce() -> Option<String>,
+    emit_patch: impl FnOnce(&[u8]) -> std::io::Result<()>,
+) -> Result<FixCommandResult, FixCommandError> {
+    // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED ->
+    // REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
+    // LLM contract: EXPLICIT_REQUEST -> SAFE_SELECTED -> TOOL_NATIVE -> SCRATCH_APPLIED ->
+    // PROVIDERS_COMPLETE -> REGRESSION_FREE -> SOURCE_REVALIDATED -> AUTH_CONSUMED -> PUBLISHED;
+    // any failed gate before PUBLISHED leaves the source repository unchanged.
+    let source_state = capture_source_state(repository_root)?;
+    let paths = materialized_repository_paths(config, repository_root)?;
+    let mut scratch = stage_snapshot(config, repository_root, &paths)?;
+    let result = (|| {
+        require_source_state(repository_root, &source_state)?;
+        let executed = execute_fix_plan(config, repository_root, &scratch)
+            .map_err(|error| FixCommandError::Execution(Box::new(error)))?;
+        let before = project_executed_read_only_plan(executed)
+            .map_err(|error| FixCommandError::Projection(Box::new(error)))?;
+        let report_time = before
+            .requires_evaluation_time()
+            .then(evaluation_time)
+            .flatten();
+        let no_fix_projection = before.clone();
+        let Some(PreparedRuffFix {
+            projection: before,
+            candidate,
+            canonical,
+        }) = prepare_single_canonical_ruff_fix(&scratch, before)
+            .map_err(|error| FixCommandError::Preparation(Box::new(error)))?
+        else {
+            require_source_state(repository_root, &source_state)?;
+            let report = assemble_read_only_report(no_fix_projection, report_time)
+                .map_err(|error| FixCommandError::Report(Box::new(error)))?;
+            return Ok((
+                FixCommandResult {
+                    patch: Vec::new(),
+                    exit_code: verdict_exit_code(&report.verdict),
+                },
+                false,
+            ));
+        };
+        let unified = render_unified_patch(&scratch, &canonical.patch)?;
+
+        let application = scratch
+            .apply_for_verification(&canonical.patch)
+            .map_err(|error| FixCommandError::Scratch(Box::new(error)))?;
+        let canonical_result = scratch
+            .capture(&canonical.patch, None)
+            .map_err(|error| FixCommandError::Scratch(Box::new(error)))?
+            .result
+            .sha256;
+        verify_unified_patch_result(
+            config,
+            repository_root,
+            &paths,
+            &scratch.base_evidence().sha256,
+            &canonical_result,
+            &unified,
+        )?;
+
+        let executed =
+            execute_patch_verification(config, repository_root, &scratch, &canonical.patch)
+                .map_err(|error| FixCommandError::Execution(Box::new(error)))?;
+        let after = project_executed_read_only_plan(executed)
+            .map_err(|error| FixCommandError::Projection(Box::new(error)))?;
+        let AuthorizedPatchVerification {
+            projection,
+            authorization,
+        } = authorize_canonical_ruff_verification(
+            &scratch,
+            &canonical,
+            &candidate,
+            &application,
+            before,
+            after,
+        )
+        .map_err(|error| FixCommandError::Verification(Box::new(error)))?;
+        let verified_candidate = projection.candidate.clone();
+        let report =
+            assemble_verified_report(projection, authorization.verified_fix(), report_time)
+                .map_err(|error| FixCommandError::Report(Box::new(error)))?;
+
+        require_source_state(repository_root, &source_state)?;
+        emit_patch(&unified).map_err(FixCommandError::PatchOutput)?;
+        require_source_state(repository_root, &source_state)?;
+        scratch
+            .publish_verified_to_source(
+                &verified_candidate,
+                &canonical.patch,
+                &canonical.patch_evidence,
+                authorization,
+            )
+            .map_err(|error| FixCommandError::Scratch(Box::new(error)))?;
+        verify_published_repository(
+            config,
+            repository_root,
+            &paths,
+            &source_state,
+            &canonical_result,
+        )?;
+        Ok((
+            FixCommandResult {
+                patch: unified,
+                exit_code: verdict_exit_code(&report.verdict),
+            },
+            true,
+        ))
+    })();
+    let cleanup = scratch
+        .cleanup()
+        .map_err(|error| FixCommandError::Scratch(Box::new(error)));
+    finish_apply_with_cleanup(result, cleanup)
+}
+
 /// Verify that an arbitrary unified diff has the exact result of one authoritative SAFE Ruff fix.
 ///
 /// Both the imported patch and the canonical candidate are applied only to private scratch
@@ -283,7 +425,10 @@ pub fn run_verify_patch_command(
         .map_err(|error| FixCommandError::Execution(Box::new(error)))?;
         let after = project_executed_read_only_plan(executed)
             .map_err(|error| FixCommandError::Projection(Box::new(error)))?;
-        let authorized = authorize_canonical_ruff_verification(
+        let AuthorizedPatchVerification {
+            projection,
+            authorization,
+        } = authorize_canonical_ruff_verification(
             &canonical_scratch,
             &canonical,
             &candidate,
@@ -292,13 +437,106 @@ pub fn run_verify_patch_command(
             after,
         )
         .map_err(|error| FixCommandError::Verification(Box::new(error)))?;
-        assemble_verified_report(authorized, evaluation_time())
+        assemble_verified_report(projection, authorization.verified_fix(), evaluation_time())
             .map_err(|error| FixCommandError::Report(Box::new(error)))
     })();
     let canonical_cleanup = canonical_scratch
         .cleanup()
         .map_err(|error| FixCommandError::Scratch(Box::new(error)));
     finish_with_cleanup(result, canonical_cleanup)
+}
+
+fn verify_unified_patch_result(
+    config: &RuntimeConfig,
+    repository_root: &Path,
+    paths: &[String],
+    expected_base: &Sha256Digest,
+    expected_result: &Sha256Digest,
+    unified: &[u8],
+) -> Result<(), FixCommandError> {
+    let imported = stage_snapshot(config, repository_root, paths)?;
+    let result = (|| {
+        if &imported.base_evidence().sha256 != expected_base {
+            return Err(FixCommandError::PatchMismatch);
+        }
+        apply_unified_patch(imported.path(), unified)?;
+        let empty = ScratchPatch::new(Vec::new())
+            .map_err(|error| FixCommandError::Scratch(Box::new(error)))?;
+        let result = imported
+            .capture(&empty, None)
+            .map_err(|error| FixCommandError::Scratch(Box::new(error)))?
+            .result
+            .sha256;
+        if &result != expected_result {
+            return Err(FixCommandError::PatchMismatch);
+        }
+        Ok(())
+    })();
+    let cleanup = imported
+        .cleanup()
+        .map_err(|error| FixCommandError::Scratch(Box::new(error)));
+    finish_with_cleanup(result, cleanup)
+}
+
+fn capture_source_state(repository_root: &Path) -> Result<RepositoryState, FixCommandError> {
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
+    {
+        capture_repository_state(repository_root)
+            .map_err(|error| FixCommandError::Snapshot(Box::new(error)))
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+    {
+        let _ = repository_root;
+        Err(FixCommandError::ApplySafePlatformUnsupported)
+    }
+}
+
+fn require_source_state(
+    repository_root: &Path,
+    expected: &RepositoryState,
+) -> Result<(), FixCommandError> {
+    if &capture_source_state(repository_root)? != expected {
+        return Err(FixCommandError::RepositoryChanged);
+    }
+    Ok(())
+}
+
+fn verify_published_repository(
+    config: &RuntimeConfig,
+    repository_root: &Path,
+    expected_paths: &[String],
+    source_state: &RepositoryState,
+    expected_result: &Sha256Digest,
+) -> Result<(), FixCommandError> {
+    let current_state = capture_repository_state(repository_root)
+        .map_err(|_| FixCommandError::AppliedRepositoryConflict)?;
+    if !published_repository_identity_matches(&current_state, source_state) {
+        return Err(FixCommandError::AppliedRepositoryConflict);
+    }
+    let current_paths = materialized_repository_paths(config, repository_root)
+        .map_err(|_| FixCommandError::AppliedRepositoryConflict)?;
+    if current_paths != expected_paths {
+        return Err(FixCommandError::AppliedRepositoryConflict);
+    }
+    let comparison = stage_snapshot(config, repository_root, &current_paths)
+        .map_err(|_| FixCommandError::AppliedRepositoryConflict)?;
+    let matches = comparison.base_evidence().sha256 == *expected_result;
+    comparison
+        .cleanup()
+        .map_err(|error| FixCommandError::AppliedAndCleanup {
+            cleanup: Box::new(FixCommandError::Scratch(Box::new(error))),
+        })?;
+    if !matches {
+        return Err(FixCommandError::AppliedRepositoryConflict);
+    }
+    Ok(())
+}
+
+fn published_repository_identity_matches(
+    current: &RepositoryState,
+    source: &RepositoryState,
+) -> bool {
+    current[0] == source[0] && current[1] == source[1] && current[3] == source[3]
 }
 
 fn finish_with_cleanup<T>(
@@ -309,6 +547,24 @@ fn finish_with_cleanup<T>(
         (Ok(value), Ok(())) => Ok(value),
         (Err(operation), Ok(())) => Err(operation),
         (Ok(_), Err(cleanup)) => Err(cleanup),
+        (Err(operation), Err(cleanup)) => Err(FixCommandError::OperationAndCleanup {
+            operation: Box::new(operation),
+            cleanup: Box::new(cleanup),
+        }),
+    }
+}
+
+fn finish_apply_with_cleanup<T>(
+    operation: Result<(T, bool), FixCommandError>,
+    cleanup: Result<(), FixCommandError>,
+) -> Result<T, FixCommandError> {
+    match (operation, cleanup) {
+        (Ok((value, _)), Ok(())) => Ok(value),
+        (Err(operation), Ok(())) => Err(operation),
+        (Ok((_, true)), Err(cleanup)) => Err(FixCommandError::AppliedAndCleanup {
+            cleanup: Box::new(cleanup),
+        }),
+        (Ok((_, false)), Err(cleanup)) => Err(cleanup),
         (Err(operation), Err(cleanup)) => Err(FixCommandError::OperationAndCleanup {
             operation: Box::new(operation),
             cleanup: Box::new(cleanup),
@@ -705,6 +961,39 @@ mod tests {
     }
 
     #[test]
+    fn source_state_rejects_a_skipped_tracked_deletion_that_reappears() {
+        let repository = git_repository();
+        fs::remove_file(repository.path().join("unrelated.txt")).expect("delete unrelated");
+        let source_state = capture_source_state(repository.path()).expect("source state");
+        let config = repository_config("src");
+        let paths = materialized_repository_paths(&config, repository.path()).expect("paths");
+        assert!(!paths.iter().any(|path| path == "unrelated.txt"));
+
+        fs::write(repository.path().join("unrelated.txt"), b"restored\n").expect("restore tracked");
+
+        assert!(matches!(
+            require_source_state(repository.path(), &source_state),
+            Err(FixCommandError::RepositoryChanged)
+        ));
+    }
+
+    #[test]
+    fn published_identity_rejects_ignored_or_untracked_drift() {
+        let source = [
+            b"head".to_vec(),
+            b"index".to_vec(),
+            b"tracked-before".to_vec(),
+            b"untracked-before".to_vec(),
+        ];
+        let mut current = source.clone();
+        current[2] = b"tracked-after".to_vec();
+        assert!(published_repository_identity_matches(&current, &source));
+
+        current[3] = b"untracked-after".to_vec();
+        assert!(!published_repository_identity_matches(&current, &source));
+    }
+
+    #[test]
     fn materialized_paths_reject_missing_required_target_explicitly() {
         let repository = git_repository();
         fs::remove_file(repository.path().join("src/lib.rs")).expect("delete target");
@@ -715,6 +1004,26 @@ mod tests {
         assert!(matches!(
             error,
             FixCommandError::MissingRequiredPath { path } if path == "src/lib.rs"
+        ));
+    }
+
+    #[test]
+    fn applied_cleanup_failure_remains_explicitly_committed() {
+        let error = finish_apply_with_cleanup(Ok(((), true)), Err(FixCommandError::PatchFormat))
+            .expect_err("published cleanup failure");
+
+        assert!(matches!(
+            error,
+            FixCommandError::AppliedAndCleanup { cleanup }
+                if matches!(*cleanup, FixCommandError::PatchFormat)
+        ));
+    }
+
+    #[test]
+    fn noop_cleanup_failure_is_not_reported_as_applied() {
+        assert!(matches!(
+            finish_apply_with_cleanup(Ok(((), false)), Err(FixCommandError::PatchFormat)),
+            Err(FixCommandError::PatchFormat)
         ));
     }
 
