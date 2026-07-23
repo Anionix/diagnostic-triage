@@ -1,6 +1,7 @@
 //! Narrow command facade used by the unpublished CLI crate.
 
 use std::{
+    collections::BTreeSet,
     fmt::Write as _,
     fs,
     path::{Component, Path},
@@ -67,6 +68,8 @@ pub struct FixCommandResult {
 pub enum FixCommandError {
     #[error("repository snapshot discovery failed: {0}")]
     Snapshot(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error("required repository path is missing: {path}")]
+    MissingRequiredPath { path: String },
     #[error("scratch workspace failed: {0}")]
     Scratch(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("fix Provider execution failed: {0}")]
@@ -337,6 +340,10 @@ fn materialized_repository_paths(
     config: &RuntimeConfig,
     repository_root: &Path,
 ) -> Result<Vec<String>, FixCommandError> {
+    // LLM contract: DISCOVERED -> NORMALIZED -> CLASSIFIED -> FIX_PROPOSED -> VERIFIED ->
+    // REPORTED; execution terminal: INCOMPLETE | UNSUPPORTED.
+    // Git documents that --cached lists index entries, not only materialized worktree paths:
+    // https://git-scm.com/docs/git-ls-files
     let outcome = run_bounded(
         &ProcessSpec::new("git")
             .args([
@@ -375,6 +382,49 @@ fn materialized_repository_paths(
                 .map_err(|error| FixCommandError::Snapshot(Box::new(error)))
         })
         .collect::<Result<Vec<_>, _>>()?;
+
+    let required_paths = configured_materialized_paths(config);
+    let required_paths = required_paths.into_iter().collect::<BTreeSet<_>>();
+    let mut materialized = Vec::with_capacity(paths.len() + required_paths.len());
+    for path in paths.drain(..) {
+        match fs::symlink_metadata(repository_root.join(&path)) {
+            Ok(_) => materialized.push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if required_paths.contains(&path) {
+                    return Err(FixCommandError::MissingRequiredPath { path });
+                }
+                // `git ls-files --cached` includes tracked files deleted from the
+                // worktree. They are unrelated unless explicitly selected below.
+            }
+            Err(source) => {
+                return Err(FixCommandError::Snapshot(Box::new(std::io::Error::other(
+                    format!("cannot inspect repository path {path}: {source}"),
+                ))));
+            }
+        }
+    }
+
+    for path in required_paths {
+        match fs::symlink_metadata(repository_root.join(&path)) {
+            Ok(_) => materialized.push(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(FixCommandError::MissingRequiredPath { path });
+            }
+            Err(source) => {
+                return Err(FixCommandError::Snapshot(Box::new(std::io::Error::other(
+                    format!("cannot inspect required repository path {path}: {source}"),
+                ))));
+            }
+        }
+    }
+
+    materialized.sort();
+    materialized.dedup();
+    Ok(materialized)
+}
+
+fn configured_materialized_paths(config: &RuntimeConfig) -> Vec<String> {
+    let mut paths = Vec::new();
     if config.repository.workspace.as_str() != "." {
         paths.push(config.repository.workspace.as_str().to_owned());
     }
@@ -397,7 +447,7 @@ fn materialized_repository_paths(
     }));
     paths.sort();
     paths.dedup();
-    Ok(paths)
+    paths
 }
 
 fn render_unified_patch(
@@ -583,7 +633,44 @@ pub const fn verdict_exit_code(verdict: &Verdict) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use tempfile::tempdir;
+
+    fn git_repository() -> tempfile::TempDir {
+        let repository = tempdir().expect("repository");
+        fs::create_dir(repository.path().join("src")).expect("source directory");
+        fs::write(
+            repository.path().join("src/lib.rs"),
+            b"pub fn value() -> u8 { 1 }\n",
+        )
+        .expect("source");
+        fs::write(repository.path().join("unrelated.txt"), b"unrelated\n").expect("unrelated");
+        for arguments in [
+            &["init", "-q"][..],
+            &["config", "user.name", "test"][..],
+            &["config", "user.email", "test@example.invalid"][..],
+            &["config", "commit.gpgsign", "false"][..],
+            &["add", "-A"][..],
+            &["commit", "-qm", "baseline"][..],
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(arguments)
+                    .current_dir(repository.path())
+                    .status()
+                    .expect("git")
+                    .success()
+            );
+        }
+        repository
+    }
+
+    fn repository_config(target: &str) -> RuntimeConfig {
+        RuntimeConfig::from_toml(&format!(
+            "[engine]\nversion=\"0.1.0\"\nsource_revision=\"a12b34c56d78e90f1234567890abcdef12345678\"\n[repository]\nworkspace=\".\"\ntargets=[\"{target}\"]\n"
+        ))
+        .expect("valid configuration")
+    }
 
     #[test]
     fn operation_and_cleanup_failures_are_both_retained() {
@@ -600,6 +687,34 @@ mod tests {
                 cleanup,
             } if matches!(*operation, FixCommandError::NoSafeCandidate)
                 && matches!(*cleanup, FixCommandError::PatchFormat)
+        ));
+    }
+
+    #[test]
+    fn materialized_paths_ignore_unrelated_deleted_tracked_files() {
+        let repository = git_repository();
+        fs::remove_file(repository.path().join("unrelated.txt")).expect("delete unrelated");
+
+        let config = repository_config("src");
+        let paths = materialized_repository_paths(&config, repository.path()).expect("paths");
+        assert!(paths.iter().any(|path| path == "src/lib.rs"));
+        assert!(!paths.iter().any(|path| path == "unrelated.txt"));
+
+        let scratch = stage_snapshot(&config, repository.path(), &paths).expect("scratch stage");
+        scratch.cleanup().expect("scratch cleanup");
+    }
+
+    #[test]
+    fn materialized_paths_reject_missing_required_target_explicitly() {
+        let repository = git_repository();
+        fs::remove_file(repository.path().join("src/lib.rs")).expect("delete target");
+
+        let config = repository_config("src/lib.rs");
+        let error = materialized_repository_paths(&config, repository.path())
+            .expect_err("missing target must fail");
+        assert!(matches!(
+            error,
+            FixCommandError::MissingRequiredPath { path } if path == "src/lib.rs"
         ));
     }
 
