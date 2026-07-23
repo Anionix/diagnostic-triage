@@ -66,10 +66,10 @@ impl Default for RuffFixLimits {
 /// Auditable linkage from authoritative Ruff Evidence to its canonical patch Evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuffFixEvidenceMapping {
-    /// Ruff Evidence identifier supplied by the Provider.
-    pub source_evidence_id: ObjectId,
-    /// Digest of the complete Ruff Evidence content.
-    pub source_sha256: Sha256Digest,
+    /// Exact `FixCandidate` validated while canonicalizing the Ruff source.
+    pub candidate: FixCandidate,
+    /// Complete Ruff Evidence snapshot supplied by the Provider.
+    pub source_evidence: Evidence,
     /// Runtime-created canonical patch Evidence identifier.
     pub canonical_evidence_id: ObjectId,
     /// Digest of the deterministic canonical patch JSON.
@@ -84,7 +84,15 @@ pub struct CanonicalRuffFix {
     /// Complete inline `application/vnd.diagnostic-triage.patch+json` Evidence.
     pub patch_evidence: Evidence,
     /// Source-to-canonical Evidence lineage.
-    pub evidence_mapping: RuffFixEvidenceMapping,
+    evidence_mapping: RuffFixEvidenceMapping,
+}
+
+impl CanonicalRuffFix {
+    /// Return the immutable Provider-source to runtime-patch provenance.
+    #[must_use]
+    pub fn evidence_mapping(&self) -> &RuffFixEvidenceMapping {
+        &self.evidence_mapping
+    }
 }
 
 /// Typed fail-closed rejection from Ruff fix canonicalization.
@@ -222,8 +230,8 @@ pub fn canonicalize_ruff_fix(
     debug_assert_eq!(captured.patch.media_type, PATCH_MEDIA_TYPE);
 
     let evidence_mapping = RuffFixEvidenceMapping {
-        source_evidence_id: source_evidence.evidence_id.clone(),
-        source_sha256: source_evidence.sha256.clone(),
+        candidate: candidate.clone(),
+        source_evidence: source_evidence.clone(),
         canonical_evidence_id: captured.patch.evidence_id.clone(),
         canonical_sha256: captured.patch.sha256.clone(),
     };

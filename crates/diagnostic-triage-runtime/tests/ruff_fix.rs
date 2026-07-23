@@ -196,16 +196,17 @@ fn canonicalizes_unordered_deletion_replacement_and_insertion_exactly() {
             contents: RESULT.to_vec(),
         }
     );
+    assert_eq!(first.evidence_mapping().candidate, harness.candidate);
     assert_eq!(
-        first.evidence_mapping.source_evidence_id,
+        first.evidence_mapping().source_evidence.evidence_id,
         harness.evidence.evidence_id
     );
     assert_eq!(
-        first.evidence_mapping.canonical_evidence_id,
+        first.evidence_mapping().canonical_evidence_id,
         first.patch_evidence.evidence_id
     );
     assert_eq!(
-        first.evidence_mapping.canonical_sha256,
+        first.evidence_mapping().canonical_sha256,
         first.patch_evidence.sha256
     );
     assert_eq!(
