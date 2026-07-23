@@ -1,0 +1,285 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release contract
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Install pinned Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+
+      - name: Validate tag and expose the checked-in matrix
+        id: matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          python3 -c 'from pathlib import Path; from tools.release_manifest import load_matrix; load_matrix(Path("release/artifact-matrix.json"))'
+          version="$(jq -r '.release_version' release/artifact-matrix.json)"
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            if [[ "${GITHUB_REF_NAME}" != "v${version}" ]]; then
+              echo "tag ${GITHUB_REF_NAME} does not match v${version}" >&2
+              exit 2
+            fi
+            test "$(git rev-parse "${GITHUB_REF}^{commit}")" = "${GITHUB_SHA}"
+          fi
+          echo "matrix=$(jq -c '{include: .artifacts}' release/artifact-matrix.json)" >> "${GITHUB_OUTPUT}"
+
+      - name: Run repository gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          nix develop --accept-flake-config --command bash -euo pipefail -c '
+            cargo fmt --all -- --check
+            cargo clippy --workspace --all-targets --all-features -- -D warnings
+            cargo test --workspace --all-targets --all-features
+            ruff check .
+            ty check
+            pyright
+            pytest
+            lake build
+          '
+          nix flake check --no-build --all-systems --accept-flake-config
+
+  build:
+    name: Build ${{ matrix.rust_target }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.validate.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install pinned Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+
+      - name: Build and smoke-test the native archive
+        shell: bash
+        env:
+          RELEASE_ARCHIVE: ${{ matrix.archive }}
+          RELEASE_SYSTEM: ${{ matrix.system }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          mkdir -p dist unpacked
+          output="$(nix build \
+            --accept-flake-config \
+            --no-link \
+            --print-out-paths \
+            ".#packages.${RELEASE_SYSTEM}.release-archive")"
+          cp -- "${output}/${RELEASE_ARCHIVE}" "dist/${RELEASE_ARCHIVE}"
+          tar -xzf "dist/${RELEASE_ARCHIVE}" -C unpacked
+          root="unpacked/${RELEASE_ARCHIVE%.tar.gz}"
+          for binary in \
+            diagnostic-triage \
+            diagnostic-triage-observer-github-actions \
+            diagnostic-triage-provider-biome \
+            diagnostic-triage-provider-python \
+            diagnostic-triage-provider-rust
+          do
+            test -x "${root}/bin/${binary}"
+          done
+          install_root="$(mktemp -d)"
+          trap 'rm -rf "${install_root}"' EXIT
+          install -d "${install_root}/bin"
+          for binary in \
+            diagnostic-triage \
+            diagnostic-triage-observer-github-actions \
+            diagnostic-triage-provider-biome \
+            diagnostic-triage-provider-python \
+            diagnostic-triage-provider-rust
+          do
+            install -m 0755 "${root}/bin/${binary}" "${install_root}/bin/${binary}"
+          done
+          "${install_root}/bin/diagnostic-triage" --version \
+            | grep -F "diagnostic-triage $(jq -r '.release_version' release/artifact-matrix.json)"
+          for adapter in \
+            diagnostic-triage-observer-github-actions \
+            diagnostic-triage-provider-biome \
+            diagnostic-triage-provider-python \
+            diagnostic-triage-provider-rust
+          do
+            "${install_root}/bin/${adapter}" </dev/null \
+              | jq -e -s 'length == 2 and .[0].kind == "manifest" and .[1].kind == "completion"' \
+              >/dev/null
+          done
+          test -d "${root}/schemas"
+          test -d "${root}/fixtures"
+          test -d "${root}/provenance"
+          test -f "${root}/release/artifact-matrix.json"
+
+      - name: Upload one native archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.system }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Assemble and sign
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Download native archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Assemble source, manifest, and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          version="$(jq -r '.release_version' release/artifact-matrix.json)"
+          revision="${GITHUB_SHA}"
+          source_archive="diagnostic-triage-v${version}-source.tar.gz"
+          git archive \
+            --format=tar \
+            --prefix="diagnostic-triage-v${version}-source/" \
+            "${GITHUB_SHA}" \
+            | gzip -n > "dist/${source_archive}"
+          gzip -t "dist/${source_archive}"
+          source_unpack="$(mktemp -d)"
+          trap 'rm -rf "${source_unpack}"' EXIT
+          tar -xzf "dist/${source_archive}" -C "${source_unpack}"
+          source_root="${source_unpack}/diagnostic-triage-v${version}-source"
+          for required in \
+            Cargo.lock \
+            Cargo.toml \
+            LICENSE \
+            README.md \
+            flake.lock \
+            flake.nix \
+            release/RELEASE_NOTES.md \
+            release/artifact-matrix.json
+          do
+            test -f "${source_root}/${required}"
+          done
+          python3 tools/release_manifest.py create \
+            --repository-root . \
+            --matrix release/artifact-matrix.json \
+            --artifact-dir dist \
+            --tag "v${version}" \
+            --revision "${revision}" \
+            --manifest dist/release-manifest.json \
+            --checksums dist/SHA256SUMS
+          python3 tools/release_manifest.py verify \
+            --repository-root . \
+            --matrix release/artifact-matrix.json \
+            --artifact-dir dist \
+            --tag "v${version}" \
+            --revision "${revision}" \
+            --manifest dist/release-manifest.json \
+            --checksums dist/SHA256SUMS
+
+      - name: Install pinned Cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.2
+
+      - name: Sign and immediately verify every release input
+        shell: bash
+        run: |
+          set -euo pipefail
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}"
+          while IFS= read -r asset; do
+            cosign sign-blob \
+              --yes \
+              --bundle "${asset}.sigstore.json" \
+              "${asset}"
+            cosign verify-blob \
+              --bundle "${asset}.sigstore.json" \
+              --certificate-identity "${identity}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "${asset}"
+          done < <(
+            find dist -maxdepth 1 -type f \
+              \( -name '*.tar.gz' -o -name 'release-manifest.json' -o -name 'SHA256SUMS' \) \
+              -print \
+              | sort
+          )
+
+      - name: Upload the complete dry-run release set
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: diagnostic-triage-release-${{ github.sha }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish tagged release
+    if: github.event_name == 'push'
+    needs: publish
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the exact revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Download the signed release set
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: diagnostic-triage-release-${{ github.sha }}
+          path: dist
+
+      - name: Publish the tagged pre-alpha release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          git fetch --force --tags origin
+          test "$(git rev-parse "${GITHUB_REF}^{commit}")" = "${GITHUB_SHA}"
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --repo "${GITHUB_REPOSITORY}" \
+            --verify-tag \
+            --prerelease \
+            --notes-file release/RELEASE_NOTES.md
