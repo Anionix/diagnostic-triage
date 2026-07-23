@@ -39,8 +39,9 @@ pub mod sarif;
 pub mod session;
 
 pub use command::{
-    ObserverCommandError, ObserverCommandResult, ReadOnlyCommandMode, RuntimeCommandError,
-    run_github_actions_observer, run_read_only_command, verdict_exit_code,
+    FixCommandError, FixCommandResult, ObserverCommandError, ObserverCommandResult,
+    ReadOnlyCommandMode, RuntimeCommandError, run_fix_command, run_github_actions_observer,
+    run_read_only_command, run_verify_patch_command, verdict_exit_code,
 };
 pub use config::{ConfigError, RuntimeConfig};
 pub use github_annotations::{

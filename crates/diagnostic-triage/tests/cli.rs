@@ -45,6 +45,10 @@ fn init_repository(repository: &Path) {
 fn parser_exposes_public_commands_without_implicit_network_or_apply_flags() {
     assert!(Cli::try_parse_from(["diagnostic-triage", "check"]).is_ok());
     assert!(Cli::try_parse_from(["diagnostic-triage", "ci"]).is_ok());
+    assert!(Cli::try_parse_from(["diagnostic-triage", "fix"]).is_ok());
+    assert!(
+        Cli::try_parse_from(["diagnostic-triage", "verify", "--patch", "candidate.patch",]).is_ok()
+    );
     assert!(
         Cli::try_parse_from([
             "diagnostic-triage",
@@ -87,6 +91,32 @@ fn ci_emits_only_the_selected_report_and_returns_pass() {
 }
 
 #[test]
+fn fix_without_a_safe_candidate_is_empty_and_read_only() {
+    let repository = tempdir().expect("repository");
+    init_repository(repository.path());
+    let cli = Cli::try_parse_from([
+        "diagnostic-triage",
+        "--repository",
+        repository.path().to_str().expect("utf-8 path"),
+        "fix",
+    ])
+    .expect("CLI");
+    let mut output = Vec::new();
+
+    assert_eq!(execute(&cli, &mut output).expect("fix").code(), 0);
+    assert!(output.is_empty());
+    assert!(
+        Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(repository.path())
+            .output()
+            .expect("git status")
+            .stdout
+            .is_empty()
+    );
+}
+
+#[test]
 fn binary_help_and_invalid_arguments_use_separate_streams() {
     let binary = env!("CARGO_BIN_EXE_diagnostic-triage");
     let help = Command::new(binary).arg("--help").output().expect("help");
@@ -94,6 +124,8 @@ fn binary_help_and_invalid_arguments_use_separate_streams() {
     let help_stdout = std::str::from_utf8(&help.stdout).expect("help UTF-8");
     assert!(help_stdout.contains("check"));
     assert!(help_stdout.contains("ci"));
+    assert!(help_stdout.contains("fix"));
+    assert!(help_stdout.contains("verify"));
     assert!(help.stderr.is_empty());
 
     let invalid = Command::new(binary)
