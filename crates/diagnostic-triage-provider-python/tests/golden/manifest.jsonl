@@ -1,1 +1,1 @@
-{"protocol_version":"diagnostic-triage.protocol/v1","kind":"manifest","adapter":{"id":"ruff","version":"0.1.0","kind":"PROVIDER","capabilities":["diagnostic.check/v1","fix.propose/v1"],"languages":["python"]}}
+{"protocol_version":"diagnostic-triage.protocol/v1","kind":"manifest","adapter":{"id":"ruff","version":"0.1.0-alpha.1","kind":"PROVIDER","capabilities":["diagnostic.check/v1","fix.propose/v1"],"languages":["python"]}}
