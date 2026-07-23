@@ -8,6 +8,7 @@ mod process;
 use std::{
     collections::HashSet,
     ffi::OsString,
+    fmt::Write as _,
     io::{self, BufRead, BufReader, Read, Write},
     path::{Component, Path, PathBuf},
     str::FromStr,
@@ -58,7 +59,7 @@ pub enum ProviderError {
     Request(String),
     #[error("Cargo JSON boundary failed: {0}")]
     CargoJson(String),
-    #[error("invalid Rust diagnostic path: {0}")]
+    #[error("invalid Rust diagnostic path")]
     Path(String),
     #[error("Provider model construction failed: {0}")]
     Model(String),
@@ -301,7 +302,14 @@ fn execute_in_workspace(
     let cargo_version = match completed_probe(&cargo_probe, "cargo") {
         Ok(version) => version,
         Err(error) => {
-            append_process_evidence(request, &cargo_probe, "text/plain", &mut ids, &mut events);
+            append_process_evidence(
+                request,
+                &cargo_probe,
+                "text/plain",
+                target_dir,
+                &mut ids,
+                &mut events,
+            );
             return incomplete(
                 request,
                 bounded_events(request, events),
@@ -377,7 +385,14 @@ fn execute_in_workspace(
     let clippy_version = match completed_probe(&clippy_probe, "clippy") {
         Ok(version) => version,
         Err(error) => {
-            append_process_evidence(request, &clippy_probe, "text/plain", &mut ids, &mut events);
+            append_process_evidence(
+                request,
+                &clippy_probe,
+                "text/plain",
+                target_dir,
+                &mut ids,
+                &mut events,
+            );
             return incomplete(
                 request,
                 bounded_events(request, events),
@@ -498,8 +513,13 @@ fn parse_version(bytes: &[u8], expected_name: &str) -> Result<String, String> {
     let name = fields.next();
     let version = fields.next();
     if name != Some(expected_name)
-        || version.is_none_or(str::is_empty)
-        || version.is_some_and(|value| value.chars().count() > 64)
+        || version.is_none_or(|value| {
+            value.is_empty()
+                || value.chars().count() > 64
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+        })
     {
         return Err(format!("{expected_name} version output is malformed"));
     }
@@ -635,6 +655,7 @@ fn append_phase(
         request,
         outcome,
         "application/vnd.cargo.messages+json",
+        scope.verification_target,
         ids,
         events,
     );
@@ -704,8 +725,8 @@ fn append_observations(
         {
             continue;
         }
-        let generated =
-            primary.is_some_and(|span| verification_target_path(&span.file_name, scope));
+        let unredacted_message = diagnostic_message(diagnostic);
+        let generated = diagnostic_is_generated(diagnostic, scope);
         let location = if generated {
             None
         } else {
@@ -717,15 +738,17 @@ fn append_observations(
         if primary.is_some() && location.is_none() && !generated {
             continue;
         }
+        let identity = diagnostic_identity(diagnostic, scope);
         let message = if generated {
-            let mut repository_safe = diagnostic.clone();
-            repository_safe.rendered = None;
-            diagnostic_message(&repository_safe)
+            identity.clone()
         } else {
-            diagnostic_message(diagnostic)
+            redact_verification_target(&unredacted_message, scope)
         };
-        let rule_id = diagnostic.code.as_ref().map(|code| code.code.clone());
-        let key = observation_key(&severity, rule_id.as_deref(), &message, location.as_ref());
+        let rule_id = diagnostic
+            .code
+            .as_ref()
+            .map(|code| redact_verification_target(&code.code, scope));
+        let key = observation_key(&severity, rule_id.as_deref(), &identity, location.as_ref());
         if !seen.insert(key) {
             continue;
         }
@@ -757,9 +780,9 @@ fn severity(level: &str) -> Result<Severity, ProviderError> {
         "error" | "ice" => Ok(Severity::Error),
         "warning" => Ok(Severity::Warning),
         "note" | "help" | "failure-note" => Ok(Severity::Info),
-        _ => Err(ProviderError::Model(format!(
-            "unsupported rustc diagnostic level: {level}"
-        ))),
+        _ => Err(ProviderError::Model(
+            "unsupported rustc diagnostic level".to_owned(),
+        )),
     }
 }
 
@@ -846,6 +869,69 @@ fn verification_target_path(raw: &str, scope: &DiagnosticScope<'_>) -> bool {
         && path.is_absolute()
         && path.starts_with(root)
         && !path.components().any(|part| part == Component::ParentDir)
+}
+
+fn diagnostic_is_generated(diagnostic: &RustcDiagnostic, scope: &DiagnosticScope<'_>) -> bool {
+    diagnostic
+        .spans
+        .iter()
+        .any(|span| verification_target_path(&span.file_name, scope))
+        || std::iter::once(diagnostic.message.as_str())
+            .chain(diagnostic.rendered.as_deref())
+            .chain(
+                diagnostic
+                    .children
+                    .iter()
+                    .map(|child| child.message.as_str()),
+            )
+            .any(|text| verification_target_mentioned(text, scope))
+}
+
+fn verification_target_mentioned(text: &str, scope: &DiagnosticScope<'_>) -> bool {
+    scope.verification_target.is_some_and(|root| {
+        let root = root.to_string_lossy();
+        !root.is_empty()
+            && text.match_indices(root.as_ref()).any(|(start, _)| {
+                let before = text[..start].chars().next_back();
+                let after = text[start + root.len()..].chars().next();
+                before.is_none_or(path_text_boundary)
+                    && after.is_none_or(|value| {
+                        matches!(value, '/' | '\\') || path_text_boundary(value)
+                    })
+            })
+    })
+}
+
+fn path_text_boundary(value: char) -> bool {
+    value.is_whitespace() || !value.is_alphanumeric() && !matches!(value, '_' | '-' | '.')
+}
+
+fn redact_verification_target(message: &str, scope: &DiagnosticScope<'_>) -> String {
+    scope.verification_target.map_or_else(
+        || message.to_owned(),
+        |root| message.replace(root.to_string_lossy().as_ref(), "<verification-target>"),
+    )
+}
+
+fn diagnostic_identity(diagnostic: &RustcDiagnostic, scope: &DiagnosticScope<'_>) -> String {
+    let root = scope
+        .verification_target
+        .map(|path| path.to_string_lossy())
+        .unwrap_or_default();
+    let escaped_root = format!("{root:?}");
+    let root = &escaped_root[1..escaped_root.len().saturating_sub(1)];
+    let identity =
+        format!("{diagnostic:?}")
+            .split(root)
+            .fold(String::new(), |mut identity, segment| {
+                write!(&mut identity, "{}:{segment}", segment.len())
+                    .expect("writing to String cannot fail");
+                identity
+            });
+    format!(
+        "generated Rust diagnostic {}",
+        Sha256Digest::compute(identity.as_bytes()).as_str()
+    )
 }
 
 fn validate_rustc_span(span: &RustcSpan) -> Result<(), ProviderError> {
@@ -1090,9 +1176,13 @@ fn append_process_evidence(
     request: &RequestEnvelope,
     outcome: &ProcessOutcome,
     stdout_media_type: &str,
+    verification_target: Option<&Path>,
     ids: &mut IdFactory,
     events: &mut Vec<ProtocolEnvelope>,
 ) -> Option<ObjectId> {
+    if verification_target.is_some() {
+        return None;
+    }
     let stdout = captured_evidence(
         ids,
         EvidenceSource::Stdout,
@@ -1617,7 +1707,12 @@ if [ "$1" = "check" ] || [ "$1" = "clippy" ]; then
   if [ "$2" != "--target-dir" ]; then exit 92; fi
   printf '%s\n' "$3" > "$0.target"
   mkdir -p "$3/out" && printf source > "$3/out/generated.rs"
-  printf '{"reason":"compiler-message","message":{"message":"generated failure","code":{"code":"E0001","explanation":null},"level":"error","spans":[{"file_name":"%s","line_start":1,"line_end":1,"column_start":1,"column_end":2,"is_primary":true}],"children":[],"rendered":"error at %s"}}\n' "$3/out/generated.rs" "$3/out/generated.rs"
+  printf '{"reason":"compiler-message","message":{"message":"generated failure at %s","code":{"code":"%s","explanation":null},"level":"error","spans":[{"file_name":"src/lib.rs","line_start":1,"line_end":1,"column_start":1,"column_end":2,"is_primary":true},{"file_name":"%s","line_start":1,"line_end":1,"column_start":1,"column_end":2,"is_primary":true}],"children":[{"message":"consider writing the generated file at %s/out/generated.rs","level":"help"}],"rendered":"error at %s"}}\n' "$3" "$3" "$3/out/generated.rs" "$3" "$3/out/generated.rs"
+  printf '{"reason":"compiler-message","message":{"message":"generated failure at %s","code":{"code":"%s","explanation":null},"level":"error","spans":[{"file_name":"%s","line_start":2,"line_end":2,"column_start":1,"column_end":2,"is_primary":true}],"children":[],"rendered":null}}\n' "$3" "$3" "$3/out/other.rs"
+  printf '{"reason":"compiler-message","message":{"message":"generated failure at <verification-target>","code":{"code":"%s","explanation":null},"level":"error","spans":[{"file_name":"%s","line_start":2,"line_end":2,"column_start":1,"column_end":2,"is_primary":true}],"children":[],"rendered":null}}\n' "$3" "$3/out/other.rs"
+  printf '{"reason":"compiler-message","message":{"message":"repository failure at %s-backup","code":{"code":"E0001","explanation":null},"level":"error","spans":[{"file_name":"src/lib.rs","line_start":3,"line_end":3,"column_start":1,"column_end":2,"is_primary":true}],"children":[{"message":"keep context","level":"help"}],"rendered":null}}\n' "$3"
+  printf '%s\n' '{"reason":"compiler-message","message":{"message":"repository failure at <verification-target>-backup","code":{"code":"E0001","explanation":null},"level":"error","spans":[{"file_name":"src/lib.rs","line_start":3,"line_end":3,"column_start":1,"column_end":2,"is_primary":true}],"children":[{"message":"keep context","level":"help"}],"rendered":null}}'
+  printf '{"reason":"compiler-message","message":{"message":"hidden target %s","code":{"code":"E0002","explanation":null},"level":"error","spans":[{"file_name":"src/lib.rs","line_start":4,"line_end":4,"column_start":1,"column_end":2,"is_primary":true}],"children":[{"message":"hidden child %s","level":"help"}],"rendered":"safe rendered"}}\n' "$3" "$3"
   printf '%s\n' '{"reason":"build-finished","success":false}'
   exit 1
 fi
@@ -1636,18 +1731,69 @@ exit 91
 
         let response = execute_with_program(&request, &fake.program);
         let target = fs::read_to_string(fake.program.with_extension("target")).unwrap();
-        let observation = response.events.iter().find_map(|event| match event {
-            ProtocolEnvelope::Observation(event) => Some(&event.observation),
-            _ => None,
-        });
-
-        assert_eq!(response.completion.status, ExecutionStatus::Complete);
-        assert_eq!(observation.unwrap().message, "generated failure");
-        assert!(observation.unwrap().location.is_none());
-        assert_ne!(Path::new(target.trim()), collision);
-        assert!(!Path::new(target.trim()).starts_with(repository_root()));
+        let observations = response
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ProtocolEnvelope::Observation(event) => Some(&event.observation),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let generated = observations
+            .iter()
+            .filter(|observation| observation.location.is_none())
+            .collect::<Vec<_>>();
+        assert_eq!(generated.len(), 4);
+        let serialized = serde_json::to_string(&observations).unwrap();
+        assert!(!serialized.contains(target.trim()));
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|item| item.location.is_some())
+                .count(),
+            2
+        );
         assert!(!Path::new(target.trim()).exists());
         fs::remove_dir(collision).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn verify_probe_failures_do_not_publish_the_external_target() {
+        let cases = [
+            r#"if [ "$1" = "--version" ]; then printf 'cargo /tmp/private\n'; exit 0; fi; exit 91"#,
+            r#"if [ "$1" = "--version" ]; then printf 'cargo 1.93.1 (fixture)\n'; exit 0; fi; if [ "$1" = "check" ]; then printf '%s\n' '{"reason":"build-finished","success":true}'; exit 0; fi; if [ "$1" = "clippy" ] && [ "$2" = "--version" ]; then printf 'broken '; cat "$0.expected"; exit 1; fi; exit 91"#,
+            r#"if [ "$1" = "--version" ]; then printf 'cargo 1.93.1 (fixture)\n'; exit 0; fi; if [ "$1" = "check" ]; then target=$(cat "$0.expected"); printf '{"reason":"compiler-message","message":{"message":"traversal","code":{"code":"E0001"},"level":"error","spans":[{"file_name":"%s/../outside.rs","line_start":1,"line_end":1,"column_start":1,"column_end":2,"is_primary":true}],"children":[],"rendered":null}}\n' "$target"; printf '%s\n' '{"reason":"build-finished","success":false}'; exit 1; fi; exit 91"#,
+            r#"if [ "$1" = "--version" ]; then printf 'cargo 1.93.1 (fixture)\n'; exit 0; fi; if [ "$1" = "check" ]; then target=$(cat "$0.expected"); printf '{"reason":"compiler-message","message":{"message":"bad level","code":{"code":"E0001"},"level":"%s","spans":[],"children":[],"rendered":null}}\n' "$target"; printf '%s\n' '{"reason":"build-finished","success":false}'; exit 1; fi; exit 91"#,
+        ];
+
+        for body in cases {
+            let fake = FakeCargo::from_body(body);
+            let mut request = request();
+            request.operation = Operation::Verify;
+            request.request_id = "019f7e95-0000-7000-8000-000000000067".parse().unwrap();
+            let target = std::fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!(
+                    "diagnostic-triage-cargo-{}-{}-0",
+                    std::process::id(),
+                    request.request_id
+                ));
+            let _ignored = fs::remove_dir_all(&target);
+            fs::write(
+                fake.program.with_extension("expected"),
+                target.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+
+            let response = execute_with_program(&request, &fake.program);
+
+            assert_eq!(response.completion.status, ExecutionStatus::Incomplete);
+            assert_eq!(response.completion.counts.evidence, 0);
+            let message = response.completion.message.unwrap_or_default();
+            assert!(!message.contains(target.to_string_lossy().as_ref()));
+            assert!(!target.exists());
+        }
     }
 
     #[test]
