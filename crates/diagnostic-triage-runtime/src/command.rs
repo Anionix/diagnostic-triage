@@ -218,10 +218,27 @@ pub fn run_verify_patch_command(
         return Err(FixCommandError::PatchInputLimit);
     }
     let paths = materialized_repository_paths(config, repository_root)?;
-    let mut canonical_scratch = stage_snapshot(config, repository_root, &paths)?;
     let imported_scratch = stage_snapshot(config, repository_root, &paths)?;
+    let imported = (|| {
+        apply_unified_patch(imported_scratch.path(), patch_bytes)?;
+        let empty = ScratchPatch::new(Vec::new())
+            .map_err(|error| FixCommandError::Scratch(Box::new(error)))?;
+        let result = imported_scratch
+            .capture(&empty, None)
+            .map_err(|error| FixCommandError::Scratch(Box::new(error)))?
+            .result
+            .sha256;
+        Ok((imported_scratch.base_evidence().sha256.clone(), result))
+    })();
+    let imported_cleanup = imported_scratch
+        .cleanup()
+        .map_err(|error| FixCommandError::Scratch(Box::new(error)));
+    let (imported_base, imported_result) =
+        imported.and_then(|value| imported_cleanup.map(|()| value))?;
+
+    let mut canonical_scratch = stage_snapshot(config, repository_root, &paths)?;
     let result = (|| {
-        if canonical_scratch.base_evidence().sha256 != imported_scratch.base_evidence().sha256 {
+        if canonical_scratch.base_evidence().sha256 != imported_base {
             return Err(FixCommandError::PatchMismatch);
         }
         let executed = execute_fix_plan(config, repository_root, &canonical_scratch)
@@ -237,14 +254,6 @@ pub fn run_verify_patch_command(
             .ok_or(FixCommandError::NoSafeCandidate)?;
         let _ = render_unified_patch(&canonical_scratch, &canonical.patch)?;
 
-        apply_unified_patch(imported_scratch.path(), patch_bytes)?;
-        let empty = ScratchPatch::new(Vec::new())
-            .map_err(|error| FixCommandError::Scratch(Box::new(error)))?;
-        let imported_result = imported_scratch
-            .capture(&empty, None)
-            .map_err(|error| FixCommandError::Scratch(Box::new(error)))?
-            .result
-            .sha256;
         let application = canonical_scratch
             .apply_for_verification(&canonical.patch)
             .map_err(|error| FixCommandError::Scratch(Box::new(error)))?;
@@ -278,13 +287,10 @@ pub fn run_verify_patch_command(
         assemble_verified_report(authorized, evaluation_time())
             .map_err(|error| FixCommandError::Report(Box::new(error)))
     })();
-    let imported_cleanup = imported_scratch
-        .cleanup()
-        .map_err(|error| FixCommandError::Scratch(Box::new(error)));
     let canonical_cleanup = canonical_scratch
         .cleanup()
         .map_err(|error| FixCommandError::Scratch(Box::new(error)));
-    result.and_then(|report| imported_cleanup.and(canonical_cleanup).map(|()| report))
+    result.and_then(|report| canonical_cleanup.map(|()| report))
 }
 
 fn stage_snapshot(
