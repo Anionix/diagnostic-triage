@@ -1283,10 +1283,11 @@ mod tests {
 
     use super::{
         PatchVerificationError, PlannedProvider, ReadOnlyMode, ReadOnlyReportError,
-        RuntimeProjectionError, assemble_read_only_report, authorize_canonical_ruff_verification,
-        build_read_only_plan, execute_fix_plan, execute_patch_verification, execute_read_only_plan,
-        preflight_projection_collections, project_patch_verification, project_provider_states,
-        resolve_provider_program, resolve_workspace, synthesize_execution,
+        ReadOnlyRuntimeProjection, RuntimeProjectionError, assemble_read_only_report,
+        authorize_canonical_ruff_verification, build_read_only_plan, execute_fix_plan,
+        execute_patch_verification, execute_read_only_plan, preflight_projection_collections,
+        project_patch_verification, project_provider_states, resolve_provider_program,
+        resolve_workspace, synthesize_execution,
     };
     use crate::{
         CanonicalRuffFix, RUFF_FIX_MEDIA_TYPE, RuffFixLimits, RuntimeConfig, ScratchChange,
@@ -1303,6 +1304,7 @@ mod tests {
         validate_session_jsonl,
     };
     use diagnostic_triage_engine::report::{MAX_REPORT_COLLECTION_ITEMS, ReportAssemblyError};
+    use diagnostic_triage_engine::verification::PatchApplication;
     use tempfile::tempdir;
 
     const REVISION: &str = "a12b34c56d78e90f1234567890abcdef12345678";
@@ -1319,6 +1321,67 @@ mod tests {
              [limits]\ntimeout_ms=1234\nmax_stdout_bytes=321\nmax_stderr_bytes=654\nmax_evidence_bytes=777\nmax_events=8"
         ))
         .expect("valid plan config")
+    }
+
+    fn assert_canonical_authorization_is_single_use(
+        scratch: &mut ScratchWorkspace,
+        canonical: &CanonicalRuffFix,
+        candidate: &FixCandidate,
+        application: &PatchApplication,
+        before: ReadOnlyRuntimeProjection,
+        after: ReadOnlyRuntimeProjection,
+    ) {
+        let authorized = authorize_canonical_ruff_verification(
+            scratch,
+            canonical,
+            candidate,
+            application,
+            before.clone(),
+            after.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            authorized.authorization.candidate_id(),
+            &candidate.fix_candidate_id
+        );
+        let verified_candidate = authorized.projection.candidate.clone();
+        assert!(matches!(
+            scratch
+                .apply_verified(
+                    &verified_candidate,
+                    &canonical.patch,
+                    &canonical.patch_evidence,
+                    authorized.authorization,
+                )
+                .unwrap(),
+            PatchApplication::Applied { .. }
+        ));
+        let replay = authorize_canonical_ruff_verification(
+            scratch,
+            canonical,
+            candidate,
+            application,
+            before,
+            after,
+        )
+        .unwrap();
+        let replay_candidate = replay.projection.candidate.clone();
+        let ScratchChange::Write { path, .. } = &canonical.patch.changes()[0] else {
+            panic!("canonical Ruff patch must contain one write");
+        };
+        let replay_path = scratch.path().join(path);
+        let verified_contents = fs::read(&replay_path).unwrap();
+        fs::write(&replay_path, b"mutated after authorization consumption").unwrap();
+        assert!(matches!(
+            scratch.apply_verified(
+                &replay_candidate,
+                &canonical.patch,
+                &canonical.patch_evidence,
+                replay.authorization,
+            ),
+            Err(ScratchError::AuthorizationAlreadyConsumed)
+        ));
+        fs::write(replay_path, verified_contents).unwrap();
     }
 
     fn init_git(repository: &Path) {
@@ -1642,18 +1705,13 @@ mod tests {
         after.evidence.clear();
         after.fix_candidates.clear();
         after.executions[0].execution_id = after.plan_id.clone();
-        let authorized = authorize_canonical_ruff_verification(
-            &scratch,
+        assert_canonical_authorization_is_single_use(
+            &mut scratch,
             &canonical,
             &candidate,
             &application,
             before.clone(),
             after.clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            authorized.authorization.candidate_id(),
-            &candidate.fix_candidate_id
         );
         let rejects = |canonical: &CanonicalRuffFix, candidate: &FixCandidate, before| {
             matches!(
