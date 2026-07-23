@@ -244,16 +244,38 @@ pub(crate) fn build_read_only_plan(
     repository_digest: &Sha256Digest,
     mode: ReadOnlyMode,
 ) -> Result<ReadOnlyPlan, ReadOnlyPlanError> {
-    let config = config.normalized()?;
-    let report_config = config.clone();
-    let limits = RequestLimits::try_from(&config.limits)?;
-    let config_json = serde_json::to_string(&config)?;
+    let mut config = config.normalized()?;
     let (mode, operation) = match mode {
         ReadOnlyMode::Check => ("check", Operation::Check),
         ReadOnlyMode::Ci => ("ci", Operation::Check),
         ReadOnlyMode::Fix => ("fix", Operation::Fix),
         ReadOnlyMode::Verify => ("verify", Operation::Verify),
     };
+    if operation == Operation::Fix {
+        // LLM contract: CONFIGURED -> CAPABILITY_PROMOTED -> PLANNED; incapable FIX Provider -> FILTERED.
+        config.providers.retain_mut(|provider| {
+            let fix_capability = provider
+                .required_capabilities
+                .iter()
+                .chain(&provider.optional_capabilities)
+                .find(|capability| capability.as_str() == FIX_PROPOSE_CAPABILITY)
+                .cloned();
+            let Some(fix_capability) = fix_capability else {
+                return false;
+            };
+            provider
+                .optional_capabilities
+                .retain(|capability| capability.as_str() != FIX_PROPOSE_CAPABILITY);
+            if !provider.required_capabilities.contains(&fix_capability) {
+                provider.required_capabilities.push(fix_capability);
+                provider.required_capabilities.sort();
+            }
+            true
+        });
+    }
+    let report_config = config.clone();
+    let limits = RequestLimits::try_from(&config.limits)?;
+    let config_json = serde_json::to_string(&config)?;
     let plan_id = deterministic_object_id(
         PLAN_ID_DOMAIN,
         [mode, config_json.as_str(), repository_digest.as_str()],
@@ -262,14 +284,7 @@ pub(crate) fn build_read_only_plan(
     let mut object_ids = BTreeSet::from([plan_id.clone()]);
     let targets = config.repository.targets;
     let mut providers = Vec::with_capacity(config.providers.len());
-    for provider in config.providers.into_iter().filter(|provider| {
-        operation != Operation::Fix
-            || provider
-                .required_capabilities
-                .iter()
-                .chain(&provider.optional_capabilities)
-                .any(|capability| capability.as_str() == FIX_PROPOSE_CAPABILITY)
-    }) {
+    for provider in config.providers {
         let request_id = deterministic_object_id(
             REQUEST_ID_DOMAIN,
             [plan_id.as_str(), provider.adapter_id.as_str()],
@@ -1554,6 +1569,42 @@ mod tests {
             error,
             super::ReadOnlyRunError::WorkspaceEscape { .. }
         ));
+    }
+
+    #[test]
+    fn fix_plan_promotes_optional_capability_to_required() {
+        let mut runtime_config = config("src");
+        runtime_config.providers.truncate(1);
+        runtime_config.providers[0]
+            .optional_capabilities
+            .push("fix.propose/v1".parse().unwrap());
+
+        let plan = build_read_only_plan(
+            &runtime_config,
+            &Sha256Digest::compute(b"repository"),
+            ReadOnlyMode::Fix,
+        )
+        .unwrap();
+        let provider = &plan.providers[0];
+
+        assert!(
+            provider
+                .request
+                .required_capabilities
+                .contains(&super::FIX_PROPOSE_CAPABILITY.parse().unwrap())
+        );
+        assert!(
+            provider
+                .request
+                .optional_capabilities
+                .iter()
+                .all(|capability| capability.as_str() != super::FIX_PROPOSE_CAPABILITY)
+        );
+        assert_eq!(
+            provider.request.required_capabilities,
+            provider.config.required_capabilities
+        );
+        assert_eq!(provider.config, plan.config.providers[0]);
     }
 
     #[test]
