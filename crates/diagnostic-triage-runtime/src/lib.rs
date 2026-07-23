@@ -1,5 +1,6 @@
 //! Runtime configuration, bounded process orchestration, and deterministic output boundaries for Diagnostic Triage.
 
+mod command;
 #[allow(
     dead_code,
     reason = "typed constructor consumed by #223 runtime projection"
@@ -37,6 +38,9 @@ pub mod reporters;
 pub mod sarif;
 pub mod session;
 
+pub use command::{
+    ReadOnlyCommandMode, RuntimeCommandError, run_read_only_command, verdict_exit_code,
+};
 pub use config::{ConfigError, RuntimeConfig};
 pub use github_annotations::{
     GitHubAnnotationReporter, github_annotations_bytes, write_github_annotations,

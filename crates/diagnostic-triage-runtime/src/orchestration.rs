@@ -128,6 +128,12 @@ pub(crate) struct ReadOnlyRuntimeProjection {
     executions: Vec<Execution>,
 }
 
+impl ReadOnlyRuntimeProjection {
+    pub(crate) fn requires_evaluation_time(&self) -> bool {
+        !self.observations.is_empty()
+    }
+}
+
 pub(crate) struct PatchVerificationProjection {
     pub(crate) candidate: FixCandidate,
     pub(crate) evidence: Vec<Evidence>,
@@ -367,13 +373,37 @@ pub(crate) fn execute_read_only_plan(
         return Err(ReadOnlyRunError::IsolatedModeRequired);
     }
     let plan = build_read_only_plan(config, repository_digest, mode)?;
-    let workspace = resolve_workspace(repository_root, &config.repository.workspace)?;
+    execute_planned_read_only_plan(plan, repository_root, None)
+}
+
+pub(crate) fn execute_current_read_only_plan(
+    config: &RuntimeConfig,
+    repository_root: &Path,
+    mode: ReadOnlyMode,
+) -> Result<ExecutedReadOnlyPlan, ReadOnlyRunError> {
+    if matches!(mode, ReadOnlyMode::Fix | ReadOnlyMode::Verify) {
+        return Err(ReadOnlyRunError::IsolatedModeRequired);
+    }
+    let normalized = config.normalized().map_err(ReadOnlyPlanError::Config)?;
+    preflight_read_only_config(&normalized, repository_root)?;
+    let before = capture_repository_state(repository_root)?;
+    let repository_digest = repository_state_digest(&before);
+    let plan = build_read_only_plan(&normalized, &repository_digest, mode)?;
+    execute_planned_read_only_plan(plan, repository_root, Some(&before))
+}
+
+fn execute_planned_read_only_plan(
+    plan: ReadOnlyPlan,
+    repository_root: &Path,
+    before: Option<&RepositoryState>,
+) -> Result<ExecutedReadOnlyPlan, ReadOnlyRunError> {
     let ReadOnlyPlan {
         config,
         plan_id,
         targets,
         providers,
     } = plan;
+    let workspace = resolve_workspace(repository_root, &config.repository.workspace)?;
     // LLM contract: PLANNED -> PREFLIGHTED -> REPOSITORY_SNAPSHOTTED -> PROVIDER_GROUPS_REAPED -> MUTATION_VERIFIED; external writers excluded.
     validate_provider_targets(&workspace, &targets)?;
     let programs = providers
@@ -382,7 +412,13 @@ pub(crate) fn execute_read_only_plan(
             resolve_provider_program(workspace.repository_root(), &provider.config.program)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let before = capture_repository_state(workspace.repository_root())?;
+    let captured_before;
+    let before = if let Some(before) = before {
+        before
+    } else {
+        captured_before = capture_repository_state(workspace.repository_root())?;
+        &captured_before
+    };
     let run_result: Result<ExecutedReadOnlyPlan, ReadOnlyRunError> = (|| {
         let mut executed = Vec::with_capacity(providers.len());
         for (planned, program) in providers.into_iter().zip(programs) {
@@ -395,10 +431,22 @@ pub(crate) fn execute_read_only_plan(
         })
     })();
     let after = capture_repository_state(workspace.repository_root())?;
-    if before != after {
+    if before != &after {
         return Err(ReadOnlyRunError::RepositoryMutation);
     }
     run_result
+}
+
+fn preflight_read_only_config(
+    config: &RuntimeConfig,
+    repository_root: &Path,
+) -> Result<(), ReadOnlyRunError> {
+    let workspace = resolve_workspace(repository_root, &config.repository.workspace)?;
+    validate_provider_targets(&workspace, &config.repository.targets)?;
+    for provider in &config.providers {
+        resolve_provider_program(workspace.repository_root(), &provider.program)?;
+    }
+    Ok(())
 }
 
 fn run_all_providers(
@@ -547,6 +595,19 @@ pub(crate) fn execute_patch_verification(
 }
 
 type RepositoryState = [Vec<u8>; 4];
+
+fn repository_state_digest(state: &RepositoryState) -> Sha256Digest {
+    let mut encoded = b"diagnostic-triage.repository-state/v1".to_vec();
+    for component in state {
+        encoded.extend_from_slice(
+            &u64::try_from(component.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        encoded.extend_from_slice(component);
+    }
+    Sha256Digest::compute(&encoded)
+}
 
 fn capture_repository_state(repository_root: &Path) -> Result<RepositoryState, ReadOnlyRunError> {
     // LLM contract: REPOSITORY_DISCOVERED -> HEAD_BOUND -> INDEX_BOUND ->

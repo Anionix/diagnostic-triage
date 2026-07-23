@@ -226,6 +226,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "diagnostic-triage-runtime",
+ "jiff",
+ "tempfile",
  "thiserror",
  "tracing",
  "tracing-subscriber",
