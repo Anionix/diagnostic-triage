@@ -445,6 +445,20 @@ fn capability_and_operation_mismatch_are_rejected() {
 
     let mut request = decode_request(REQUEST, REQUEST.len()).unwrap();
     request.operation = Operation::Fix;
+    validate_request(&request).unwrap();
+
+    request
+        .optional_capabilities
+        .retain(|capability| capability.as_str() != "fix.propose/v1");
+    assert!(matches!(
+        validate_request(&request),
+        Err(ProviderError::Unsupported(_))
+    ));
+
+    request.operation = Operation::Verify;
+    validate_request(&request).unwrap();
+
+    request.operation = Operation::Observe;
     assert!(matches!(
         validate_request(&request),
         Err(ProviderError::Unsupported(_))
@@ -495,11 +509,12 @@ fn fix_events_require_negotiated_fix_propose_capability() {
 
 #[cfg(unix)]
 #[test]
-fn nonzero_findings_exit_is_complete_and_cross_field_valid() {
+fn fix_operation_emits_complete_findings_and_candidates() {
     let fake = FakeRuff::new(
         r#"printf '%s' '[{"code":"F401","filename":"src/a.py","location":{"row":1,"column":1},"end_location":{"row":1,"column":2},"message":"unused","severity":"error","fix":{"applicability":"safe","message":"remove","edits":[{"content":"","location":{"row":1,"column":1},"end_location":{"row":1,"column":2}}]}}]'; exit 1"#,
     );
-    let request = request();
+    let mut request = request();
+    request.operation = Operation::Fix;
     let session = run_ruff_session(&request, &fake.root, &fake.program).unwrap();
 
     assert_eq!(session.completion.status, ExecutionStatus::Complete);

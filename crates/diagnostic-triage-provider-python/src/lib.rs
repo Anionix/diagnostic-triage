@@ -408,9 +408,9 @@ pub fn validate_request(request: &RequestEnvelope) -> Result<(), ProviderError> 
     ProtocolEnvelope::Request(request.clone())
         .validate()
         .map_err(|error| ProviderError::Request(error.to_string()))?;
-    if request.operation != Operation::Check {
+    if request.operation == Operation::Observe {
         return Err(ProviderError::Unsupported(
-            "this slice implements only CHECK".to_owned(),
+            "Provider does not implement OBSERVE".to_owned(),
         ));
     }
     if request
@@ -429,7 +429,12 @@ pub fn validate_request(request: &RequestEnvelope) -> Result<(), ProviderError> 
         .any(|capability| capability.as_str() == CHECK_CAPABILITY)
     {
         return Err(ProviderError::Unsupported(
-            "CHECK requires diagnostic.check/v1".to_owned(),
+            "Provider operation requires diagnostic.check/v1".to_owned(),
+        ));
+    }
+    if request.operation == Operation::Fix && !request_negotiates(request, FIX_CAPABILITY) {
+        return Err(ProviderError::Unsupported(
+            "FIX requires fix.propose/v1".to_owned(),
         ));
     }
     Ok(())
