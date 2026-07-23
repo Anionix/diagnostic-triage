@@ -226,10 +226,10 @@ fn execute_observe(
     input: &Path,
     output: &mut dyn Write,
 ) -> Result<CommandStatus, CliError> {
-    let input_path = resolve_input_path(repository, input)?;
+    let (input_path, input_repo_path) = resolve_observer_input_path(repository, input)?;
     let input_bytes = read_bounded(&input_path)?;
     let program = observer_program(source)?;
-    let result = run_github_actions_observer(&program, &input.to_string_lossy(), &input_bytes)?;
+    let result = run_github_actions_observer(&program, &input_repo_path, &input_bytes)?;
     output
         .write_all(&result.transcript)
         .map_err(CliError::ObserverIo)?;
@@ -238,14 +238,16 @@ fn execute_observe(
 
 fn observer_program(source: ObserveSource) -> Result<PathBuf, CliError> {
     let current = std::env::current_exe().map_err(CliError::InputIo)?;
+    let working_directory = std::env::current_dir().map_err(CliError::InputIo)?;
     let search_path = std::env::var_os("PATH");
-    observer_program_from(source, &current, search_path.as_deref())
+    observer_program_from(source, &current, search_path.as_deref(), &working_directory)
 }
 
 fn observer_program_from(
     source: ObserveSource,
     current: &Path,
     search_path: Option<&OsStr>,
+    working_directory: &Path,
 ) -> Result<PathBuf, CliError> {
     let name = match source {
         ObserveSource::GitHubActions => {
@@ -256,18 +258,29 @@ fn observer_program_from(
         .parent()
         .ok_or_else(|| CliError::ObserverMissing(name.clone()))?
         .join(&name);
-    if sibling.is_file() {
+    if let Some(sibling) = canonical_observer_file(&sibling, working_directory) {
         return Ok(sibling);
     }
     if let Some(program) = search_path
         .into_iter()
         .flat_map(std::env::split_paths)
         .map(|directory| directory.join(&name))
-        .find(|candidate| candidate.is_file())
+        .find_map(|candidate| canonical_observer_file(&candidate, working_directory))
     {
         return Ok(program);
     }
     Err(CliError::ObserverMissing(name))
+}
+
+fn canonical_observer_file(candidate: &Path, working_directory: &Path) -> Option<PathBuf> {
+    let candidate = if candidate.is_absolute() {
+        candidate.to_owned()
+    } else {
+        working_directory.join(candidate)
+    };
+    fs::canonicalize(candidate)
+        .ok()
+        .filter(|canonical| canonical.is_file())
 }
 
 fn canonical_repository(path: &Path) -> Result<PathBuf, CliError> {
@@ -330,6 +343,34 @@ fn resolve_input_path(repository: &Path, relative: &Path) -> Result<PathBuf, Cli
         return Err(CliError::InputPath(relative.display().to_string()));
     }
     Ok(canonical)
+}
+
+fn resolve_observer_input_path(
+    repository: &Path,
+    relative: &Path,
+) -> Result<(PathBuf, String), CliError> {
+    let canonical = resolve_input_path(repository, relative)?;
+    let repo_relative = canonical
+        .strip_prefix(repository)
+        .map_err(|_| CliError::InputPath(relative.display().to_string()))?;
+    let mut components = Vec::new();
+    for component in repo_relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(CliError::InputPath(relative.display().to_string()));
+        };
+        let Some(component) = component.to_str() else {
+            return Err(CliError::InputPath(relative.display().to_string()));
+        };
+        if component.contains(['\\', '\0']) {
+            return Err(CliError::InputPath(relative.display().to_string()));
+        }
+        components.push(component);
+    }
+    let repo_path = components.join("/");
+    if repo_path.is_empty() {
+        return Err(CliError::InputPath(relative.display().to_string()));
+    }
+    Ok((canonical, repo_path))
 }
 
 fn read_bounded(path: &Path) -> Result<Vec<u8>, CliError> {
@@ -403,10 +444,97 @@ mod tests {
             observer_program_from(
                 ObserveSource::GitHubActions,
                 &current,
-                Some(directory.path().as_os_str())
+                Some(directory.path().as_os_str()),
+                directory.path(),
             )
             .expect("PATH observer"),
-            observer
+            fs::canonicalize(observer).expect("canonical observer")
+        );
+    }
+
+    #[test]
+    fn input_path_normalizes_dot_components_before_protocol_construction() {
+        let directory = tempdir().expect("temporary directory");
+        let repository = fs::canonicalize(directory.path()).expect("canonical repository");
+        fs::create_dir(directory.path().join("runs")).expect("runs");
+        let input = directory.path().join("runs/run.json");
+        fs::write(&input, b"{}").expect("input");
+
+        let (canonical, repo_path) =
+            resolve_observer_input_path(&repository, Path::new("./runs/./run.json"))
+                .expect("canonical input");
+
+        assert_eq!(canonical, fs::canonicalize(input).expect("canonical file"));
+        assert_eq!(repo_path, "runs/run.json");
+    }
+
+    #[test]
+    fn input_path_rejects_escape_and_non_file_inputs() {
+        let directory = tempdir().expect("temporary directory");
+        fs::create_dir(directory.path().join("runs")).expect("runs");
+        fs::write(directory.path().join("run.json"), b"{}").expect("input");
+        let repository = fs::canonicalize(directory.path()).expect("canonical repository");
+
+        assert!(matches!(
+            resolve_observer_input_path(&repository, Path::new("../run.json")),
+            Err(CliError::InputPath(path)) if path == "../run.json"
+        ));
+        assert!(matches!(
+            resolve_observer_input_path(&repository, Path::new("runs")),
+            Err(CliError::InputPath(path)) if path == "runs"
+        ));
+    }
+
+    #[test]
+    fn observer_discovery_absolutizes_relative_path_entries() {
+        let directory = tempdir().expect("temporary directory");
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).expect("bin");
+        let observer = bin.join(format!(
+            "{GITHUB_ACTIONS_OBSERVER}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        fs::write(&observer, b"observer").expect("observer");
+        let current = directory.path().join("nested/diagnostic-triage");
+
+        let found = observer_program_from(
+            ObserveSource::GitHubActions,
+            &current,
+            Some(Path::new("bin").as_os_str()),
+            directory.path(),
+        )
+        .expect("relative PATH observer");
+
+        assert_eq!(
+            found,
+            fs::canonicalize(observer).expect("canonical observer")
+        );
+        assert!(found.is_absolute());
+    }
+
+    #[test]
+    fn observer_discovery_prefers_and_canonicalizes_sibling() {
+        let directory = tempdir().expect("temporary directory");
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).expect("bin");
+        let current = bin.join(format!("diagnostic-triage{}", std::env::consts::EXE_SUFFIX));
+        let observer = bin.join(format!(
+            "{GITHUB_ACTIONS_OBSERVER}{}",
+            std::env::consts::EXE_SUFFIX
+        ));
+        fs::write(&observer, b"observer").expect("observer");
+
+        let found = observer_program_from(
+            ObserveSource::GitHubActions,
+            &current,
+            Some(directory.path().as_os_str()),
+            directory.path(),
+        )
+        .expect("sibling observer");
+
+        assert_eq!(
+            found,
+            fs::canonicalize(observer).expect("canonical observer")
         );
     }
 }
