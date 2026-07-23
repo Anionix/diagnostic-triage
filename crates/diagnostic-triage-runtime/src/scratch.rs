@@ -295,11 +295,18 @@ impl SafeFixAuthorization {
 
 /// A temporary workspace copied from explicitly selected repository paths.
 #[derive(Debug)]
+struct AppliedScratchState {
+    patch_sha256: Sha256Digest,
+    result_sha256: Sha256Digest,
+}
+
+#[derive(Debug)]
 pub struct ScratchWorkspace {
     tempdir: TempDir,
     repo_root: PathBuf,
     workspace_nonce: Uuid,
     base: Evidence,
+    applied: Option<AppliedScratchState>,
     limits: ScratchLimits,
 }
 
@@ -388,6 +395,7 @@ impl ScratchWorkspace {
             repo_root,
             workspace_nonce: Uuid::now_v7(),
             base,
+            applied: None,
             limits,
         })
     }
@@ -567,18 +575,49 @@ impl ScratchWorkspace {
         result_execution_id: Option<ObjectId>,
     ) -> Result<ScratchEvidence, ScratchError> {
         patch.preflight(self.limits)?;
+        let patch = make_patch_evidence(patch, self.limits)?;
+        if let Some(applied) = &self.applied {
+            if applied.patch_sha256 != patch.sha256 {
+                return Err(ScratchError::PatchEvidenceMismatch);
+            }
+        }
         let result = make_snapshot_evidence(
             self.path(),
             self.limits,
             result_execution_id,
             RESULT_MEDIA_TYPE,
         )?;
-        let patch = make_patch_evidence(patch, self.limits)?;
+        if self
+            .applied
+            .as_ref()
+            .is_some_and(|applied| applied.result_sha256 != result.sha256)
+        {
+            return Err(ScratchError::VerificationResultChanged);
+        }
         Ok(ScratchEvidence {
             base: self.base.clone(),
             result,
             patch,
         })
+    }
+
+    /// Apply an unverified patch transactionally to this private workspace for Provider checks.
+    ///
+    /// The original repository is never written. The immutable base Evidence remains available
+    /// so a later [`Self::capture`] binds the patched result to the exact staged preimage.
+    // LLM contract: STAGED -> CANDIDATE_BUILT -> PREFLIGHTED -> APPLIED -> VERIFY_READY;
+    // pre-publication failure terminal: INCOMPLETE, with the previous workspace preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the patch, staged base, candidate result, or resource bounds are
+    /// invalid. Failure before the private publication point preserves the prior workspace.
+    pub fn apply_for_verification(
+        &mut self,
+        patch: &ScratchPatch,
+    ) -> Result<PatchApplication, ScratchError> {
+        let patch_evidence = make_patch_evidence(patch, self.limits)?;
+        self.apply_to_private_workspace(patch, patch_evidence.sha256)
     }
 
     /// Compare one complete safe-fix input and mint runtime-owned apply authorization only when
@@ -678,6 +717,18 @@ impl ScratchWorkspace {
         let encoded_patch = patch.encode()?;
         validate_patch_evidence(candidate, patch_evidence, &encoded_patch)?;
 
+        self.apply_to_private_workspace(patch, patch_evidence.sha256.clone())
+    }
+
+    fn apply_to_private_workspace(
+        &mut self,
+        patch: &ScratchPatch,
+        patch_sha256: Sha256Digest,
+    ) -> Result<PatchApplication, ScratchError> {
+        if self.applied.is_some() {
+            return Err(ScratchError::PatchAlreadyApplied);
+        }
+        patch.preflight(self.limits)?;
         let current = scan_workspace(self.path(), self.limits)?;
         if digest_bytes(&current.encoded) != self.base.sha256 {
             return Err(ScratchError::BaseChanged);
@@ -699,19 +750,27 @@ impl ScratchWorkspace {
             // A final bounded scan validates the complete candidate result before publication.
             scan_workspace(candidate.path(), self.limits)
         })();
-        if let Err(error) = prepared {
-            return Err(cleanup_failed_tempdir(
-                candidate,
-                "cleanup failed transactional candidate",
-                error,
-            ));
-        }
+        let prepared = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(cleanup_failed_tempdir(
+                    candidate,
+                    "cleanup failed transactional candidate",
+                    error,
+                ));
+            }
+        };
+        let result_sha256 = digest_bytes(&prepared.encoded);
 
         let application = PatchApplication::Applied {
-            patch_sha256: patch_evidence.sha256.clone(),
+            patch_sha256: patch_sha256.clone(),
             base_snapshot_sha256: self.base.sha256.clone(),
         };
         let old_tempdir = std::mem::replace(&mut self.tempdir, candidate);
+        self.applied = Some(AppliedScratchState {
+            patch_sha256,
+            result_sha256,
+        });
         let cleanup_result = old_tempdir.close();
         #[cfg(all(test, unix))]
         let cleanup_result = inject_replaced_workspace_cleanup_result(cleanup_result);
@@ -776,10 +835,14 @@ pub enum ScratchError {
     MissingPatchTarget { path: String },
     #[error("scratch base changed before explicit apply")]
     BaseChanged,
+    #[error("private verification result changed after patch application")]
+    VerificationResultChanged,
     #[error("candidate is not authorized for explicit scratch apply")]
     CandidateNotAuthorized,
     #[error("candidate patch evidence does not match the deterministic patch")]
     PatchEvidenceMismatch,
+    #[error("a patch was already applied to this private workspace")]
+    PatchAlreadyApplied,
     #[error("candidate patch evidence is not complete inline PATCH evidence")]
     InvalidPatchEvidence,
     #[error("safe-fix verification input is invalid: {source}")]
@@ -3094,6 +3157,104 @@ mod tests {
         );
         first.cleanup().expect("cleanup first");
         second.cleanup().expect("cleanup second");
+    }
+
+    #[test]
+    fn verification_apply_preserves_base_and_mutates_only_private_workspace() {
+        let repo = tempdir().expect("repo");
+        fs::write(repo.path().join("file.txt"), b"before").expect("file");
+        let mut workspace =
+            ScratchWorkspace::stage(repo.path(), &["file.txt"], limits()).expect("stage");
+        let base = workspace.base_evidence().clone();
+        let patch = ScratchPatch::new(vec![ScratchChange::Write {
+            path: "file.txt".to_owned(),
+            contents: b"after".to_vec(),
+        }])
+        .expect("patch");
+
+        let application = workspace
+            .apply_for_verification(&patch)
+            .expect("verification apply");
+        let captured = workspace.capture(&patch, None).expect("capture result");
+
+        assert_eq!(captured.base, base);
+        assert_ne!(captured.result.sha256, captured.base.sha256);
+        assert!(matches!(
+            application,
+            PatchApplication::Applied {
+                patch_sha256,
+                base_snapshot_sha256,
+            } if patch_sha256 == captured.patch.sha256
+                && base_snapshot_sha256 == captured.base.sha256
+        ));
+        assert_eq!(
+            fs::read(workspace.path().join("file.txt")).unwrap(),
+            b"after"
+        );
+        assert_eq!(fs::read(repo.path().join("file.txt")).unwrap(), b"before");
+        let unrelated = ScratchPatch::new(vec![ScratchChange::Write {
+            path: "file.txt".to_owned(),
+            contents: b"unrelated".to_vec(),
+        }])
+        .expect("unrelated patch");
+        assert!(matches!(
+            workspace.capture(&unrelated, None),
+            Err(ScratchError::PatchEvidenceMismatch)
+        ));
+        workspace.cleanup().expect("cleanup");
+    }
+
+    #[test]
+    fn verification_capture_rejects_mutation_after_private_apply() {
+        let repo = tempdir().expect("repo");
+        fs::write(repo.path().join("file.txt"), b"before").expect("file");
+        let mut workspace =
+            ScratchWorkspace::stage(repo.path(), &["file.txt"], limits()).expect("stage");
+        let patch = ScratchPatch::new(vec![ScratchChange::Write {
+            path: "file.txt".to_owned(),
+            contents: b"after".to_vec(),
+        }])
+        .expect("patch");
+        workspace
+            .apply_for_verification(&patch)
+            .expect("verification apply");
+
+        fs::write(workspace.path().join("file.txt"), b"provider mutation")
+            .expect("mutate private workspace");
+
+        assert!(matches!(
+            workspace.capture(&patch, None),
+            Err(ScratchError::VerificationResultChanged)
+        ));
+        assert_eq!(fs::read(repo.path().join("file.txt")).unwrap(), b"before");
+        workspace.cleanup().expect("cleanup");
+    }
+
+    #[test]
+    fn verification_workspace_rejects_a_second_patch_after_noop_apply() {
+        let repo = tempdir().expect("repo");
+        fs::write(repo.path().join("file.txt"), b"before").expect("file");
+        let mut workspace =
+            ScratchWorkspace::stage(repo.path(), &["file.txt"], limits()).expect("stage");
+        let first = ScratchPatch::new(Vec::new()).expect("empty patch");
+        let second = ScratchPatch::new(vec![ScratchChange::Write {
+            path: "file.txt".to_owned(),
+            contents: b"before".to_vec(),
+        }])
+        .expect("same-content patch");
+
+        workspace
+            .apply_for_verification(&first)
+            .expect("first apply");
+        assert!(matches!(
+            workspace.apply_for_verification(&second),
+            Err(ScratchError::PatchAlreadyApplied)
+        ));
+        workspace
+            .capture(&first, None)
+            .expect("first binding intact");
+        assert_eq!(fs::read(repo.path().join("file.txt")).unwrap(), b"before");
+        workspace.cleanup().expect("cleanup");
     }
 
     #[test]
