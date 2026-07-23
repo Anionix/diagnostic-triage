@@ -47,6 +47,7 @@ use crate::{
 const PLAN_ID_DOMAIN: &str = "diagnostic-triage.runtime-plan/v1";
 const REQUEST_ID_DOMAIN: &str = "diagnostic-triage.runtime-request/v1";
 const EXECUTION_ID_DOMAIN: &str = "diagnostic-triage.runtime-execution/v1";
+const FIX_PROPOSE_CAPABILITY: &str = "fix.propose/v1";
 const MAX_EXECUTION_MESSAGE_CHARS: usize = 8_192;
 const EMPTY_EXECUTION_MESSAGE: &str = "provider session ended without a reason";
 const REPOSITORY_STATE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -55,6 +56,8 @@ const REPOSITORY_STATE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) enum ReadOnlyMode {
     Check,
     Ci,
+    Fix,
+    Verify,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -242,9 +245,11 @@ pub(crate) fn build_read_only_plan(
     let report_config = config.clone();
     let limits = RequestLimits::try_from(&config.limits)?;
     let config_json = serde_json::to_string(&config)?;
-    let mode = match mode {
-        ReadOnlyMode::Check => "check",
-        ReadOnlyMode::Ci => "ci",
+    let (mode, operation) = match mode {
+        ReadOnlyMode::Check => ("check", Operation::Check),
+        ReadOnlyMode::Ci => ("ci", Operation::Check),
+        ReadOnlyMode::Fix => ("fix", Operation::Fix),
+        ReadOnlyMode::Verify => ("verify", Operation::Verify),
     };
     let plan_id = deterministic_object_id(
         PLAN_ID_DOMAIN,
@@ -254,7 +259,14 @@ pub(crate) fn build_read_only_plan(
     let mut object_ids = BTreeSet::from([plan_id.clone()]);
     let targets = config.repository.targets;
     let mut providers = Vec::with_capacity(config.providers.len());
-    for provider in config.providers {
+    for provider in config.providers.into_iter().filter(|provider| {
+        operation != Operation::Fix
+            || provider
+                .required_capabilities
+                .iter()
+                .chain(&provider.optional_capabilities)
+                .any(|capability| capability.as_str() == FIX_PROPOSE_CAPABILITY)
+    }) {
         let request_id = deterministic_object_id(
             REQUEST_ID_DOMAIN,
             [plan_id.as_str(), provider.adapter_id.as_str()],
@@ -270,7 +282,7 @@ pub(crate) fn build_read_only_plan(
             protocol_version: ProtocolVersion::V1,
             kind: EnvelopeKind::Request,
             request_id,
-            operation: Operation::Check,
+            operation,
             workspace: config.repository.workspace.clone(),
             targets: targets.clone(),
             required_capabilities: provider.required_capabilities.clone(),
@@ -1442,6 +1454,12 @@ mod tests {
         );
 
         let ci = build_read_only_plan(&runtime_config, &digest, ReadOnlyMode::Ci).unwrap();
+        let mut fix_config = runtime_config.clone();
+        fix_config.providers[0]
+            .optional_capabilities
+            .push("fix.propose/v1".parse().unwrap());
+        let fix = build_read_only_plan(&fix_config, &digest, ReadOnlyMode::Fix).unwrap();
+        let verify = build_read_only_plan(&runtime_config, &digest, ReadOnlyMode::Verify).unwrap();
         let changed_digest = build_read_only_plan(
             &runtime_config,
             &Sha256Digest::compute(b"other repository"),
@@ -1454,7 +1472,14 @@ mod tests {
         changed_provider.providers[0].tool_version.push_str(".1");
         let changed_provider =
             build_read_only_plan(&changed_provider, &digest, ReadOnlyMode::Check).unwrap();
-        for changed in [&ci, &changed_digest, &changed_target, &changed_provider] {
+        for changed in [
+            &ci,
+            &fix,
+            &verify,
+            &changed_digest,
+            &changed_target,
+            &changed_provider,
+        ] {
             assert_ne!(forward.plan_id, changed.plan_id);
             assert_ne!(
                 first.request.request_id,
@@ -1463,6 +1488,10 @@ mod tests {
             assert_ne!(first.execution_id, changed.providers[0].execution_id);
         }
         assert_eq!(ci.providers[0].request.operation, Operation::Check);
+        assert_eq!(fix.providers.len(), 1);
+        assert_eq!(fix.providers[0].config.adapter_id.as_str(), "alpha");
+        assert_eq!(fix.providers[0].request.operation, Operation::Fix);
+        assert_eq!(verify.providers[0].request.operation, Operation::Verify);
 
         let mut one = runtime_config.clone();
         one.providers.truncate(1);
