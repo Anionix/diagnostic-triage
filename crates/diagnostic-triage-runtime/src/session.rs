@@ -796,7 +796,7 @@ mod tests {
             &manifest(&["diagnostic.check/v1"]),
             marker.to_str().unwrap(),
         ]);
-        let request = request("fix.propose/v1", &[], 16_384);
+        let request = request_for("FIX", "fix.propose/v1", &[], 16_384);
         let outcome =
             run_provider_session(script, &adapter_id(), ADAPTER_VERSION, &request).unwrap();
 
