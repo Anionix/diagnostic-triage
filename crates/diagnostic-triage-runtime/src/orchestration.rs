@@ -11,9 +11,18 @@ use diagnostic_triage_contracts::protocol::{
 };
 use diagnostic_triage_contracts::{
     AdapterId, ContractError, Nullable, ObjectId, RepoPath, Sha256Digest,
-    model::{AdapterKind, Evidence, Execution, ExecutionStatus, FixCandidate, Observation, Tool},
+    model::{
+        AdapterKind, EngineIdentity, Evidence, Execution, ExecutionStatus, FixCandidate,
+        Observation, SessionReport, Tool,
+    },
 };
-use diagnostic_triage_engine::{EngineError, deterministic_object_id};
+use diagnostic_triage_engine::{
+    EngineError,
+    dedup::deduplicate_findings,
+    deterministic_object_id,
+    finding::build_finding,
+    report::{ReportAssemblyError, ReportAssemblyInput, assemble_session_report},
+};
 use serde::Serialize;
 use thiserror::Error;
 
@@ -76,6 +85,7 @@ impl PlannedProvider {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ReadOnlyPlan {
+    config: RuntimeConfig,
     plan_id: ObjectId,
     targets: Vec<RepoPath>,
     providers: Vec<PlannedProvider>,
@@ -89,12 +99,15 @@ pub(crate) struct ExecutedProvider {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExecutedReadOnlyPlan {
+    config: RuntimeConfig,
     plan_id: ObjectId,
     providers: Vec<ExecutedProvider>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct ReadOnlyRuntimeProjection {
+    #[serde(skip)]
+    config: RuntimeConfig,
     plan_id: ObjectId,
     observations: Vec<Observation>,
     evidence: Vec<Evidence>,
@@ -193,12 +206,23 @@ pub(crate) enum RuntimeProjectionError {
     #[error("runtime projection object ID collided: {0}")]
     ObjectIdCollision(ObjectId),
 }
+
+#[derive(Debug, Error)]
+pub(crate) enum ReadOnlyReportError {
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error("runtime classification or deduplication failed")]
+    Engine(#[from] EngineError),
+    #[error(transparent)]
+    Report(#[from] ReportAssemblyError),
+}
 pub(crate) fn build_read_only_plan(
     config: &RuntimeConfig,
     repository_digest: &Sha256Digest,
     mode: ReadOnlyMode,
 ) -> Result<ReadOnlyPlan, ReadOnlyPlanError> {
     let config = config.normalized()?;
+    let report_config = config.clone();
     let limits = RequestLimits::try_from(&config.limits)?;
     let config_json = serde_json::to_string(&config)?;
     let mode = match mode {
@@ -244,6 +268,7 @@ pub(crate) fn build_read_only_plan(
         });
     }
     Ok(ReadOnlyPlan {
+        config: report_config,
         plan_id,
         targets,
         providers,
@@ -259,6 +284,7 @@ pub(crate) fn execute_read_only_plan(
     let plan = build_read_only_plan(config, repository_digest, mode)?;
     let workspace = resolve_workspace(repository_root, &config.repository.workspace)?;
     let ReadOnlyPlan {
+        config,
         plan_id,
         targets,
         providers,
@@ -276,6 +302,7 @@ pub(crate) fn execute_read_only_plan(
         executed.push(planned.run(&workspace, program)?);
     }
     Ok(ExecutedReadOnlyPlan {
+        config,
         plan_id,
         providers: executed,
     })
@@ -418,8 +445,13 @@ fn synthesize_execution(
 pub(crate) fn project_executed_read_only_plan(
     executed: ExecutedReadOnlyPlan,
 ) -> Result<ReadOnlyRuntimeProjection, RuntimeProjectionError> {
-    let ExecutedReadOnlyPlan { plan_id, providers } = executed;
+    let ExecutedReadOnlyPlan {
+        config,
+        plan_id,
+        providers,
+    } = executed;
     project_provider_states(
+        config,
         plan_id,
         providers
             .into_iter()
@@ -429,6 +461,7 @@ pub(crate) fn project_executed_read_only_plan(
 }
 
 fn project_provider_states(
+    config: RuntimeConfig,
     plan_id: ObjectId,
     mut providers: Vec<(PlannedProvider, ProviderSessionState)>,
 ) -> Result<ReadOnlyRuntimeProjection, RuntimeProjectionError> {
@@ -486,12 +519,51 @@ fn project_provider_states(
     fix_candidates.sort_by(|left, right| left.fix_candidate_id.cmp(&right.fix_candidate_id));
     executions.sort_by(|left, right| left.execution_id.cmp(&right.execution_id));
     Ok(ReadOnlyRuntimeProjection {
+        config,
         plan_id,
         observations,
         evidence,
         fix_candidates,
         executions,
     })
+}
+
+pub(crate) fn assemble_read_only_report(
+    projection: ReadOnlyRuntimeProjection,
+    evaluation_time: Option<String>,
+) -> Result<SessionReport, ReadOnlyReportError> {
+    let ReadOnlyRuntimeProjection {
+        config,
+        plan_id,
+        observations,
+        evidence,
+        fix_candidates,
+        executions,
+    } = projection;
+    let rules = config.classification_rules()?;
+    let policy = config.policy_snapshot()?;
+    // LLM contract: NORMALIZED -> CLASSIFIED -> REPORTED; invalid classification, policy, or reference -> REJECTED atomically.
+    let findings = observations
+        .iter()
+        .map(|observation| build_finding(observation, &rules).map(|value| value.finding))
+        .collect::<Result<Vec<_>, _>>()?;
+    let findings = deduplicate_findings(findings)?;
+    Ok(assemble_session_report(
+        ReportAssemblyInput {
+            session_id: plan_id,
+            engine: EngineIdentity {
+                version: config.engine.version.clone(),
+                source_revision: config.engine.source_revision.clone(),
+            },
+            observations,
+            findings,
+            evidence,
+            fix_candidates,
+            executions,
+            evaluation_time,
+        },
+        &policy,
+    )?)
 }
 
 fn bounded_message(message: &str) -> String {
@@ -575,14 +647,14 @@ mod tests {
     use std::{env, fs};
 
     use super::{
-        PlannedProvider, ReadOnlyMode, RuntimeProjectionError, build_read_only_plan,
-        execute_read_only_plan, project_provider_states, resolve_provider_program,
-        resolve_workspace, synthesize_execution,
+        PlannedProvider, ReadOnlyMode, RuntimeProjectionError, assemble_read_only_report,
+        build_read_only_plan, execute_read_only_plan, project_provider_states,
+        resolve_provider_program, resolve_workspace, synthesize_execution,
     };
     use crate::{RuntimeConfig, session::ProviderSessionState};
     use diagnostic_triage_contracts::{
         ObjectId, Sha256Digest, ValidatedSession,
-        model::{Execution, ExecutionStatus, PhaseDuration},
+        model::{Category, Execution, ExecutionStatus, MicroCategory, PhaseDuration, Verdict},
         protocol::Operation,
         validate_session_jsonl,
     };
@@ -724,9 +796,10 @@ mod tests {
             (first.clone(), complete.clone()),
             (second.clone(), terminal),
         ];
-        let forward = project_provider_states(plan_id.clone(), states.clone()).unwrap();
+        let forward =
+            project_provider_states(config("src"), plan_id.clone(), states.clone()).unwrap();
         states.reverse();
-        let reverse = project_provider_states(plan_id.clone(), states).unwrap();
+        let reverse = project_provider_states(config("src"), plan_id.clone(), states).unwrap();
         assert_eq!(
             serde_json::to_vec(&forward).unwrap(),
             serde_json::to_vec(&reverse).unwrap()
@@ -737,8 +810,25 @@ mod tests {
         assert_eq!(forward.executions.len(), 2);
         assert!(forward.executions[0].required);
         assert!(!forward.executions[1].required);
+        let evaluated_at = Some("2026-07-23T00:00:00Z".to_owned());
+        let forward_report = assemble_read_only_report(forward, evaluated_at.clone()).unwrap();
+        let reverse_report = assemble_read_only_report(reverse, evaluated_at).unwrap();
+        assert_eq!(forward_report.verdict, Verdict::Pass);
+        assert_eq!(
+            forward_report.findings[0].classification.category,
+            Category::Unknown
+        );
+        assert_eq!(
+            forward_report.findings[0].classification.micro_category,
+            MicroCategory::Unknown
+        );
+        assert_eq!(
+            serde_json::to_vec(&forward_report).unwrap(),
+            serde_json::to_vec(&reverse_report).unwrap()
+        );
 
         let collision = project_provider_states(
+            config("src"),
             plan_id,
             vec![
                 (first.clone(), complete.clone()),
@@ -754,6 +844,7 @@ mod tests {
         ));
 
         let reserved = project_provider_states(
+            config("src"),
             "019f7e95-0000-7000-8000-000000000272".parse().unwrap(),
             vec![(first.clone(), complete.clone())],
         );
@@ -765,10 +856,25 @@ mod tests {
         let mut mismatch = first;
         mismatch.config.tool_version = "wrong".to_owned();
         let error = project_provider_states(
+            config("src"),
             "019f7e95-0000-7000-8000-000000000280".parse().unwrap(),
             vec![(mismatch, complete)],
         );
         assert!(matches!(error, Err(RuntimeProjectionError::Provider(..))));
+    }
+
+    #[test]
+    fn empty_runtime_projection_is_a_valid_pass_without_evaluation_time() {
+        let projection = project_provider_states(
+            config("src"),
+            "019f7e95-0000-7000-8000-000000000280".parse().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+        let report = assemble_read_only_report(projection, None).unwrap();
+        assert_eq!(report.verdict, Verdict::Pass);
+        assert!(report.findings.is_empty());
+        assert!(report.executions.is_empty());
     }
 
     #[test]
