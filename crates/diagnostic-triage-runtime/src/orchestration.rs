@@ -373,8 +373,7 @@ pub(crate) fn execute_read_only_plan(
         return Err(ReadOnlyRunError::IsolatedModeRequired);
     }
     let plan = build_read_only_plan(config, repository_digest, mode)?;
-    let before = capture_repository_state(repository_root)?;
-    execute_planned_read_only_plan(plan, repository_root, &before)
+    execute_planned_read_only_plan(plan, repository_root, None)
 }
 
 pub(crate) fn execute_current_read_only_plan(
@@ -385,16 +384,18 @@ pub(crate) fn execute_current_read_only_plan(
     if matches!(mode, ReadOnlyMode::Fix | ReadOnlyMode::Verify) {
         return Err(ReadOnlyRunError::IsolatedModeRequired);
     }
+    let normalized = config.normalized().map_err(ReadOnlyPlanError::Config)?;
+    preflight_read_only_config(&normalized, repository_root)?;
     let before = capture_repository_state(repository_root)?;
     let repository_digest = repository_state_digest(&before);
-    let plan = build_read_only_plan(config, &repository_digest, mode)?;
-    execute_planned_read_only_plan(plan, repository_root, &before)
+    let plan = build_read_only_plan(&normalized, &repository_digest, mode)?;
+    execute_planned_read_only_plan(plan, repository_root, Some(&before))
 }
 
 fn execute_planned_read_only_plan(
     plan: ReadOnlyPlan,
     repository_root: &Path,
-    before: &RepositoryState,
+    before: Option<&RepositoryState>,
 ) -> Result<ExecutedReadOnlyPlan, ReadOnlyRunError> {
     let ReadOnlyPlan {
         config,
@@ -411,6 +412,13 @@ fn execute_planned_read_only_plan(
             resolve_provider_program(workspace.repository_root(), &provider.config.program)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let captured_before;
+    let before = if let Some(before) = before {
+        before
+    } else {
+        captured_before = capture_repository_state(workspace.repository_root())?;
+        &captured_before
+    };
     let run_result: Result<ExecutedReadOnlyPlan, ReadOnlyRunError> = (|| {
         let mut executed = Vec::with_capacity(providers.len());
         for (planned, program) in providers.into_iter().zip(programs) {
@@ -427,6 +435,18 @@ fn execute_planned_read_only_plan(
         return Err(ReadOnlyRunError::RepositoryMutation);
     }
     run_result
+}
+
+fn preflight_read_only_config(
+    config: &RuntimeConfig,
+    repository_root: &Path,
+) -> Result<(), ReadOnlyRunError> {
+    let workspace = resolve_workspace(repository_root, &config.repository.workspace)?;
+    validate_provider_targets(&workspace, &config.repository.targets)?;
+    for provider in &config.providers {
+        resolve_provider_program(workspace.repository_root(), &provider.program)?;
+    }
+    Ok(())
 }
 
 fn run_all_providers(
